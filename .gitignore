@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.coverage
+.eggs/
+build/
+dist/
+experiments/
+wandb/
+data/
+local/
+third_party/
+*.swp
+.DS_Store
+slides
+# Auto-generated tree-shape overlays (scripts/_common.sh:ensure_tree_config)
+configs/episode_generators/_generated/
+prunning_analysis/outputs/
