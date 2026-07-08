@@ -1,0 +1,60 @@
+# Flat (non-tree) config for GRPO / RLOO — verl native loop with the recipe's
+# treetune_ppo loss + gear_math reward. Select the estimator on the CLI:
+#   algorithm.adv_estimator=grpo   (or rloo)
+# and set the group size actor_rollout_ref.rollout.n=<N>.
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+algorithm:
+
+  # grpo | rloo (exact verl built-ins). Override per run.
+  adv_estimator: grpo
+
+  # KL coefficient = 0.
+  use_kl_in_reward: false
+
+  kl_ctrl:
+
+    kl_coef: 0.0
+
+actor_rollout_ref:
+
+  actor:
+
+    # treetune-faithful PPO-clip loss (prob-mask, +-10 clamp, ratio-threshold).
+    policy_loss:
+
+      loss_mode: treetune_ppo
+
+    use_kl_loss: false
+
+    kl_loss_coef: 0.0
+
+    entropy_coeff: 0.0
+
+    clip_ratio: 0.2
+
+    ppo_epochs: 1
+
+  rollout:
+
+    name: vllm
+
+    # N independent completions per prompt (the group). Override per run.
+    n: 8
+
+custom_reward_function:
+
+  path: recipe/gear_tree/reward.py
+
+  name: compute_gear_math_score
+
+reward_model:
+
+  reward_manager: gear_math

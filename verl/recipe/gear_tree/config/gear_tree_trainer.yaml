@@ -1,0 +1,151 @@
+# GEAR/Tree recipe config. Composes verl's ppo_trainer base, then switches the
+# policy loss to the treetune-faithful `treetune_ppo` and adds the custom
+# `gear_tree` block consumed by the rollout worker (tree shape, M, GEAR params).
+#
+# Launch:
+#   python -m recipe.gear_tree.main_gear_tree \
+#     --config-path recipe/gear_tree/config --config-name gear_tree_trainer \
+#     actor_rollout_ref.model.path=<hf_model> data.train_files=... data.val_files=...
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# --- custom block read by GearTreeActorRolloutWorker.init_model --------------
+gear_tree:
+
+  # Branch factor per depth (SPO tree shape). Chain = [1,1,...]; tree = [6,6,6].
+  tree_shape: [6, 6, 6]
+
+  # Segment length M (tokens per non-terminal segment). None at the last depth.
+  segment_length: 100
+
+  # Advantage variant: spo | treepo_original | treerl_original.
+  tree_update_mode: spo
+
+  # Local advantage baseline: rloo (child-parent) | grpo (normalized).
+  adv_method: rloo
+
+  # TreePO global-advantage mixing weight (only used by treepo_original).
+  treepo_global_weight: 0.5
+
+  # TreeRL discount (only used by treerl_original).
+  treerl_gamma: 0.9
+
+  # Drop edges whose pav_advantage == 0 (treetune default).
+  only_adv_greater_than_zero: true
+
+  # GEAR-VinePPO: K MC rollouts per cut-point for value estimation (0 = off,
+  # use SPO/TreeRL/TreePO tree values instead).
+  vineppo_K: 0
+
+  # Penalty for length-truncated MC rollouts (VinePPO unfinished penalty).
+  unfinished_penalty: 0.0
+
+  # MATH grading knobs (treetune MATHRewardFunction / MATH task).
+  answer_prefix: "# Answer\n"
+
+  use_minerva_few_shot_prompt: false
+
+  # --- offline logging (treetune-style) -------------------------------------
+  # demos.jsonl / demos.md + full-tree examples. null => <default_local_dir>/gear_demos.
+  demos_dir: null
+
+  # SHARE/PRUNE/budget demo rows dumped per tree (0 = stats only).
+  demo_examples_per_tree: 4
+
+  # Dump one COMPLETE example tree every N trees (0 = never), capped at max.
+  full_tree_every_n_trees: 25
+
+  full_tree_max_trees: 5
+
+  # GEAR online gate (prefix GEAR-* algorithms). Disabled => plain SPO/TreeRL/TreePO.
+  gear:
+
+    enabled: false
+
+    epsilon: 0.02
+
+    r_max: 1.0
+
+    gamma: 0.9
+
+    alpha: 0.05
+
+    k_algorithm: simple
+
+    n_min: 0
+
+    # Weight = sqrt(sigma^2 - budget_lambda); default lambda 0 (deviates from
+    # treetune's sqrt(sigma^4 - 0.02)).
+    budget_lambda: 0.0
+
+    # TV estimates per node; null => auto = branch_factor**2.
+    n_tv_estimates: null
+
+    # Estimate root reward variance and allocate depth-0 budget across the
+    # minibatch's roots before building each tree.
+    root_allocation: true
+
+    skip_near_leaf_expand: true
+
+    enable_share: false
+
+# --- overrides on the verl base ---------------------------------------------
+algorithm:
+
+  # Advantage is computed in the tree rollout, so verl's estimator is bypassed
+  # by RayGearTreeTrainer. Kept as gae to satisfy config validation.
+  adv_estimator: gae
+
+  # KL coefficient = 0 by default (no KL in reward).
+  use_kl_in_reward: false
+
+  kl_ctrl:
+
+    kl_coef: 0.0
+
+actor_rollout_ref:
+
+  actor:
+
+    # treetune-faithful PPO-clip loss (prob-mask, +-10 clamp, ratio-threshold).
+    policy_loss:
+
+      loss_mode: treetune_ppo
+
+    # No KL-in-loss by default (matches tree-family configs). KL coef = 0.
+    use_kl_loss: false
+
+    kl_loss_coef: 0.0
+
+    entropy_coeff: 0.0
+
+    clip_ratio: 0.2
+
+    ppo_epochs: 1
+
+  rollout:
+
+    # Synchronous SPMD vLLM engine (required for segment stepping).
+    name: vllm
+
+    mode: sync
+
+    # Per-token logprobs needed by the GEAR gate.
+    calculate_log_probs: true
+
+# Validation grading uses the vendored MATH grader.
+custom_reward_function:
+
+  path: recipe/gear_tree/reward.py
+
+  name: compute_gear_math_score
+
+reward_model:
+
+  reward_manager: gear_math
