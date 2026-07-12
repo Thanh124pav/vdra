@@ -3,6 +3,7 @@
 {
   gear+: {
     eps_tail: 0.0,
+    strict_vdra: false,
     eps_tail_by_depth: null,
   },
 }

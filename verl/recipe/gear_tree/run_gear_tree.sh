@@ -13,6 +13,10 @@
 # thin CLI overlay on config/gear_tree_trainer.yaml — no per-variant YAML needed.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERL_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "${VERL_ROOT}"
+
 ALGO="${ALGO:-gear_spo_tree}"
 MODEL="${MODEL:?set MODEL=<hf model path>}"
 TRAIN="${TRAIN:?set TRAIN=<train parquet>}"
@@ -37,6 +41,16 @@ esac
 
 EXP_NAME="${EXP_NAME:-gear_tree-${ALGO}}"
 
+VDRA_OVERRIDES=()
+if [[ "${GEAR}" == "true" ]]; then
+  : "${EPS_TAIL_CALIBRATION_PATH:?set EPS_TAIL_CALIBRATION_PATH=<artifact.json> for VDRA}"
+  SCORER_API_BASE="${SCORER_API_BASE:-http://127.0.0.1:8000/v1}"
+  VDRA_OVERRIDES+=(
+    "gear_tree.gear.eps_tail_calibration_path=${EPS_TAIL_CALIBRATION_PATH}"
+    "gear_tree.gear.scorer_api_base=${SCORER_API_BASE}"
+  )
+fi
+
 python -m recipe.gear_tree.main_gear_tree \
   --config-path "$(pwd)/recipe/gear_tree/config" \
   --config-name gear_tree_trainer \
@@ -47,5 +61,6 @@ python -m recipe.gear_tree.main_gear_tree \
   "gear_tree.tree_update_mode=${MODE}" \
   "gear_tree.gear.enabled=${GEAR}" \
   "gear_tree.vineppo_K=${VINEPPO_K}" \
+  "${VDRA_OVERRIDES[@]}" \
   trainer.experiment_name="$EXP_NAME" \
   "$@"

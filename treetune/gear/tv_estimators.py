@@ -67,7 +67,11 @@ class TVEstimateResult:
     logp_matrix: List[List[float]]
     prob_matrix: List[List[float]]
     pair_tvs: Dict[PairKey, float]
-    reward_variance: float
+    dispersion_C: float
+
+    @property
+    def reward_variance(self) -> float:
+        return self.dispersion_C
     candidates: List[Node] = field(default_factory=list)
     predicted_k: int = 0
     unique_candidates: List[Node] = field(default_factory=list)
@@ -92,16 +96,32 @@ class ConditionalTVEstimator:
         r_max: float = 1.0,
         eps_tail: float = 0.0,
         bound_form: str = "linear",
+        pilot_branch_factor: Optional[int] = None,
+        likelihood_samples_per_distribution: int = 1,
+        invalid_support_policy: str = "error",
+        strict_vdra: bool = True,
     ):
         if mode not in {"subnode", "hierachical", "hierarchical", "perplexity"}:
             raise ValueError(f"Unsupported TV estimator mode: {mode}")
         if tv_estimator not in {"tanh", "legacy_abs"}:
             raise ValueError(f"Unsupported tv_estimator: {tv_estimator}")
+        if invalid_support_policy not in {"error", "exclude", "resample"}:
+            raise ValueError(f"Unsupported invalid_support_policy: {invalid_support_policy}")
+        if strict_vdra and invalid_support_policy != "error":
+            raise ValueError("strict_vdra requires invalid_support_policy='error'")
+        if scorer is None and strict_vdra:
+            raise ValueError("VDRA requires a conditional likelihood scorer")
         self.scorer = scorer
         self.node_expander = node_expander
         self.gamma = float(gamma)
         self.mode = "hierachical" if mode == "hierarchical" else mode
-        self.n_tv_estimates = max(int(n_tv_estimates), 2)
+        self.pilot_branch_factor = max(int(pilot_branch_factor or n_tv_estimates), 2)
+        self.likelihood_samples_per_distribution = max(
+            int(likelihood_samples_per_distribution), 1
+        )
+        self.n_tv_estimates = (
+            self.pilot_branch_factor * self.likelihood_samples_per_distribution
+        )
         self.first_phase_tokens = max(int(first_phase_tokens), 1)
         self.second_phase_tokens = max(int(second_phase_tokens), 1)
         self.tv_includes_half_factor = bool(tv_includes_half_factor)
@@ -110,6 +130,8 @@ class ConditionalTVEstimator:
         self.eps_tail = float(eps_tail)
         self.bound_form = bound_form
         self._score_cache: Dict[Tuple[str, str], float] = {}
+        self.invalid_support_policy = invalid_support_policy
+        self.strict_vdra = bool(strict_vdra)
 
     def _reward_variance(self, pair_tvs: Mapping[PairKey, float], n: int) -> float:
         return reward_variance_from_pair_tvs(
@@ -152,7 +174,7 @@ class ConditionalTVEstimator:
                 logp_matrix=[],
                 prob_matrix=[],
                 pair_tvs={},
-                reward_variance=0.0,
+                dispersion_C=0.0,
                 candidates=[],
                 predicted_k=0,
                 unique_candidates=[],
@@ -169,7 +191,7 @@ class ConditionalTVEstimator:
                 logp_matrix=[],
                 prob_matrix=[],
                 pair_tvs={},
-                reward_variance=0.0,
+                dispersion_C=0.0,
                 candidates=first_nodes,
                 predicted_k=len(first_nodes),
                 unique_candidates=first_nodes,
@@ -196,7 +218,7 @@ class ConditionalTVEstimator:
             logp_matrix=logp_matrix,
             prob_matrix=prob_matrix,
             pair_tvs=pair_tvs,
-            reward_variance=variance,
+            dispersion_C=variance,
             candidates=first_nodes,
             predicted_k=len(unique_candidates),
             unique_candidates=unique_candidates,
@@ -212,7 +234,7 @@ class ConditionalTVEstimator:
                 logp_matrix=[],
                 prob_matrix=[],
                 pair_tvs={},
-                reward_variance=0.0,
+                dispersion_C=0.0,
             )
 
         prefixes = [sample.first.get("full_text", "") for sample in samples]
@@ -231,23 +253,23 @@ class ConditionalTVEstimator:
             logp_matrix=logp_matrix,
             prob_matrix=prob_matrix,
             pair_tvs=pair_tvs,
-            reward_variance=variance,
+            dispersion_C=variance,
         )
 
     async def _generate_samples(
         self, parent: Node, *, depth: int
     ) -> Tuple[List[TVSample], List[Node]]:
         if self.mode == "hierachical":
-            first_count = self._hierarchical_first_count()
-            second_per_first = max(1, int(math.ceil(self.n_tv_estimates / first_count)))
+            first_count = self.pilot_branch_factor
+            second_per_first = self.likelihood_samples_per_distribution
         elif self.mode == "perplexity":
             first_count = self._perplexity_branch_factor(
                 parent, fallback=self._hierarchical_first_count()
             )
             second_per_first = None
         else:
-            first_count = self.n_tv_estimates
-            second_per_first = 1
+            first_count = self.pilot_branch_factor
+            second_per_first = self.likelihood_samples_per_distribution
 
         first_nodes = await self._expand(
             current_node=parent,
@@ -285,8 +307,7 @@ class ConditionalTVEstimator:
         for first, seconds in zip(continuable_first_nodes, second_batches):
             for second in seconds:
                 samples.append(TVSample(first=first, second=second))
-                if self.mode != "perplexity" and len(samples) >= self.n_tv_estimates:
-                    return samples, first_nodes
+
         return samples, first_nodes
 
 
@@ -294,16 +315,16 @@ class ConditionalTVEstimator:
         self, parent: Node, *, depth: int
     ) -> Tuple[List[Node], List[Node], List[int]]:
         if self.mode == "hierachical":
-            first_count = self._hierarchical_first_count()
-            second_per_first = max(1, int(math.ceil(self.n_tv_estimates / first_count)))
+            first_count = self.pilot_branch_factor
+            second_per_first = self.likelihood_samples_per_distribution
         elif self.mode == "perplexity":
             first_count = self._perplexity_branch_factor(
                 parent, fallback=self._hierarchical_first_count()
             )
             second_per_first = None
         else:
-            first_count = self.n_tv_estimates
-            second_per_first = 1
+            first_count = self.pilot_branch_factor
+            second_per_first = self.likelihood_samples_per_distribution
 
         first_nodes = await self._expand(
             current_node=parent,
@@ -339,13 +360,10 @@ class ConditionalTVEstimator:
         # generated support block k; the tanh estimator uses it to restrict
         # each pair (i, j) to its own continuations Z_i ∪ Z_j.
         support_origins: List[int] = []
-        seen_support = set()
+
         for (first_idx, _), seconds in zip(continuable, second_batches):
             for second in seconds:
-                text = second.get("text", "")
-                if text in seen_support:
-                    continue
-                seen_support.add(text)
+
                 support_nodes.append(second)
                 support_origins.append(first_idx)
         return first_nodes, support_nodes, support_origins
@@ -508,10 +526,8 @@ class ConditionalTVEstimator:
     ) -> Dict[PairKey, float]:
         """Pairwise TV via the §9 tanh estimator on the log-prob matrix.
 
-        When ``support_origins`` maps each column to the first-prefix that
-        generated it, pair (i, j) is estimated only on Z_i ∪ Z_j (the mixture
-        support of that pair); pairs without own columns fall back to the full
-        pooled support.
+        Pair (i, j) is estimated only on its own mixture support. Samples from
+        unrelated distributions are never used as a fallback.
         """
 
         pair_tvs: Dict[PairKey, float] = {}
@@ -527,7 +543,11 @@ class ConditionalTVEstimator:
                         if origin in (i, j) and k < n_cols
                     ]
                 if not cols:
-                    cols = list(range(n_cols))
+                    if self.invalid_support_policy == "exclude":
+                        continue
+                    if self.invalid_support_policy == "resample":
+                        raise RuntimeError(f"Pair ({i}, {j}) requires support resampling")
+                    raise ValueError(f"Pair ({i}, {j}) has no pair-specific TV support")
                 pair_tvs[(i, j)] = pairwise_tv_tanh(
                     [logp_matrix[i][k] for k in cols],
                     [logp_matrix[j][k] for k in cols],

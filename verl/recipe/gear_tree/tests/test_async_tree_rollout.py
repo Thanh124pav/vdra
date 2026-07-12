@@ -110,7 +110,7 @@ def test_batch_allocation_path_builds_valid_tree():
         k_algorithm="budget_allocation",
         scorer=scorer,
         n_min=1,
-        n_tv_estimates=2,
+        pilot_branch_factor=2,
         skip_near_leaf_expand=True,
         max_depth=3,
     )

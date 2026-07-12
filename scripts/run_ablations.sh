@@ -62,9 +62,28 @@ for abl in ${ABLATIONS}; do
     m120)          # #14: short-continuation length sweep
       run "vdra-m-120" "${GEAR_ROOT}/configs/ablations/abl_m_120.jsonnet"
       ;;
-    k0sweep)       # #13: pilot branch factor k0 sweep (n_tv_estimates 4/16)
+    k0sweep)       # #13: pilot branch factor k0 sweep (pilot_branch_factor 4/16)
       run "vdra-k0-4" "${GEAR_ROOT}/configs/ablations/abl_budget_allocation_n4.jsonnet"
       run "vdra-k0-16" "${GEAR_ROOT}/configs/ablations/abl_budget_allocation_n16.jsonnet"
+      ;;
+    uniform)
+      run "vdra-uniform" "${GEAR_ROOT}/configs/ablations/abl_uniform_allocation.jsonnet"
+      ;;
+    empirical)
+      run "vdra-empirical-variance" "${GEAR_ROOT}/configs/ablations/abl_empirical_variance_allocation.jsonnet"
+      ;;
+    external)
+      run "vdra-external-score" "${GEAR_ROOT}/configs/ablations/abl_external_score_allocation.jsonnet"
+      ;;
+    directtv)
+      run "vdra-direct-tv" "${GEAR_ROOT}/configs/ablations/abl_direct_tv_allocation.jsonnet"
+      ;;
+    oracle)
+      run "vdra-oracle" "${GEAR_ROOT}/configs/ablations/abl_oracle_allocation.jsonnet"
+      ;;
+    rsweep)
+      run "vdra-r-1" "${GEAR_ROOT}/configs/ablations/abl_r_1.jsonnet"
+      run "vdra-r-4" "${GEAR_ROOT}/configs/ablations/abl_r_4.jsonnet"
       ;;
     *)
       echo "[ablations] Unknown: ${abl}" >&2

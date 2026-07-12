@@ -13,6 +13,8 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
+: "${EPS_TAIL_CALIBRATION_PATH:?set EPS_TAIL_CALIBRATION_PATH=<artifact.json> for VDRA}"
+
 MODEL="${MODEL:-deepseekR1Qwen}"
 TREE="${TREE:-${GEAR_TREE:-666}}"
 EXP_NAME="${APP_EXPERIMENT_NAME:-gear-tree-${TREE}-${MODEL}-math}"

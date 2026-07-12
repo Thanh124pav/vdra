@@ -118,6 +118,8 @@ class SegmentNodeExpander:
                     "sum_logprobs": s.sum_logprobs,
                     "num_tokens": s.num_tokens,
                     "full_token_ids": list(prompt_ids) + list(s.token_ids),
+                    "response_token_ids": list(s.token_ids),
+                    "actor_shifted_log_probs": list(s.logprobs) if s.logprobs is not None else None,
                 }
             )
         return nodes
@@ -273,9 +275,8 @@ try:  # keep CPU-importable when agent_loop isn't installed
         scorer = _build_scorer(g, tokenizer)
         return GearGate(
             epsilon=g.get("epsilon", 0.02), r_max=g.get("r_max", 1.0), gamma=g.get("gamma", 0.9),
-            alpha=g.get("alpha", 0.05), k_algorithm=g.get("k_algorithm", "simple"),
-            n_min=g.get("n_min", 0), budget_lambda=g.get("budget_lambda", 0.0),
-            n_tv_estimates=g.get("n_tv_estimates", None), root_allocation=g.get("root_allocation", True),
+            alpha=g.get("alpha", 0.05), k_algorithm=g.get("k_algorithm", "budget_allocation"),
+            n_min=g.get("n_min", 1), pilot_branch_factor=g.get("pilot_branch_factor", None), likelihood_samples_per_distribution=g.get("likelihood_samples_per_distribution", 2), root_allocation=g.get("root_allocation", True),
             skip_near_leaf_expand=g.get("skip_near_leaf_expand", True),
             max_depth=len(gt.get("tree_shape", [])) or None, enable_share=g.get("enable_share", False),
             scorer=scorer,
@@ -285,9 +286,9 @@ try:  # keep CPU-importable when agent_loop isn't installed
             tv_estimator=g.get("tv_estimator", "tanh"),
             tv_first_phase_tokens=g.get("tv_first_phase_tokens", 120),
             tv_second_phase_tokens=g.get("tv_second_phase_tokens", 60),
-            queue_count=g.get("queue_count", 1),
+            queue_count=g.get("queue_count", 1), queue_capacity=g.get("queue_capacity", 8),
             queue_timeout_seconds=g.get("queue_timeout_seconds", 0.0),
-            use_residual_budget=g.get("use_residual_budget", True),
+            use_residual_budget=g.get("use_residual_budget", True), strict_vdra=g.get("strict_vdra", True), invalid_support_policy=g.get("invalid_support_policy", "error"), budget_mode=g.get("budget_mode", "fixed_main"),
         )
 
     def _build_scorer(g: dict, tokenizer: Any):
@@ -295,7 +296,6 @@ try:  # keep CPU-importable when agent_loop isn't installed
 
         ``scorer_api_base`` points at an OpenAI-compatible vLLM server (the
         agent-loop stack already runs one); without it the gate runs with
-        ``scorer=None`` — share and budget allocation stay disabled.
         """
         api_base = g.get("scorer_api_base")
         if not api_base or tokenizer is None:

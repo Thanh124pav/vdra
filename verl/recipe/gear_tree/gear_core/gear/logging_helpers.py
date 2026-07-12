@@ -137,6 +137,43 @@ def aggregate_tree_stats(
             if len(allocated_branch_factors) > 1
             else 0.0
         )
+        metric_fields = {
+            "vdra/main_expansion_requested_branches": "vdra_default_k",
+            "vdra/main_expansion_allocated_branches": "vdra_allocated_k",
+            "vdra/pilot_children_generated": "vdra_pilot_children_generated",
+            "vdra/pilot_children_reused": "vdra_pilot_children_reused",
+            "vdra/pilot_children_discarded": "vdra_pilot_children_discarded",
+            "vdra/additional_children_generated": "vdra_additional_children_generated",
+            "vdra/pilot_generated_tokens": "vdra_pilot_generated_tokens",
+            "vdra/main_expansion_generated_tokens": "vdra_main_expansion_generated_tokens",
+            "vdra/likelihood_scoring_requests": "vdra_likelihood_scoring_requests",
+            "vdra/likelihood_scored_prompt_tokens": "vdra_likelihood_scored_prompt_tokens",
+            "vdra/likelihood_scored_continuation_tokens": "vdra_likelihood_scored_continuation_tokens",
+        }
+        totals = {name: 0.0 for name in metric_fields}
+        stack = [tree]
+        while stack:
+            node = stack.pop()
+            stack.extend(node.get("children") or [])
+            for name, field in metric_fields.items():
+                totals[name] += float(node.get(field, 0.0) or 0.0)
+        totals["vdra/total_generated_tokens"] = (
+            totals["vdra/pilot_generated_tokens"]
+            + totals["vdra/main_expansion_generated_tokens"]
+        )
+        totals["vdra/total_scored_tokens"] = (
+            totals["vdra/likelihood_scored_prompt_tokens"]
+            + totals["vdra/likelihood_scored_continuation_tokens"]
+        )
+        totals["vdra/total_forward_pass_cost"] = (
+            totals["vdra/total_generated_tokens"]
+            + totals["vdra/total_scored_tokens"]
+        )
+        generated = totals["vdra/pilot_children_generated"]
+        totals["vdra/pilot_reuse_rate"] = (
+            totals["vdra/pilot_children_reused"] / generated if generated else 0.0
+        )
+        out.update(totals)
         return out
 
     counts: Counter = Counter()
@@ -297,8 +334,8 @@ def collect_demo_rows(
                     truncate(n.get("text") or n.get("full_text")),
                     float(n.get("gear_budget_weight") or 0.0),
                     (
-                        float(n.get("gear_reward_variance") or 0.0)
-                        if n.get("gear_reward_variance") is not None
+                        float(n.get("vdra_dispersion_C") or 0.0)
+                        if n.get("vdra_dispersion_C") is not None
                         else None
                     ),
                     int(allocated),

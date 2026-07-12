@@ -69,7 +69,7 @@ gear_tree:
   # GEAR online gate (prefix GEAR-* algorithms). Disabled => plain SPO/TreeRL/TreePO.
   gear:
 
-    enabled: false
+    enabled: true
 
     epsilon: 0.02
 
@@ -81,22 +81,20 @@ gear_tree:
 
     # simple (perplexity k-predictor) | budget_allocation (VDRA: pilot TV ->
     # dispersion bound C_s -> k_s ~ sqrt(C_s) with n_min floor; needs scorer).
-    k_algorithm: simple
+    k_algorithm: budget_allocation
 
     # Allocation floor k_min (Summary.md §10): every queued node keeps at
     # least n_min branches so an inaccurate proxy cannot fully discard it.
-    n_min: 0
+    n_min: 1
 
-    # Weight = sqrt(sigma^2 - budget_lambda); default lambda 0 (deviates from
-    # treetune's sqrt(sigma^4 - 0.02)).
-    budget_lambda: 0.0
 
-    # Pilot children per node (k_0); null => auto = branch_factor.
-    n_tv_estimates: null
+    # k0 pilot children and r likelihood samples per child.
+    pilot_branch_factor: null
+    likelihood_samples_per_distribution: 2
 
-    # Estimate root reward variance and allocate depth-0 budget across the
+    # Estimate root dispersion bounds and allocate depth-0 budget across the
     # minibatch's roots before building each tree.
-    root_allocation: true
+    root_allocation: false
 
     skip_near_leaf_expand: true
 
@@ -105,7 +103,8 @@ gear_tree:
     # --- VDRA scoring / bound knobs ----------------------------------------
     # Tail-divergence correction (Summary.md §7): D_L <= D_m + (1-D_m)*eps_tail.
     # Calibrate with scripts/calibrate_tail_divergence.py (RQ3).
-    eps_tail: 0.0
+    eps_tail: 0.1
+    eps_tail_calibration_path: null
 
     # Optional depth-indexed override, e.g. {0: 0.3, 2: 0.15}. null => global.
     eps_tail_by_depth: null
@@ -122,17 +121,24 @@ gear_tree:
 
     tv_second_phase_tokens: 60
 
-    # Allocation queues per root and flush timeout (0 = flush per depth batch).
+    # Online queues flush on capacity or timeout; final drain only at rollout end.
     queue_count: 1
+    queue_capacity: 8
 
     queue_timeout_seconds: 0.0
 
     # Share unused floor budget across queues via the reserve pool.
     use_residual_budget: true
 
+    # Main method fails instead of changing algorithms or supports silently.
+    strict_vdra: true
+    invalid_support_policy: error
+    budget_mode: fixed_main
+    allocation_proxy: vdra
+
     # OpenAI-compatible vLLM endpoint used to score log pi(y|prefix) for the
-    # share / budget-allocation paths. null => scorer disabled (uniform width).
-    scorer_api_base: null
+    # VDRA likelihood scoring. Missing endpoint is a startup error in strict mode.
+    scorer_api_base: http://127.0.0.1:8000/v1
 
     scorer_model: ""
 

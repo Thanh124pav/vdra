@@ -22,7 +22,7 @@ from verl.utils.device import get_device_id, get_torch_device
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
 
-def _build_gate(gt: dict):
+def _build_gate(gt: dict, scorer=None):
     if not gt.get("gear", {}).get("enabled", False):
         return None
     from recipe.gear_tree.gear_gate import GearGate
@@ -33,23 +33,22 @@ def _build_gate(gt: dict):
         r_max=g.get("r_max", 1.0),
         gamma=g.get("gamma", 0.9),
         alpha=g.get("alpha", 0.05),
-        k_algorithm=g.get("k_algorithm", "simple"),
-        n_min=g.get("n_min", 0),
-        budget_lambda=g.get("budget_lambda", 0.0),
-        n_tv_estimates=g.get("n_tv_estimates", None),
+        k_algorithm=g.get("k_algorithm", "budget_allocation"),
+        n_min=g.get("n_min", 1), pilot_branch_factor=g.get("pilot_branch_factor", None), likelihood_samples_per_distribution=g.get("likelihood_samples_per_distribution", 2),
         root_allocation=g.get("root_allocation", True),
         skip_near_leaf_expand=g.get("skip_near_leaf_expand", True),
         max_depth=len(gt.get("tree_shape", [])) or None,
         enable_share=g.get("enable_share", False),
+        scorer=scorer,
         eps_tail=g.get("eps_tail", 0.0),
         eps_tail_by_depth=g.get("eps_tail_by_depth", None),
         bound_form=g.get("bound_form", "linear"),
         tv_estimator=g.get("tv_estimator", "tanh"),
         tv_first_phase_tokens=g.get("tv_first_phase_tokens", 120),
         tv_second_phase_tokens=g.get("tv_second_phase_tokens", 60),
-        queue_count=g.get("queue_count", 1),
+        queue_count=g.get("queue_count", 1), queue_capacity=g.get("queue_capacity", 8),
         queue_timeout_seconds=g.get("queue_timeout_seconds", 0.0),
-        use_residual_budget=g.get("use_residual_budget", True),
+        use_residual_budget=g.get("use_residual_budget", True), strict_vdra=g.get("strict_vdra", True), invalid_support_policy=g.get("invalid_support_policy", "error"), budget_mode=g.get("budget_mode", "fixed_main"),
     )
 
 

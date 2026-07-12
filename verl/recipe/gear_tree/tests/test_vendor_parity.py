@@ -75,9 +75,9 @@ def test_budget_allocation_parity():
         ba_new.reward_variance_from_pair_tvs(pair_tvs, n=4, gamma=0.9)
 
     nodes = [
-        {"id": "a", "gear_reward_variance": 0.30},
-        {"id": "b", "gear_reward_variance": 0.05},
-        {"id": "c", "gear_reward_variance": 0.50},
+        {"id": "a", "vdra_dispersion_C": 0.30},
+        {"id": "b", "vdra_dispersion_C": 0.05},
+        {"id": "c", "vdra_dispersion_C": 0.50},
     ]
     o = ba_orig.allocate_branch_factors(nodes, total_budget=9, lambda_=0.02, n_min=0)
     n = ba_new.allocate_branch_factors(nodes, total_budget=9, lambda_=0.02, n_min=0)

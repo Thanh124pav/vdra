@@ -1,6 +1,6 @@
-"""Treetune adapter for the shared VDRA mathematical core."""
+"""Dependency-free mathematical core shared by treetune and verl VDRA."""
 
-from vdra_core import (
+from .core import (
     AllocationSummary,
     allocate_branch_factors,
     apply_tail_correction,
@@ -10,16 +10,12 @@ from vdra_core import (
     value_gap_bound,
 )
 
-# Read-compatible API name; new runtime fields use vdra_dispersion_C.
-reward_variance_from_pair_tvs = dispersion_bound_from_pair_tvs
-
 __all__ = [
     "AllocationSummary",
     "allocate_branch_factors",
     "apply_tail_correction",
     "dispersion_bound_from_pair_tvs",
     "largest_remainder_rounding",
-    "reward_variance_from_pair_tvs",
     "simulation_lemma_gap",
     "value_gap_bound",
 ]

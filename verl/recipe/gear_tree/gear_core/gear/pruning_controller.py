@@ -222,7 +222,7 @@ def records_from_analysis_node(
         threshold_cfg=threshold_cfg,
         duplicate_tv_threshold=evidence.get("duplicate_tv_threshold"),
         value_gaps=evidence.get("value_gaps"),
-        reward_variance=evidence.get("reward_variance", node.get("gear_reward_variance")),
+        reward_variance=evidence.get("reward_variance", node.get("vdra_dispersion_C")),
     )
 
 

@@ -271,6 +271,65 @@ async def async_build_tree(
     return tree
 
 
+def _retained_pilot_samples(node: Dict[str, Any], allocated_k: int) -> List[SegmentSample]:
+    samples: List[SegmentSample] = []
+    for candidate in list(node.get("vdra_pilot_children") or [])[:allocated_k]:
+        token_ids = candidate.get("response_token_ids")
+        if token_ids is None:
+            parent_ids = list(node.get("full_token_ids") or [])
+            full_ids = list(candidate.get("full_token_ids") or [])
+            token_ids = full_ids[len(parent_ids):] if full_ids[:len(parent_ids)] == parent_ids else []
+        if not token_ids:
+            continue
+        samples.append(
+            SegmentSample(
+                token_ids=list(token_ids),
+                text=str(candidate.get("text", "")),
+                finish_reason=str(candidate.get("finish_reason", "length")),
+                logprobs=(
+                    list(candidate["actor_shifted_log_probs"])
+                    if candidate.get("actor_shifted_log_probs") is not None
+                    else None
+                ),
+                sum_logprobs=candidate.get("sum_logprobs"),
+                num_tokens=candidate.get("num_tokens"),
+            )
+        )
+    return samples
+
+
+async def _expand_reusing_pilots(
+    node: Dict[str, Any],
+    allocated_k: int,
+    max_tokens: Optional[int],
+    segment_fn,
+) -> List[SegmentSample]:
+    retained = _retained_pilot_samples(node, allocated_k)
+    missing = max(int(allocated_k) - len(retained), 0)
+    additional = (
+        await segment_fn(node["full_token_ids"], missing, max_tokens)
+        if missing
+        else []
+    )
+    generated = len(node.get("vdra_pilot_children") or [])
+    node["vdra_pilot_children_generated"] = generated
+    node["vdra_pilot_generated_tokens"] = sum(
+        len(candidate.get("response_token_ids") or [])
+        for candidate in node.get("vdra_pilot_children") or []
+    )
+    node["vdra_pilot_children_reused"] = len(retained)
+    node["vdra_pilot_children_discarded"] = max(generated - len(retained), 0)
+    node["vdra_additional_children_generated"] = len(additional)
+    node["vdra_main_expansion_generated_tokens"] = sum(
+        len(sample.token_ids) for sample in additional
+    )
+    node["vdra_total_generated_tokens"] = (
+        node["vdra_pilot_generated_tokens"]
+        + node["vdra_main_expansion_generated_tokens"]
+    )
+    node["vdra_pilot_reuse_rate"] = len(retained) / generated if generated else 0.0
+    return retained + list(additional)
+
 async def async_build_tree_batch_alloc(
     root_prompt_text: str,
     root_prompt_token_ids: Sequence[int],
@@ -340,7 +399,7 @@ async def async_build_tree_batch_alloc(
 
         sample_batches = await asyncio.gather(
             *[
-                segment_fn(node["full_token_ids"], bf, max_tokens)
+                _expand_reusing_pilots(node, bf, max_tokens, segment_fn)
                 for node, bf in zip(expand_nodes, branch_factors)
             ]
         ) if expand_nodes else []

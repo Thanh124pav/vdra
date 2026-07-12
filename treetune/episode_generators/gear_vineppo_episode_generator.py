@@ -127,7 +127,6 @@ class GEARVinePPOEpisodeGenerator(VinePPOEpisodeGenerator):
             branch_factors=branch_factors,
             use_residual_budget=tree.get("gear_use_residual_budget"),
             root_allocation=tree.get("gear_root_allocation"),
-            budget_lambda=tree.get("gear_budget_lambda"),
             n_min=tree.get("gear_n_min"),
             training=True,
             extra={"tree_update_mode": "vineppo_original"},

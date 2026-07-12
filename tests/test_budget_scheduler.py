@@ -1,30 +1,32 @@
 from treetune.gear.budget_scheduler import FlexibleBudgetScheduler
 
 
-def test_flexible_scheduler_marks_queue_ids_and_floor_allocates():
-    nodes = [
-        {"gear_segment_id": "a", "gear_reward_variance": 0.0},
-        {"gear_segment_id": "b", "gear_reward_variance": 0.5},
-        {"gear_segment_id": "c", "gear_reward_variance": 1.0},
-    ]
-    scheduler = FlexibleBudgetScheduler(queue_count=2, lambda_=0.02)
-    summaries = scheduler.allocate(nodes, total_depth_budget=9)
+def _node(name, default_k, predicted_k, dispersion_C):
+    return {
+        "vdra_node_id": name,
+        "vdra_default_k": default_k,
+        "vdra_predicted_k": predicted_k,
+        "vdra_dispersion_C": dispersion_C,
+    }
 
-    assert summaries
-    assert all("gear_budget_queue_id" in node for node in nodes)
-    assert sum(summary.allocated_budget for summary in summaries) <= 9
-    assert sum(summary.underallocated_budget for summary in summaries) == 9 - sum(
-        summary.allocated_budget for summary in summaries
+
+def test_flexible_scheduler_marks_queue_ids_and_preserves_budget():
+    nodes = [
+        _node("a", 1, 5, 0.1),
+        _node("b", 1, 5, 0.5),
+        _node("c", 1, 5, 1.0),
+    ]
+    summaries = FlexibleBudgetScheduler(queue_count=2).allocate(
+        nodes, total_depth_budget=9
     )
+    assert all("vdra_queue_id" in node for node in nodes)
+    assert sum(summary.allocated_budget for summary in summaries) == 9
 
 
-def test_flexible_scheduler_passes_n_min_to_queue_allocations():
-    nodes = [
-        {"gear_segment_id": "a", "gear_reward_variance": 0.0},
-        {"gear_segment_id": "b", "gear_reward_variance": 0.0},
-    ]
-    scheduler = FlexibleBudgetScheduler(queue_count=1, lambda_=0.02, n_min=1)
-
-    summaries = scheduler.allocate(nodes, total_depth_budget=4)
-
-    assert summaries[0].allocations == {"a": 1, "b": 1}
+def test_flexible_scheduler_respects_demand_caps():
+    nodes = [_node("a", 4, 1, 0.0), _node("b", 4, 2, 0.0)]
+    summaries = FlexibleBudgetScheduler(queue_count=1, n_min=1).allocate(
+        nodes, total_depth_budget=8
+    )
+    assert summaries[0].allocations == {"a": 1, "b": 2}
+    assert summaries[0].underallocated_budget == 5

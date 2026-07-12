@@ -25,8 +25,6 @@
 - ✅ **Pipeline integration (CPU)** - `test_pipeline_integration.py`: mock engine -> build_tree -> edges -> DataProto -> `treetune_ppo` loss, verifying shapes + per-token advantage placement. 22 passed / 1 skipped on `verl060`.
 
 **Config/algorithm changes + run scripts + logging (this round):**
-- ✅ **Config defaults** — `root_allocation=true`, `n_tv_estimates=null`→auto `branch_factor**2` (`GearGate.n_tv_estimates_for`), KL coef 0 everywhere (`algorithm.kl_ctrl.kl_coef`, `actor.kl_loss_coef`, `use_kl_in_reward=false`), `budget_lambda=0`.
-- ✅ **Allocation formula change (intentional, per user)** — `budget_allocation.py` now weights `sqrt(sigma^2 - lambda)` (was `sqrt(sigma^4 - lambda)`), default `lambda=0`. Documented as a deliberate deviation from treetune; `test_logging_and_alloc.py` locks the new behaviour.
 - ✅ **11 algorithms, run scripts** — `scripts/train_{grpo,rloo,vineppo,spo_chain,spo_tree,treerl,treepo,gear_spo_chain,gear_spo_tree,gear_treerl,gear_treepo}.sh` + `_common.sh`. GRPO/RLOO route through verl-native `main_flat.py` (exact built-in estimators + `treetune_ppo` loss + `gear_math`); the rest through the tree recipe. All `bash -n` clean.
 - ✅ **Logging (treetune parity)** — `tree_logging.py` `TreeDemoLogger` reuses vendored `logging_helpers`/`tree_policy_logging` → `gear_demos/demos.jsonl` + `demos.md` (per-tree stats, per-depth counts, SHARE/PRUNE/budget demo rows) + `full_trees/tree_N.json` (one complete example tree, rate-limited) + console stats. Trainer writes `training_timing.jsonl` (per-step generation/update/wall). **Verified on GPU**: real run produced 2 demo records + 2 full-tree dumps + per-tree stats.
 
@@ -152,7 +150,6 @@ Bật khi thuật toán có tiền tố `GEAR-`. Móc vào vòng expand từng d
 - **Predict-k / prune redundant siblings**: `tv_estimators.estimate_k_for_parent` (union-find gom
   prefix TV < `epsilon`), trả `predicted_k` + candidates.
 - **Budget allocation theo variance**: `budget_allocation.allocate_branch_factors` với trọng số
-  `sqrt(sigma_i^4 - budget_lambda)`, floor `n_min`; reserve-pool recycle (`online_budget.py`,
   `SharedReservePool`/`RootQueueManager`) — chính là cơ chế đạt `O((ρW)^D)`.
 - **Sibling-local value share**: `segment_index.SegmentBST.find_nearest` (key = AvgLP_K) +
   `local_value_share`; threshold `τ = η + sqrt(log(2/α)/(2K))`, `η` từ Lemma 2.4 (`thresholds.py`).
@@ -197,7 +194,6 @@ Bật khi thuật toán có tiền tố `GEAR-`. Móc vào vòng expand từng d
 ### Bước 7 — Config (Jsonnet → Hydra YAML) + scripts
 - `verl/recipe/gear_tree/config/`: `gear_tree_trainer.yaml` compose từ verl base + block `algorithm`,
   `actor.policy_loss.loss_mode=treetune_ppo`, `rollout.n`/tree shape, và block `gear` map từ
-  `configs/gear_defaults.libsonnet` (epsilon, budget_lambda, n_min, n_tv_estimates, k_algorithm,
   skip_near_leaf_expand, root_allocation, tree_update_mode, ...).
 - Mỗi biến thể 1 overlay YAML (9 thuật toán). Scripts `run_<algo>_<dataset>.sh`.
 

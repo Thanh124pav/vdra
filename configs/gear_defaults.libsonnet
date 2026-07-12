@@ -16,20 +16,26 @@
     // Online GEAR: predict k per node, then allocate branch budget across queues.
     k_algorithm: 'hierarchical',
     generation_mode: 'single_request',
-    n_tv_estimates: 8,
+    pilot_branch_factor: 8,
+    likelihood_samples_per_distribution: 2,
     tv_subnode_max_tokens: 120,
     tv_second_phase_tokens: 60,
     tv_includes_half_factor: true,
-    budget_lambda: 0.02,
-    n_min: 0,
+    n_min: 1,
     budget_overhead_mode: 'flexible',
     allocation_mode: 'budget_allocation',
     use_residual_budget: true,
     budget_queue_count: 4,
+    budget_queue_capacity: 8,
     budget_queue_timeout_seconds: 1.0,
     // VDRA (Summary.md §7-§9): tail-corrected value bound + tanh TV estimator.
     // eps_tail is calibrated offline via scripts/calibrate_tail_divergence.py.
-    eps_tail: 0.0,
+    eps_tail: 0.1,
+    eps_tail_calibration_path: null,
+    strict_vdra: true,
+    invalid_support_policy: 'error',
+    budget_mode: 'fixed_main',
+    allocation_proxy: 'vdra',
     eps_tail_by_depth: null,
     bound_form: 'linear',  // 'linear' | 'simulation_lemma' (legacy gamma form)
     tv_estimator: 'tanh',  // 'tanh' (§9) | 'legacy_abs' (degenerate; ablation only)

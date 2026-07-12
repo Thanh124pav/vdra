@@ -701,6 +701,74 @@ The solution is optimal for the continuous relaxation of the current allocation 
 
 ---
 
+### 10.1 Pruning, Demand Caps, and Residual Reallocation
+
+VDRA uses two distinct node signals. The predicted useful branch demand
+\(\widehat k_s^{\mathrm{need}}\) controls pruning and provides an upper demand
+cap. The dispersion bound \(C_s\) controls how saved branches are prioritized.
+They must not be merged.
+
+For default branch factor \(n_s^{\mathrm{default}}\) and \(k_{\min}=1\), define
+
+$$
+k_s^{\mathrm{cap}}=\max(k_{\min},\widehat k_s^{\mathrm{need}}),\qquad
+k_s^{\mathrm{base}}=\min(n_s^{\mathrm{default}},k_s^{\mathrm{cap}}).
+$$
+
+The pruned budget and remaining demand are
+
+$$
+r_s=n_s^{\mathrm{default}}-k_s^{\mathrm{base}},\qquad
+d_s=\max(k_s^{\mathrm{cap}}-k_s^{\mathrm{base}},0).
+$$
+
+Saved branches enter a shared residual pool. For a queue \(\mathcal Q\), VDRA
+solves the bounded problem
+
+$$
+\min_{\{k_s\}}\sum_{s\in\mathcal Q}\frac{C_s}{k_s}
+\quad\text{subject to}\quad
+k_s^{\mathrm{base}}\le k_s\le k_s^{\mathrm{cap}},\qquad
+\sum_s k_s\le B_{\mathcal Q}.
+$$
+
+The continuous solution is capped water filling,
+
+$$
+k_s^\star=\operatorname{clip}
+\left(\sqrt{C_s/\lambda_{\mathrm{dual}}},
+k_s^{\mathrm{base}},k_s^{\mathrm{cap}}\right),
+$$
+
+where the internal dual variable \(\lambda_{\mathrm{dual}}>0\) is chosen so
+that
+
+$$
+\sum_s k_s^\star=
+\min\left(B_{\mathcal Q},\sum_s k_s^{\mathrm{cap}}\right).
+$$
+
+This dual variable is not a public hyperparameter and is unrelated to the
+historical threshold called `budget_lambda`. The VDRA allocation priority is
+always \(\sqrt{C_s}\); no term of the form \(\sqrt{C_s-\lambda}\) is used.
+
+Integer allocations use capped largest-remainder rounding. Every node records
+`default_k`, `predicted_k`, `base_k`, `saved_k`, `unmet_demand`,
+`dispersion_C`, `additional_k`, and `allocated_k`. Pilot children are retained:
+allocation reuses the selected pilots and generates only missing branches.
+
+### 10.2 Budget Reporting Modes
+
+The default `fixed_main` mode holds the main-expansion branch budget fixed and
+reports pilot generation and likelihood scoring as additional compute. It must
+not be described as a fixed-total-compute comparison.
+
+The optional `fixed_total_generated` mode places pilot and main-expansion
+generation under one generated-token cap. Likelihood-scoring tokens and the
+token-level forward-pass proxy are still reported separately. Experimental
+claims must name the selected mode.
+
+
 ## 11. Online Queue-Based Tree Expansion
 
 During one rollout-generation phase, the policy parameters are frozen at $\theta_t$.
@@ -854,7 +922,7 @@ Its queue-based implementation:
 3. VDRA provides an intrinsic likelihood-based proxy for node value dispersion.
 4. VDRA is compatible with different segmentation and tree-construction methods.
 5. VDRA is batchwise optimal for the nodes contained in each allocation queue.
-6. VDRA reduces redundant rollout generation under a fixed total generation budget.
+6. VDRA reduces redundant main-expansion generation under the declared budget mode.
 
 ## Claims that VDRA should avoid
 
@@ -871,7 +939,7 @@ Its queue-based implementation:
 
 ## RQ1: Does VDRA improve task performance under a fixed rollout budget?
 
-Compare VDRA with existing methods under identical total generated-token budgets.
+Compare VDRA under the declared budget mode. The default fixed_main comparison matches the main-expansion budget and reports pilot/scoring overhead separately. The fixed_total_generated option matches total generated tokens including pilots.
 
 Report:
 
@@ -894,7 +962,7 @@ Baselines should include:
 - VIP or another adaptive-rollout baseline;
 - oracle allocation on a small evaluation subset.
 
-All pilot-generation and likelihood-scoring costs must be included in the VDRA compute budget.
+Pilot-generation and likelihood-scoring costs must always be reported; fixed_total_generated also charges pilot generation to its generated-token cap.
 
 ---
 

@@ -3,6 +3,8 @@
 import asyncio
 import math
 
+import pytest
+
 from recipe.gear_tree.gear_gate import GearGate
 
 
@@ -33,7 +35,7 @@ def test_root_and_near_leaf_keep_default_width():
 
 
 def test_no_scorer_share_is_noop():
-    gate = GearGate(enable_share=True, scorer=None)
+    gate = GearGate(k_algorithm="simple", enable_share=True, scorer=None)
     children = [
         {"text": "a", "full_text": "P a"},
         {"text": "b", "full_text": "P b"},
@@ -143,7 +145,7 @@ def test_allocate_batch_async_moves_budget_to_high_dispersion_node():
         k_algorithm="budget_allocation",
         scorer=_DispersionScorer(),
         n_min=1,
-        n_tv_estimates=2,
+        pilot_branch_factor=8,
         skip_near_leaf_expand=False,
     )
     assert gate.use_batch_allocation
@@ -151,16 +153,16 @@ def test_allocate_batch_async_moves_budget_to_high_dispersion_node():
     cold = {"full_text": "cold", "tag": "c", "gear_segment_id": "cold"}
     asyncio.run(gate.allocate_batch_async([hot, cold], depth=1, default_bf=4, node_expander=_PilotExpander()))
 
-    assert hot["gear_reward_variance"] > cold["gear_reward_variance"]
+    assert hot["vdra_dispersion_C"] > cold["vdra_dispersion_C"]
     total = hot["gear_branch_allocation"] + cold["gear_branch_allocation"]
-    assert total == 8  # budget conserved: 2 nodes x default_bf 4
+    assert total == min(8, hot["gear_predicted_k"] + cold["gear_predicted_k"])
     assert cold["gear_branch_allocation"] >= 1  # n_min floor kept
     assert hot["gear_branch_allocation"] > cold["gear_branch_allocation"]
     # branch_factor consumes the written allocation.
     assert gate.branch_factor(hot, depth=1, default_bf=4) == hot["gear_branch_allocation"]
 
 
-def test_allocate_batch_async_scoring_failure_falls_back_to_uniform():
+def test_allocate_batch_async_scoring_failure_is_explicit():
     class BoomScorer:
         async def score_one(self, prefix, y):
             raise RuntimeError("boom")
@@ -168,13 +170,17 @@ def test_allocate_batch_async_scoring_failure_falls_back_to_uniform():
     gate = GearGate(
         k_algorithm="budget_allocation",
         scorer=BoomScorer(),
-        n_tv_estimates=2,
+        pilot_branch_factor=2,
         skip_near_leaf_expand=False,
     )
     nodes = [
         {"full_text": "a", "gear_segment_id": "a"},
         {"full_text": "b", "gear_segment_id": "b"},
     ]
-    asyncio.run(gate.allocate_batch_async(nodes, depth=1, default_bf=3, node_expander=_PilotExpander()))
+    with pytest.raises(RuntimeError, match="no fallback"):
+        asyncio.run(
+            gate.allocate_batch_async(
+                nodes, depth=1, default_bf=3, node_expander=_PilotExpander()
+            )
+        )
     assert gate.allocation_error_count == 1
-    assert [n["gear_branch_allocation"] for n in nodes] == [3, 3]

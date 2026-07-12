@@ -37,6 +37,7 @@ import json
 import math
 import random
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -209,7 +210,7 @@ async def build_node_record(
         values = []
         for i, pilot in enumerate(pilots):
             grades = [
-                simple_math_grade(text, answer, args.answer_prefix)
+                simple_math_grade(pilot + text, answer, args.answer_prefix)
                 for origin, text in conts
                 if origin == i
             ]
@@ -321,20 +322,22 @@ def _allocation_regret(graded: List[Dict[str, Any]], args: argparse.Namespace) -
     def alloc(weight_field: Optional[str]) -> Dict[str, int]:
         nodes = []
         for idx, rec in enumerate(graded):
-            node = {"id": f"node_{idx}"}
+            node = {
+                "id": f"node_{idx}",
+                "vdra_default_k": args.default_bf,
+                "vdra_predicted_k": budget,
+            }
             if weight_field is None:
                 node["w"] = 1.0
             else:
-                # sqrt handled by allocate for gear_reward_variance; explicit for oracle.
+                # sqrt handled by allocate for vdra_dispersion_C; explicit for oracle.
                 node["w"] = math.sqrt(max(rec[weight_field], 0.0))
             nodes.append(node)
         summary = allocate_branch_factors(
             nodes,
             total_budget=budget,
             n_min=args.n_min,
-            distribute_remainder=True,
             weight_key="w",
-            fallback_uniform=True,
         )
         return summary.allocations
 
@@ -379,7 +382,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--default-bf", type=int, default=6)
     ap.add_argument("--n-min", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--out", default="tail_calibration.json")
+    ap.add_argument("--checkpoint", default=None)
+    ap.add_argument("--dataset", default=None)
+    ap.add_argument("--quantile", type=float, default=0.99)
+    ap.add_argument("--out", default=None)
     args = ap.parse_args()
     args.horizons = [int(x) for x in str(args.horizons).split(",") if x]
     args.depths = [int(x) for x in str(args.depths).split(",") if x != ""]

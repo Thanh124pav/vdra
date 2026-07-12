@@ -104,9 +104,9 @@ class GEAREpisodeGenerator(HybridEpisodeGenerator):
         self._gear_full_tree_md_handle = None
         self._gear_run_manifest_written = False
         self._gear_run_manifest_printed = False
-        self._gear_reward_variance_jsonl_handle = None
-        self._gear_reward_variance_csv_handle = None
-        self._gear_reward_variance_csv_writer = None
+        self._vdra_dispersion_C_jsonl_handle = None
+        self._vdra_dispersion_C_csv_handle = None
+        self._vdra_dispersion_C_csv_writer = None
         self._tree_seen = 0
 
     # ------------------------------------------------------------------
@@ -382,26 +382,26 @@ class GEAREpisodeGenerator(HybridEpisodeGenerator):
         base = self._resolve_demos_dir()
         if base is False:
             return None, None
-        if self._gear_reward_variance_jsonl_handle is None:
-            self._gear_reward_variance_jsonl_handle = (
+        if self._vdra_dispersion_C_jsonl_handle is None:
+            self._vdra_dispersion_C_jsonl_handle = (
                 base / "reward_variance_nodes.jsonl"
             ).open("a", buffering=1)
-        if self._gear_reward_variance_csv_handle is None:
+        if self._vdra_dispersion_C_csv_handle is None:
             csv_path = base / "reward_variance_nodes.csv"
             needs_header = not csv_path.exists() or csv_path.stat().st_size == 0
-            self._gear_reward_variance_csv_handle = csv_path.open(
+            self._vdra_dispersion_C_csv_handle = csv_path.open(
                 "a", buffering=1, newline=""
             )
-            self._gear_reward_variance_csv_writer = csv.DictWriter(
-                self._gear_reward_variance_csv_handle,
+            self._vdra_dispersion_C_csv_writer = csv.DictWriter(
+                self._vdra_dispersion_C_csv_handle,
                 fieldnames=self._reward_variance_fieldnames(),
                 extrasaction="ignore",
             )
             if needs_header:
-                self._gear_reward_variance_csv_writer.writeheader()
+                self._vdra_dispersion_C_csv_writer.writeheader()
         return (
-            self._gear_reward_variance_jsonl_handle,
-            self._gear_reward_variance_csv_writer,
+            self._vdra_dispersion_C_jsonl_handle,
+            self._vdra_dispersion_C_csv_writer,
         )
 
     def _open_full_tree_handles(self):
@@ -450,7 +450,6 @@ class GEAREpisodeGenerator(HybridEpisodeGenerator):
             branch_factors=branch_factors,
             use_residual_budget=tree.get("gear_use_residual_budget"),
             root_allocation=tree.get("gear_root_allocation"),
-            budget_lambda=tree.get("gear_budget_lambda"),
             n_min=tree.get("gear_n_min"),
             training=True,
             extra={
@@ -516,9 +515,9 @@ class GEAREpisodeGenerator(HybridEpisodeGenerator):
             "reward",
             "reward_std",
             "empirical_child_reward_variance",
-            "gear_reward_variance",
-            "gear_sigma2",
-            "gear_sigma4",
+            "vdra_dispersion_C",
+            "vdra_dispersion_C_legacy_sigma2",
+            "vdra_dispersion_C_legacy_sigma4",
             "gear_tv_pair_count",
             "gear_tv_support_size",
             "gear_allocated_branch_factor",
@@ -562,11 +561,11 @@ class GEAREpisodeGenerator(HybridEpisodeGenerator):
                 "reward": self._safe_float(node.get("reward")),
                 "reward_std": self._safe_float(node.get("reward_std")),
                 "empirical_child_reward_variance": empirical_var,
-                "gear_reward_variance": self._safe_float(
-                    node.get("gear_reward_variance")
+                "vdra_dispersion_C": self._safe_float(
+                    node.get("vdra_dispersion_C")
                 ),
-                "gear_sigma2": self._safe_float(node.get("gear_sigma2")),
-                "gear_sigma4": self._safe_float(node.get("gear_sigma4")),
+                "vdra_dispersion_C_legacy_sigma2": self._safe_float(node.get("vdra_dispersion_C_legacy_sigma2")),
+                "vdra_dispersion_C_legacy_sigma4": self._safe_float(node.get("vdra_dispersion_C_legacy_sigma4")),
                 "gear_tv_pair_count": node.get("gear_tv_pair_count"),
                 "gear_tv_support_size": node.get("gear_tv_support_size"),
                 "gear_allocated_branch_factor": node.get(
@@ -580,7 +579,7 @@ class GEAREpisodeGenerator(HybridEpisodeGenerator):
                 ),
                 "n_children": len(children),
             }
-            if row["gear_reward_variance"] is not None or row["reward"] is not None:
+            if row["vdra_dispersion_C"] is not None or row["reward"] is not None:
                 yield row
             stack.extend(reversed(children))
 
@@ -593,9 +592,9 @@ class GEAREpisodeGenerator(HybridEpisodeGenerator):
             )
         )
         variances = [
-            r["gear_reward_variance"]
+            r["vdra_dispersion_C"]
             for r in rows
-            if r["gear_reward_variance"] is not None
+            if r["vdra_dispersion_C"] is not None
         ]
         rewards = [r["reward"] for r in rows if r["reward"] is not None]
         out: Dict[str, float] = {
@@ -683,8 +682,8 @@ class GEAREpisodeGenerator(HybridEpisodeGenerator):
             self._gear_md_handle,
             self._gear_full_tree_jsonl_handle,
             self._gear_full_tree_md_handle,
-            self._gear_reward_variance_jsonl_handle,
-            self._gear_reward_variance_csv_handle,
+            self._vdra_dispersion_C_jsonl_handle,
+            self._vdra_dispersion_C_csv_handle,
         ):
             try:
                 if h is not None:

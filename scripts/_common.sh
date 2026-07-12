@@ -103,14 +103,20 @@ ensure_runtime_config() {
   if [[ -n "${GEAR_SCORE_CONCURRENCY:-}" ]]; then
     gear_inference_overrides+="      gear_score_concurrency: ${GEAR_SCORE_CONCURRENCY},"$'\n'
   fi
+  if [[ -n "${EPS_TAIL_CALIBRATION_PATH:-}" ]]; then
+    gear_inference_overrides+="      gear_eps_tail_calibration_path: '${EPS_TAIL_CALIBRATION_PATH}',"$'\n'
+  fi
   if [[ -n "${GEAR_K_ALGORITHM:-}" ]]; then
     gear_inference_overrides+="      gear_k_algorithm: '${GEAR_K_ALGORITHM}',"$'\n'
   fi
   if [[ -n "${GEAR_GENERATION_MODE:-}" ]]; then
     gear_inference_overrides+="      gear_generation_mode: '${GEAR_GENERATION_MODE}',"$'\n'
   fi
-  if [[ -n "${GEAR_N_TV_ESTIMATES:-}" ]]; then
-    gear_inference_overrides+="      gear_n_tv_estimates: ${GEAR_N_TV_ESTIMATES},"$'\n'
+  if [[ -n "${GEAR_PILOT_BRANCH_FACTOR:-}" ]]; then
+    gear_inference_overrides+="      gear_pilot_branch_factor: ${GEAR_PILOT_BRANCH_FACTOR},"$'\n'
+  fi
+  if [[ -n "${GEAR_LIKELIHOOD_SAMPLES_PER_DISTRIBUTION:-}" ]]; then
+    gear_inference_overrides+="      gear_likelihood_samples_per_distribution: ${GEAR_LIKELIHOOD_SAMPLES_PER_DISTRIBUTION},"$'\n'
   fi
   if [[ -n "${GEAR_TV_SUBNODE_MAX_TOKENS:-}" ]]; then
     gear_inference_overrides+="      gear_tv_subnode_max_tokens: ${GEAR_TV_SUBNODE_MAX_TOKENS},"$'\n'
@@ -126,9 +132,6 @@ ensure_runtime_config() {
   fi
   if [[ -n "${GEAR_USE_RESIDUAL_BUDGET:-}" ]]; then
     gear_inference_overrides+="      gear_use_residual_budget: $(jsonnet_value "${GEAR_USE_RESIDUAL_BUDGET}"),"$'\n'
-  fi
-  if [[ -n "${GEAR_BUDGET_LAMBDA:-}" ]]; then
-    gear_inference_overrides+="      gear_budget_lambda: ${GEAR_BUDGET_LAMBDA},"$'\n'
   fi
   if [[ -n "${GEAR_N_MIN:-}" ]]; then
     gear_inference_overrides+="      gear_n_min: ${GEAR_N_MIN},"$'\n'
@@ -259,9 +262,9 @@ gear_eval() {
 
 # ensure_tree_config <shape>
 # Resolve a tree shape (e.g. "666", "6666", "3456", "8888") to a jsonnet
-# overlay path.  If a checked-in config exists under
+# overlay path.  If a checked-in config exists unde
 #   configs/episode_generators/branch_factor_<shape>.jsonnet
-# we use it as-is.  Otherwise we auto-generate one under
+# we use it as-is.  Otherwise we auto-generate one unde
 #   configs/episode_generators/_generated/branch_factor_<shape>.jsonnet
 # so any shape works without hand-editing the repo.
 #

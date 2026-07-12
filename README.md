@@ -170,32 +170,56 @@ node expander và tất cả vLLM server (train, evaluation, analyzer):
 APP_MAX_MODEL_LEN=4096 bash scripts/train_gear_tree_deepseekR1Qwen_MATH.sh
 ```
 
-## GEAR — chi tiết thuật toán
+## VDRA - pruning and adaptive rollout allocation
 
-GEAR hiện dùng `budget_allocation`: TV probes estimate reward variance cho frontier nodes, rồi phân bổ branch budget theo variance.
+The default adaptive path is VDRA, not the legacy perplexity predictor. Each
+node produces two separate signals:
 
-Các path SHARE/PRUNE còn lại chỉ dùng sibling-local TV comparison; code generate lời giải tham chiếu cũ đã bị loại khỏi production path.
+- `predicted_k`: useful branch demand and pruning cap;
+- `vdra_dispersion_C`: the upper bound \(C_s\) used to prioritize residual budget.
 
-Tham số mặc định (`configs/gear_defaults.libsonnet`):
+After pruning, saved branches enter a shared pool. Nodes with remaining demand
+receive additional branches through capped water filling for
+\(\min\sum_s C_s/k_s\). The continuous priority is `sqrt(C_s)` and integer
+allocations use capped largest-remainder rounding. `budget_lambda` is not a
+VDRA parameter; the solver's internal `dual_lambda` is computed, never tuned.
 
-| Tham số | Default | Ý nghĩa |
-|---------|---------|---------|
-| `m` | 100 | Số continuation anchors tối đa cho sibling-local TV |
-| `epsilon` | 0.02 | Ngưỡng value gap cho Prune |
-| `local_value_share` | true | Chỉ dùng path local so sánh siblings; global Y path đã bị loại bỏ |
-| `demo_examples_per_tree` | 2 | Số demo budget/local gate lưu mỗi cây |
-| `budget_lambda` | 0.02 | Ngưỡng trong trọng số `sqrt(sigma_i^4 - budget_lambda)` |
-| `n_min` | 0 | Số nhánh trả về khi `sigma_i^4 - budget_lambda < 0` |
-| `skip_near_leaf_expand` | false | Budget allocation: ở depth cuối, bỏ TV/budget allocation và expand uniform theo branch factor B |
-| `root_allocation` | false | Budget allocation: estimate variance ở các root trong minibatch và phân bổ branch budget depth 0 giữa các root đó |
+Main configuration:
 
-Override trong file `.jsonnet`:
+| Parameter | Default | Meaning |
+|---|---:|---|
+| `pilot_branch_factor` | branch factor | Pilot children \(k_0\) |
+| `likelihood_samples_per_distribution` | 2 | Mixture samples \(r\) per pilot child |
+| `tv_second_phase_tokens` | 60 | Short horizon \(m\) |
+| `n_min` | 1 | Minimum retained branch demand |
+| `strict_vdra` | true | Fail rather than changing estimator/allocation behavior |
+| `invalid_support_policy` | `error` | Handling for missing pair-specific support |
+| `budget_mode` | `fixed_main` | Fixed main-expansion branch budget |
+| `queue_capacity` | 8 | Nodes per online allocation flush |
+| `root_allocation` | backend-specific | Joint root allocation; unsupported backends reject it |
 
-```jsonnet
-{ gear+: { epsilon: 0.05, K: 20 } }
+`fixed_main` keeps the main-expansion budget fixed and reports pilot/scoring as
+overhead. `fixed_total_generated` places pilot and main generation under one
+generated-token cap. Neither mode hides likelihood-scoring work.
+
+Strict main runs require a compatible tail-calibration artifact:
+
+```bash
+python scripts/calibrate_tail_divergence.py \
+  --api-base http://127.0.0.1:8000/v1 --model "$MODEL" \
+  --prompts-file data/math/train.jsonl --dataset math \
+  --k0 6 --r 2 --horizons 60 --full-tokens 512 --grade
+
+EPS_TAIL_CALIBRATION_PATH=artifacts/tail_calibration/<artifact>.json \
+  bash scripts/train_gear_tree_MATH.sh
 ```
 
-Ablations & sweep nằm trong `configs/ablations/`, `configs/baselines/`, `configs/num_iter_sweep.libsonnet`.
+The calibration grader evaluates `pilot_response + continuation`. Artifacts
+record model/checkpoint, dataset, \(k_0\), \(r\), horizons, seed and quantile.
+
+Legacy `simple`, `perplexity`, `legacy_abs`, no-tail, no-floor and no-queue
+paths are explicit ablations only. Presets live in `configs/ablations/` and are
+launched through `scripts/run_ablations.sh`.
 
 ## Logging offline (no internet)
 

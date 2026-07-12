@@ -48,7 +48,6 @@ def build_run_manifest(
     branch_factors: Optional[Mapping[int, int]] = None,
     use_residual_budget: Optional[bool] = None,
     root_allocation: Optional[bool] = None,
-    budget_lambda: Optional[float] = None,
     n_min: Optional[int] = None,
     backend: Optional[str] = None,
     training: bool = True,
@@ -70,7 +69,6 @@ def build_run_manifest(
         "branch_factors": {str(k): int(v) for k, v in sorted(branch_factors.items())},
         "use_residual_budget": use_residual_budget,
         "root_allocation": root_allocation,
-        "budget_lambda": budget_lambda,
         "n_min": n_min,
     }
     if backend is not None:

@@ -218,9 +218,9 @@ def test_pair_tvs_tanh_restricts_pairs_to_their_own_support():
     ]
     pair_tvs = estimator._pair_tvs_tanh(logp_matrix, [0, 1, 2])
     assert pair_tvs[(0, 1)] == pytest.approx(0.0)
-    # Without origins the pooled support leaks z2 into pair (0, 1).
-    pooled = estimator._pair_tvs_tanh(logp_matrix, None)
-    assert pooled[(0, 1)] > 0.0
+    # Missing origins must never trigger unrelated pooled support.
+    with pytest.raises(ValueError, match="pair-specific TV support"):
+        estimator._pair_tvs_tanh(logp_matrix, None)
 
 
 def test_estimate_for_parent_generates_subnode_samples_with_budgeted_expansion():

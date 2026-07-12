@@ -51,10 +51,10 @@ def test_demo_logger_writes_files(tmp_path: Path):
 
 
 def test_allocation_uses_sigma_squared():
-    # weight = sqrt(sigma^2 - lambda), lambda default 0.
+    # VDRA priority weight is exactly sqrt(C_s).
     nodes = [
-        {"gear_segment_id": "a", "gear_reward_variance": 0.25},  # weight sqrt(0.25)=0.5
-        {"gear_segment_id": "b", "gear_reward_variance": 1.0},   # weight sqrt(1.0)=1.0
+        {"gear_segment_id": "a", "vdra_default_k": 1, "vdra_predicted_k": 6, "vdra_dispersion_C": 0.25},  # weight sqrt(0.25)=0.5
+        {"gear_segment_id": "b", "vdra_default_k": 1, "vdra_predicted_k": 6, "vdra_dispersion_C": 1.0},   # weight sqrt(1.0)=1.0
     ]
     summ = allocate_branch_factors(nodes, total_budget=6)
     assert summ.weights["a"] == math.sqrt(0.25)
@@ -64,10 +64,8 @@ def test_allocation_uses_sigma_squared():
     assert summ.allocations["b"] == 4
 
 
-def test_allocation_lambda_zero_default_keeps_low_variance():
-    # With old sqrt(sigma^4 - 0.02), sigma^2=0.1 -> sigma^4=0.01 < 0.02 -> weight 0.
-    # With new sqrt(sigma^2 - 0), sigma^2=0.1 -> weight sqrt(0.1) > 0.
-    nodes = [{"gear_segment_id": "a", "gear_reward_variance": 0.1}]
+def test_allocation_uses_positive_dispersion_without_threshold():
+    nodes = [{"gear_segment_id": "a", "vdra_default_k": 1, "vdra_predicted_k": 4, "vdra_dispersion_C": 0.1}]
     summ = allocate_branch_factors(nodes, total_budget=4)
     assert summ.weights["a"] == math.sqrt(0.1)
     assert summ.allocations["a"] == 4
