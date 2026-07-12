@@ -37,30 +37,89 @@ def simulation_lemma_gap(tv: float, gamma: float) -> float:
     return gamma * tv / denom
 
 
+def apply_tail_correction(tv: float, eps_tail: float) -> float:
+    """Short-horizon -> full-horizon TV bound: D_L <= D_m + (1 - D_m) * eps_tail."""
+
+    tv = min(max(float(tv), 0.0), 1.0)
+    eps_tail = min(max(float(eps_tail), 0.0), 1.0)
+    return tv + (1.0 - tv) * eps_tail
+
+
+def value_gap_bound(
+    tv: float,
+    *,
+    gamma: float = 0.9,
+    r_max: float = 1.0,
+    eps_tail: float = 0.0,
+    bound_form: str = "linear",
+) -> float:
+    """Upper bound on |V(u_i) - V(u_j)| from a short-horizon TV estimate.
+
+    Shared by the pruning path (``thresholds.tv_to_value_bound``) and the
+    budget-allocation path (``reward_variance_from_pair_tvs``) so both use the
+    same scale.  Steps:
+
+      1. tail correction  tv_eff = tv + (1 - tv) * eps_tail;
+      2. ``bound_form='linear'``: g = tv_eff — the exact TV bound for bounded
+         terminal reward, |V_i - V_j| <= R_max * D_TV;
+         ``bound_form='simulation_lemma'``: legacy discounted form
+         g = gamma*tv_eff / ((1-gamma)*(1-gamma+tv_eff));
+      3. clamp: values live in [0, R_max], so the bound is R_max * min(g, 1).
+    """
+
+    tv_eff = apply_tail_correction(tv, eps_tail)
+    if bound_form == "linear":
+        g = tv_eff
+    elif bound_form == "simulation_lemma":
+        g = simulation_lemma_gap(tv_eff, gamma)
+    else:
+        raise ValueError(f"Unknown bound_form: {bound_form!r}")
+    return max(float(r_max), 0.0) * min(g, 1.0)
+
+
+def _canonical_pair_items(
+    pair_tvs: Mapping[PairKey, float],
+) -> Dict[PairKey, float]:
+    """Normalize keys to unordered ``i < j`` pairs, dropping diagonals."""
+
+    out: Dict[PairKey, float] = {}
+    for (i, j), tv in pair_tvs.items():
+        if i == j:
+            continue
+        key = (i, j) if i < j else (j, i)
+        out.setdefault(key, float(tv))
+    return out
+
+
 def reward_variance_from_pair_tvs(
     pair_tvs: Mapping[PairKey, float],
     *,
     n: int,
     gamma: float,
+    r_max: float = 1.0,
+    eps_tail: float = 0.0,
+    bound_form: str = "linear",
 ) -> float:
-    """Compute Var(P) from unordered pairwise TV estimates.
+    """Node value-dispersion upper bound C_s from pairwise TV estimates.
 
-    The requested formula is
+    Implements Summary.md §8 with uniform pilot weights q_i = 1/n:
 
-        1 / (2*n*(n-1)) * sum_{i,j} gap(TV_ij)^2.
+        C_s = 1/(2*n^2) * sum_{i,j} B_ij^2,
 
-    ``pair_tvs`` normally stores unordered pairs with ``i < j``.  We multiply
-    the unordered-pair contribution by two so the normalization matches the
-    ordered ``sum_{i,j}``; diagonal terms are zero and omitted.
+    where ``B_ij = value_gap_bound(TV_ij)``.  ``pair_tvs`` stores unordered
+    pairs (canonicalized here); each contributes twice to the ordered sum and
+    diagonal terms are zero, so C_s = sum_{i<j} B_ij^2 / n^2.
     """
 
     if n <= 1:
         return 0.0
     total = 0.0
-    for tv in pair_tvs.values():
-        gap = simulation_lemma_gap(tv, gamma)
-        total += 2.0 * gap * gap
-    return total / (2.0 * float(n) * float(n - 1))
+    for tv in _canonical_pair_items(pair_tvs).values():
+        gap = value_gap_bound(
+            tv, gamma=gamma, r_max=r_max, eps_tail=eps_tail, bound_form=bound_form
+        )
+        total += gap * gap
+    return total / (float(n) * float(n))
 
 
 def _node_id(node: Mapping[str, Any], fallback: int) -> str:
@@ -82,13 +141,19 @@ def allocate_branch_factors(
     weight_key: Optional[str] = None,
     fallback_uniform: bool = False,
 ) -> AllocationSummary:
-    """Allocate branch factors with optional largest-remainder rounding.
+    """Allocate branch factors per Summary.md §10 with an allocation floor.
 
-    By default this preserves the historical floor-only behavior: ``sigma_i^2``
-    is stored as ``gear_reward_variance`` and nodes are weighted by
-    ``sqrt(sigma_i^4 - lambda_)`` when the margin is non-negative.  Queue-based
-    online GEAR calls this with ``distribute_remainder=True`` so all queue
-    resources are consumed by the largest fractional remainders.
+    Every node first receives the floor ``n_min`` (the floor prevents a node
+    from being completely discarded because of an inaccurate proxy), then the
+    remaining budget ``B - |Q| * n_min`` is distributed proportionally to the
+    node weights:
+
+        k_s = n_min + (B - |Q| * n_min) * w_s / sum_j w_j,
+
+    with ``w_s = sqrt(max(sigma_s^4 - lambda_, 0))`` (historical treetune
+    weighting) and largest-remainder rounding when ``distribute_remainder=True``.
+    Queue-based online GEAR calls this with ``distribute_remainder=True`` so all
+    queue resources are consumed by the largest fractional remainders.
     """
 
     total_budget = max(int(total_budget), 0)
@@ -106,11 +171,7 @@ def allocate_branch_factors(
         sigma2 = max(float(node.get("gear_reward_variance", 0.0) or 0.0), 0.0)
         sigma4 = sigma2 * sigma2
         margin = sigma4 - lambda_
-        if margin < 0.0:
-            weights[node_id] = 0.0
-            allocations[node_id] = n_min
-        else:
-            weights[node_id] = math.sqrt(margin)
+        weights[node_id] = math.sqrt(margin) if margin > 0.0 else 0.0
 
     weight_sum = sum(weights.values())
     if fallback_uniform and total_budget > 0 and weight_sum <= 0.0 and weights:
@@ -118,15 +179,22 @@ def allocate_branch_factors(
             weights[node_id] = 1.0
         weight_sum = sum(weights.values())
 
-    remaining_budget = max(total_budget - sum(allocations.values()), 0)
-    if remaining_budget > 0 and weight_sum > 0.0:
-        for node_id, weight in weights.items():
-            if node_id in allocations:
-                raw_allocations[node_id] = float(allocations[node_id])
-                continue
-            raw = remaining_budget * weight / weight_sum
-            raw_allocations[node_id] = raw
-            allocations[node_id] = int(math.floor(raw))
+    # Floor: every node keeps at least n_min so no node is fully discarded.
+    # If the floor alone exceeds the budget, fall back to an even split.
+    if weights and n_min * len(weights) > total_budget:
+        even, extra = divmod(total_budget, len(weights))
+        for idx, node_id in enumerate(sorted(weights)):
+            allocations[node_id] = even + (1 if idx < extra else 0)
+            raw_allocations[node_id] = float(allocations[node_id])
+    else:
+        for node_id in weights:
+            allocations[node_id] = n_min
+        remaining_budget = max(total_budget - n_min * len(weights), 0)
+        if remaining_budget > 0 and weight_sum > 0.0:
+            for node_id, weight in weights.items():
+                raw = remaining_budget * weight / weight_sum
+                raw_allocations[node_id] = n_min + raw
+                allocations[node_id] = n_min + int(math.floor(raw))
 
     for node_id, value in allocations.items():
         raw_allocations.setdefault(node_id, float(value))
@@ -146,9 +214,7 @@ def allocate_branch_factors(
         )
         idx = 0
         while leftover > 0 and fractional:
-            frac, node_id = fractional[idx % len(fractional)]
-            if frac <= 0.0 and weight_sum > 0.0:
-                break
+            _, node_id = fractional[idx % len(fractional)]
             allocations[node_id] = allocations.get(node_id, 0) + 1
             leftover -= 1
             idx += 1

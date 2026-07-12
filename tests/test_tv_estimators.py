@@ -3,7 +3,11 @@ import math
 
 import pytest
 
-from treetune.gear.tv_estimators import ConditionalTVEstimator, TVSample
+from treetune.gear.tv_estimators import (
+    ConditionalTVEstimator,
+    TVSample,
+    pairwise_tv_tanh,
+)
 
 
 class FakeScorer:
@@ -125,8 +129,8 @@ def test_pair_tvs_can_use_half_factor():
     assert pair_tvs[(0, 1)] == pytest.approx(1.0)
 
 
-def test_estimator_uses_restricted_support_probabilities_without_softmax():
-    scorer = TableScorer(
+def _ratio_table_scorer():
+    return TableScorer(
         {
             ("p1", "a"): math.log(0.2),
             ("p1", "bb"): math.log(0.05),
@@ -134,24 +138,89 @@ def test_estimator_uses_restricted_support_probabilities_without_softmax():
             ("p2", "bb"): math.log(0.01),
         }
     )
-    estimator = ConditionalTVEstimator(
-        scorer=scorer,
-        node_expander=FakeExpander(),
-        gamma=0.5,
-        n_tv_estimates=2,
-    )
-    samples = [
+
+
+def _ratio_samples():
+    return [
         TVSample(first={"full_text": "p1"}, second={"text": "a"}),
         TVSample(first={"full_text": "p2"}, second={"text": "bb"}),
     ]
 
-    result = asyncio.run(estimator.estimate_from_samples(samples))
+
+def test_estimator_defaults_to_tanh_mixture_estimator():
+    estimator = ConditionalTVEstimator(
+        scorer=_ratio_table_scorer(),
+        node_expander=FakeExpander(),
+        gamma=0.5,
+        n_tv_estimates=2,
+    )
+
+    result = asyncio.run(estimator.estimate_from_samples(_ratio_samples()))
 
     assert result.prob_matrix[0] == pytest.approx([0.2, 0.05])
     assert result.prob_matrix[1] == pytest.approx([0.1, 0.01])
+    # Summary.md §9: mean over z of |P_i(z)-P_j(z)| / (P_i(z)+P_j(z)):
+    #   z=a : (0.2-0.1)/(0.2+0.1)   = 1/3
+    #   z=bb: (0.05-0.01)/(0.05+0.01) = 2/3
+    assert result.pair_tvs[(0, 1)] == pytest.approx(0.5)
+
+
+def test_estimator_legacy_abs_mode_keeps_old_unnormalized_formula():
+    estimator = ConditionalTVEstimator(
+        scorer=_ratio_table_scorer(),
+        node_expander=FakeExpander(),
+        gamma=0.5,
+        n_tv_estimates=2,
+        tv_estimator="legacy_abs",
+    )
+
+    result = asyncio.run(estimator.estimate_from_samples(_ratio_samples()))
+
     assert sum(result.prob_matrix[0]) == pytest.approx(0.25)
     assert sum(result.prob_matrix[1]) == pytest.approx(0.11)
     assert result.pair_tvs[(0, 1)] == pytest.approx(0.07)
+
+
+def test_pairwise_tv_tanh_matches_probability_ratio_identity():
+    logps_i = [math.log(0.2), math.log(0.05)]
+    logps_j = [math.log(0.1), math.log(0.01)]
+    expected = 0.5 * ((0.2 - 0.1) / (0.2 + 0.1) + (0.05 - 0.01) / (0.05 + 0.01))
+    assert pairwise_tv_tanh(logps_i, logps_j) == pytest.approx(expected)
+    # Symmetric, zero for identical rows, one for disjoint support.
+    assert pairwise_tv_tanh(logps_j, logps_i) == pytest.approx(expected)
+    assert pairwise_tv_tanh(logps_i, logps_i) == 0.0
+    assert pairwise_tv_tanh([-1.0], [-math.inf]) == pytest.approx(1.0)
+
+
+def test_pairwise_tv_tanh_survives_sequence_level_logprobs():
+    # Sequence-level log-probs around -60 underflow exp(); the tanh estimator
+    # must still distinguish similar from dissimilar continuation likelihoods.
+    close = pairwise_tv_tanh([-60.0, -61.0], [-60.05, -61.02])
+    far = pairwise_tv_tanh([-60.0, -61.0], [-80.0, -40.0])
+    assert close < 0.05
+    assert far > 0.99
+
+
+def test_pair_tvs_tanh_restricts_pairs_to_their_own_support():
+    estimator = ConditionalTVEstimator(
+        scorer=FakeScorer(),
+        node_expander=FakeExpander(),
+        gamma=0.5,
+        n_tv_estimates=2,
+    )
+    # Column origins: z0 from prefix 0, z1 from prefix 1, z2 from prefix 2.
+    # Rows 0/1 agree on their own support (z0, z1) and only differ on z2,
+    # which belongs to prefix 2 and must be excluded for pair (0, 1).
+    logp_matrix = [
+        [-1.0, -2.0, -3.0],
+        [-1.0, -2.0, -9.0],
+        [-5.0, -6.0, -1.5],
+    ]
+    pair_tvs = estimator._pair_tvs_tanh(logp_matrix, [0, 1, 2])
+    assert pair_tvs[(0, 1)] == pytest.approx(0.0)
+    # Without origins the pooled support leaks z2 into pair (0, 1).
+    pooled = estimator._pair_tvs_tanh(logp_matrix, None)
+    assert pooled[(0, 1)] > 0.0
 
 
 def test_estimate_for_parent_generates_subnode_samples_with_budgeted_expansion():

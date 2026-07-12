@@ -46,6 +46,10 @@
       gear_budget_queue_timeout_seconds: $.gear.budget_queue_timeout_seconds,
       gear_skip_near_leaf_expand: $.gear.skip_near_leaf_expand,
       gear_root_allocation: $.gear.root_allocation,
+      gear_eps_tail: $.gear.eps_tail,
+      gear_eps_tail_by_depth: $.gear.eps_tail_by_depth,
+      gear_bound_form: $.gear.bound_form,
+      gear_tv_estimator: $.gear.tv_estimator,
     },
 
     tree_update_mode: $.gear.tree_update_mode,

@@ -18,3 +18,6 @@ slides
 # Auto-generated tree-shape overlays (scripts/_common.sh:ensure_tree_config)
 configs/episode_generators/_generated/
 prunning_analysis/outputs/
+# verl migration: env-setup log + reversible old-verl backup (not for VCS)
+verl/recipe/gear_tree/tests/_env_setup.log
+verl_0.8.0.dev_backup/

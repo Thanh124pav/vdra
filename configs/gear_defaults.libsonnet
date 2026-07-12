@@ -27,6 +27,12 @@
     use_residual_budget: true,
     budget_queue_count: 4,
     budget_queue_timeout_seconds: 1.0,
+    // VDRA (Summary.md §7-§9): tail-corrected value bound + tanh TV estimator.
+    // eps_tail is calibrated offline via scripts/calibrate_tail_divergence.py.
+    eps_tail: 0.0,
+    eps_tail_by_depth: null,
+    bound_form: 'linear',  // 'linear' | 'simulation_lemma' (legacy gamma form)
+    tv_estimator: 'tanh',  // 'tanh' (§9) | 'legacy_abs' (degenerate; ablation only)
     // When true, skip TV/budget allocation at the final expansion depth and
     // use uniform SPO-style branch factor B instead. This avoids near-leaf
     // context exhaustion from TV probe continuations.
