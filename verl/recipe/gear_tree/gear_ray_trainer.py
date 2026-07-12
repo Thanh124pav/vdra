@@ -41,12 +41,30 @@ class RayGearTreeTrainer(RayPPOTrainer):
         return gt
 
     def _generate_edge_batch(self, gen_batch: DataProto) -> DataProto:
-        """Run the tree rollout on the actor/rollout worker group.
+        """Run the tree rollout and return a flat edge DataProto.
 
-        Returns a flat DataProto whose rows are SPO/GEAR edges with
-        ``advantages`` already filled in by the tree rollout.
+        Two backends:
+          * ``async`` (verl >= 0.7 + vLLM >= 0.20): standard ``generate_sequences``
+            routes to the ``gear_tree_agent`` agent loop, which returns per-prompt
+            edges in ``non_tensor_batch['gear_tree_edges']``; we flatten them.
+          * ``spmd`` (verl 0.6): the custom ``build_trees`` worker method.
+        Advantages are precomputed in either case (verl ``compute_advantage`` bypassed).
         """
-        gen_batch.meta_info["gear_tree_config"] = self._gear_tree_config()
+        gt = self._gear_tree_config()
+        gen_batch.meta_info["gear_tree_config"] = gt
+        backend = gt.get("rollout_backend", "async")
+        if backend == "async":
+            from recipe.gear_tree.async_tree_rollout import collect_tree_edges
+            from recipe.gear_tree.tree_data import edges_to_dataproto
+
+            rollout_out = self.actor_rollout_wg.generate_sequences(gen_batch)
+            edges = collect_tree_edges(rollout_out)
+            return edges_to_dataproto(
+                edges,
+                self.tokenizer,
+                max_prompt_length=self.config.data.max_prompt_length,
+                max_response_length=self.config.data.max_response_length,
+            )
         return self.actor_rollout_wg.build_trees(gen_batch)
 
     def fit(self):

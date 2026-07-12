@@ -1,0 +1,5 @@
+# Agent-loop registry for the GEAR/Tree recipe.
+# Loaded via actor_rollout_ref.rollout.agent.agent_loop_config_path so the
+# agent-loop workers can instantiate the tree agent by fqdn.
+- name: gear_tree_agent
+  _target_: recipe.gear_tree.async_tree_rollout.TreeAgentLoop

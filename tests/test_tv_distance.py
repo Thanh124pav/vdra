@@ -21,7 +21,32 @@ def test_tv_m_identical_rows_zero():
     r = [math.log(0.3), math.log(0.3), math.log(0.2), math.log(0.1)]
     a = make_row(M, "a", r)
     b = make_row(M, "b", r)
-    assert tv_m(a, b) == pytest.approx(2 * 0.5 * math.exp(a.delta()), abs=1e-9)
+    # tanh estimator: identical log-prob rows give exactly zero TV.
+    assert tv_m(a, b) == pytest.approx(0.0, abs=1e-12)
+    # Legacy partial-sum bound keeps its residual-mass tail.
+    assert tv_m(a, b, estimator="legacy_abs") == pytest.approx(
+        2 * 0.5 * math.exp(a.delta()), abs=1e-9
+    )
+
+
+def test_tv_m_tanh_stays_informative_for_sequence_level_logprobs():
+    # Full-sequence log-probs (~-60) underflow exp(); the legacy estimator's
+    # body degenerates to ~0 while its tail saturates to ~1.  The tanh
+    # estimator still separates near-identical from different rows.
+    M = LogProbMatrix(K=1, m=3)
+    close_a = make_row(M, "ca", [-60.0, -61.0, -59.5])
+    close_b = make_row(M, "cb", [-60.1, -60.9, -59.4])
+    far_a = make_row(M, "fa", [-60.0, -61.0, -59.5])
+    far_b = make_row(M, "fb", [-80.0, -40.0, -75.0])
+    tv_close = tv_m(close_a, close_b)
+    tv_far = tv_m(far_a, far_b)
+    assert 0.0 <= tv_close < 0.1
+    assert tv_far > 0.9
+    # Legacy form cannot distinguish the two cases (both ≈ 1 via the tail).
+    legacy_close = tv_m(close_a, close_b, estimator="legacy_abs")
+    legacy_far = tv_m(far_a, far_b, estimator="legacy_abs")
+    assert legacy_close == pytest.approx(1.0, abs=1e-6)
+    assert legacy_far == pytest.approx(1.0, abs=1e-6)
 
 
 def test_tv_m_disjoint_rows_close_to_one():

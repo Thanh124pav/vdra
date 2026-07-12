@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from treetune.gear.budget_allocation import reward_variance_from_pair_tvs
-from treetune.gear.thresholds import ThresholdConfig, tv_to_value_bound
+from treetune.gear.thresholds import ThresholdConfig, eps_tail_for_depth, tv_to_value_bound
 
 
 PairKey = Tuple[int, int]
@@ -59,6 +59,10 @@ class PruningTraceRecord:
     prune_candidate: Optional[bool]
     keep: Optional[bool]
     unavailable_fields: List[str]
+    # Diagnostic only: does the observed |v_x - v_y| respect the bound?  Used
+    # by the oracle audit; NOT a pruning criterion (the bound holding says the
+    # bound is valid, not that the values are close).
+    bound_holds: Optional[bool] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -113,7 +117,12 @@ def trace_records_from_matrices(
     )
     if reward_variance is None:
         reward_variance = reward_variance_from_pair_tvs(
-            normalized_pairs, n=len(prob_matrix), gamma=threshold_cfg.gamma
+            normalized_pairs,
+            n=len(prob_matrix),
+            gamma=threshold_cfg.gamma,
+            r_max=threshold_cfg.r_max,
+            eps_tail=eps_tail_for_depth(threshold_cfg, depth),
+            bound_form=threshold_cfg.bound_form,
         )
     sigma4 = float(reward_variance) * float(reward_variance)
     normalized_value_gaps = normalize_pair_tvs(value_gaps or {})
@@ -123,12 +132,17 @@ def trace_records_from_matrices(
         p_x = list(prob_matrix[i]) if i < len(prob_matrix) else None
         p_y = list(prob_matrix[j]) if j < len(prob_matrix) else None
         value_gap = normalized_value_gaps.get(pair)
-        upper_bound = tv_to_value_bound(float(tv), threshold_cfg)
+        upper_bound = tv_to_value_bound(float(tv), threshold_cfg, depth)
         duplicate = float(tv) < duplicate_tv_threshold
-        prune_candidate = (
-            bool(value_gap is not None and float(value_gap) <= upper_bound)
+        # Prune only when the *bound* certifies the values are within epsilon:
+        # |v_x - v_y| <= upper_bound <= epsilon.  (The old check
+        # `value_gap <= upper_bound` merely verified the bound holds — it is
+        # nearly always true and is kept as the `bound_holds` diagnostic.)
+        prune_candidate = float(upper_bound) <= float(threshold_cfg.epsilon)
+        bound_holds = (
+            bool(float(value_gap) <= float(upper_bound))
             if value_gap is not None
-            else duplicate
+            else None
         )
         records.append(
             PruningTraceRecord(
@@ -148,6 +162,7 @@ def trace_records_from_matrices(
                 prune_candidate=bool(prune_candidate),
                 keep=not bool(prune_candidate),
                 unavailable_fields=[],
+                bound_holds=bound_holds,
             )
         )
     return records
@@ -259,6 +274,7 @@ def format_trace_record(record: PruningTraceRecord) -> str:
             f"[prunning] value_upper_bound={record.value_upper_bound}",
             f"[prunning] reward_variance_sigma2={record.reward_variance}",
             f"[prunning] sigma4={record.sigma4}",
+            f"[prunning] bound_holds={record.bound_holds}",
             (
                 f"[prunning] duplicate={record.duplicate} "
                 f"prune_candidate={record.prune_candidate} keep={record.keep}"

@@ -21,6 +21,40 @@ from .budget_allocation import reward_variance_from_pair_tvs
 PairKey = Tuple[int, int]
 
 
+def pairwise_tv_tanh(logps_i: Sequence[float], logps_j: Sequence[float]) -> float:
+    """Likelihood-based short-horizon TV estimator (Summary.md §9).
+
+    Uses the identity |a-b|/(a+b) = |tanh((log a - log b)/2)| so the estimate
+    depends only on the log-probability *ratio* of each sampled block under the
+    two conditional distributions — full-sequence probabilities like exp(-60)
+    never appear, which keeps the estimator numerically meaningful.
+
+        D_hat = mean_z |tanh((log P_i(z) - log P_j(z)) / 2)|,
+
+    averaged over blocks z drawn from the mixture (Z_i ∪ Z_j when per-pair
+    supports are available).  A block with zero probability under exactly one
+    distribution contributes 1 (disjoint support).
+    """
+
+    vals: List[float] = []
+    for a, b in zip(logps_i, logps_j):
+        try:
+            a = float(a)
+            b = float(b)
+        except (TypeError, ValueError):
+            continue
+        finite_a = math.isfinite(a)
+        finite_b = math.isfinite(b)
+        if not finite_a or not finite_b:
+            if finite_a != finite_b:
+                vals.append(1.0)
+            continue
+        vals.append(abs(math.tanh((a - b) / 2.0)))
+    if not vals:
+        return 0.0
+    return sum(vals) / len(vals)
+
+
 @dataclass
 class TVSample:
     first: Node
@@ -54,9 +88,15 @@ class ConditionalTVEstimator:
         first_phase_tokens: int = 120,
         second_phase_tokens: int = 60,
         tv_includes_half_factor: bool = True,
+        tv_estimator: str = "tanh",
+        r_max: float = 1.0,
+        eps_tail: float = 0.0,
+        bound_form: str = "linear",
     ):
         if mode not in {"subnode", "hierachical", "hierarchical", "perplexity"}:
             raise ValueError(f"Unsupported TV estimator mode: {mode}")
+        if tv_estimator not in {"tanh", "legacy_abs"}:
+            raise ValueError(f"Unsupported tv_estimator: {tv_estimator}")
         self.scorer = scorer
         self.node_expander = node_expander
         self.gamma = float(gamma)
@@ -65,7 +105,21 @@ class ConditionalTVEstimator:
         self.first_phase_tokens = max(int(first_phase_tokens), 1)
         self.second_phase_tokens = max(int(second_phase_tokens), 1)
         self.tv_includes_half_factor = bool(tv_includes_half_factor)
+        self.tv_estimator = tv_estimator
+        self.r_max = float(r_max)
+        self.eps_tail = float(eps_tail)
+        self.bound_form = bound_form
         self._score_cache: Dict[Tuple[str, str], float] = {}
+
+    def _reward_variance(self, pair_tvs: Mapping[PairKey, float], n: int) -> float:
+        return reward_variance_from_pair_tvs(
+            pair_tvs,
+            n=n,
+            gamma=self.gamma,
+            r_max=self.r_max,
+            eps_tail=self.eps_tail,
+            bound_form=self.bound_form,
+        )
 
     async def estimate_for_parent(self, parent: Node, *, depth: int) -> TVEstimateResult:
         samples, candidates = await self._generate_samples(parent, depth=depth)
@@ -89,8 +143,8 @@ class ConditionalTVEstimator:
         is below ``duplicate_tv_threshold``.
         """
 
-        first_nodes, support_nodes = await self._generate_first_prefix_support(
-            parent, depth=depth
+        first_nodes, support_nodes, support_origins = (
+            await self._generate_first_prefix_support(parent, depth=depth)
         )
         if not first_nodes:
             return TVEstimateResult(
@@ -125,7 +179,10 @@ class ConditionalTVEstimator:
         support = [node.get("text", "") for node in support_nodes]
         logp_matrix = await self._score_matrix(prefixes, support)
         prob_matrix = [self._support_probabilities(row) for row in logp_matrix]
-        pair_tvs = self._pair_tvs(prob_matrix)
+        if self.tv_estimator == "tanh":
+            pair_tvs = self._pair_tvs_tanh(logp_matrix, support_origins)
+        else:
+            pair_tvs = self._pair_tvs(prob_matrix)
         duplicate_pairs = [
             pair for pair, tv in pair_tvs.items() if tv < float(duplicate_tv_threshold)
         ]
@@ -133,9 +190,7 @@ class ConditionalTVEstimator:
             first_nodes, pair_tvs, duplicate_tv_threshold
         )
         unique_candidates = [first_nodes[idx] for idx in unique_indices]
-        variance = reward_variance_from_pair_tvs(
-            pair_tvs, n=len(first_nodes), gamma=self.gamma
-        )
+        variance = self._reward_variance(pair_tvs, len(first_nodes))
         return TVEstimateResult(
             samples=samples,
             logp_matrix=logp_matrix,
@@ -164,8 +219,13 @@ class ConditionalTVEstimator:
         support = [sample.second.get("text", "") for sample in samples]
         logp_matrix = await self._score_matrix(prefixes, support)
         prob_matrix = [self._support_probabilities(row) for row in logp_matrix]
-        pair_tvs = self._pair_tvs(prob_matrix)
-        variance = reward_variance_from_pair_tvs(pair_tvs, n=n, gamma=self.gamma)
+        if self.tv_estimator == "tanh":
+            # Column k was generated from sample k's first prefix, so pair
+            # (i, j) restricts to its own continuations Z_i ∪ Z_j.
+            pair_tvs = self._pair_tvs_tanh(logp_matrix, list(range(n)))
+        else:
+            pair_tvs = self._pair_tvs(prob_matrix)
+        variance = self._reward_variance(pair_tvs, n)
         return TVEstimateResult(
             samples=samples,
             logp_matrix=logp_matrix,
@@ -232,7 +292,7 @@ class ConditionalTVEstimator:
 
     async def _generate_first_prefix_support(
         self, parent: Node, *, depth: int
-    ) -> Tuple[List[Node], List[Node]]:
+    ) -> Tuple[List[Node], List[Node], List[int]]:
         if self.mode == "hierachical":
             first_count = self._hierarchical_first_count()
             second_per_first = max(1, int(math.ceil(self.n_tv_estimates / first_count)))
@@ -252,8 +312,10 @@ class ConditionalTVEstimator:
             max_tokens=self.first_phase_tokens,
             branch_factor=first_count,
         )
-        continuable_first_nodes = [
-            first for first in first_nodes if first.get("finish_reason") == "length"
+        continuable = [
+            (idx, first)
+            for idx, first in enumerate(first_nodes)
+            if first.get("finish_reason") == "length"
         ]
         second_tasks = [
             asyncio.create_task(
@@ -269,19 +331,24 @@ class ConditionalTVEstimator:
                     ),
                 )
             )
-            for first in continuable_first_nodes
+            for _, first in continuable
         ]
         second_batches = await asyncio.gather(*second_tasks) if second_tasks else []
         support_nodes: List[Node] = []
+        # support_origins[k] = index (in first_nodes) of the prefix that
+        # generated support block k; the tanh estimator uses it to restrict
+        # each pair (i, j) to its own continuations Z_i ∪ Z_j.
+        support_origins: List[int] = []
         seen_support = set()
-        for seconds in second_batches:
+        for (first_idx, _), seconds in zip(continuable, second_batches):
             for second in seconds:
                 text = second.get("text", "")
                 if text in seen_support:
                     continue
                 seen_support.add(text)
                 support_nodes.append(second)
-        return first_nodes, support_nodes
+                support_origins.append(first_idx)
+        return first_nodes, support_nodes, support_origins
 
     @staticmethod
     def _unique_prefix_indices(
@@ -370,6 +437,14 @@ class ConditionalTVEstimator:
                 max_tokens=max_tokens,
             )
 
+    async def _score_one_any(self, prefix: str, continuation: str) -> float:
+        """Await the scorer if it is async; accept sync scorers as-is."""
+
+        result = self.scorer.score_one(prefix, continuation)
+        if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+            return await result
+        return result
+
     async def _score_matrix(
         self,
         prefixes: Sequence[str],
@@ -383,7 +458,7 @@ class ConditionalTVEstimator:
                 if key in self._score_cache:
                     matrix[i][k] = self._score_cache[key]
                 else:
-                    pending.append((i, k, asyncio.create_task(self.scorer.score_one(prefix, continuation))))
+                    pending.append((i, k, asyncio.create_task(self._score_one_any(prefix, continuation))))
         if pending:
             values = await asyncio.gather(*(task for _, _, task in pending))
             for (i, k, _), value in zip(pending, values):
@@ -408,6 +483,13 @@ class ConditionalTVEstimator:
         return probs
 
     def _pair_tvs(self, prob_matrix: Sequence[Sequence[float]]) -> Dict[PairKey, float]:
+        """Legacy absolute-probability estimator (``tv_estimator='legacy_abs'``).
+
+        Kept only for ablations: summing |exp(LP_i) - exp(LP_j)| over a sampled
+        support of full sequences is numerically degenerate (sequence
+        probabilities underflow toward 0), so it systematically reports TV ≈ 0.
+        """
+
         pair_tvs: Dict[PairKey, float] = {}
         for i in range(len(prob_matrix)):
             pi = prob_matrix[i]
@@ -417,6 +499,39 @@ class ConditionalTVEstimator:
                 if self.tv_includes_half_factor:
                     tv *= 0.5
                 pair_tvs[(i, j)] = tv
+        return pair_tvs
+
+    def _pair_tvs_tanh(
+        self,
+        logp_matrix: Sequence[Sequence[float]],
+        support_origins: Optional[Sequence[int]] = None,
+    ) -> Dict[PairKey, float]:
+        """Pairwise TV via the §9 tanh estimator on the log-prob matrix.
+
+        When ``support_origins`` maps each column to the first-prefix that
+        generated it, pair (i, j) is estimated only on Z_i ∪ Z_j (the mixture
+        support of that pair); pairs without own columns fall back to the full
+        pooled support.
+        """
+
+        pair_tvs: Dict[PairKey, float] = {}
+        n = len(logp_matrix)
+        n_cols = len(logp_matrix[0]) if n else 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                cols: List[int] = []
+                if support_origins is not None:
+                    cols = [
+                        k
+                        for k, origin in enumerate(support_origins)
+                        if origin in (i, j) and k < n_cols
+                    ]
+                if not cols:
+                    cols = list(range(n_cols))
+                pair_tvs[(i, j)] = pairwise_tv_tanh(
+                    [logp_matrix[i][k] for k in cols],
+                    [logp_matrix[j][k] for k in cols],
+                )
         return pair_tvs
 
 

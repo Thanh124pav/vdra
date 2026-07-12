@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+
+from treetune.gear.budget_allocation import value_gap_bound
 
 
 @dataclass
@@ -23,6 +25,26 @@ class ThresholdConfig:
     K: int = 10  # fast subset size
     use_dkw: bool = True
     eta_override: Optional[float] = None  # for ablation: bypass Lemma 2.4
+    # Tail-divergence correction (Summary.md §7): D_L <= D_m + (1-D_m)*eps_tail.
+    # eps_tail_by_depth overrides the global value per tree depth when set.
+    eps_tail: float = 0.0
+    eps_tail_by_depth: Optional[Dict[int, float]] = None
+    # 'linear' (R_max * TV bound, default) or 'simulation_lemma' (legacy gamma form).
+    bound_form: str = "linear"
+
+
+def eps_tail_for_depth(cfg: ThresholdConfig, depth: Optional[int] = None) -> float:
+    """Resolve the tail-correction coefficient for a node depth."""
+
+    if depth is not None and cfg.eps_tail_by_depth:
+        by_depth = cfg.eps_tail_by_depth
+        if depth in by_depth:
+            return float(by_depth[depth])
+        # Fall back to the deepest configured level below `depth`, else global.
+        known = [d for d in by_depth if d <= depth]
+        if known:
+            return float(by_depth[max(known)])
+    return float(cfg.eps_tail)
 
 
 def compute_eta(cfg: ThresholdConfig, delta_avg: float = 0.0) -> float:
@@ -41,22 +63,21 @@ def compute_tau(cfg: ThresholdConfig, eta: float) -> float:
     return eta + band
 
 
-def tv_to_value_bound(tv: float, cfg: ThresholdConfig) -> float:
+def tv_to_value_bound(
+    tv: float, cfg: ThresholdConfig, depth: Optional[int] = None
+) -> float:
     """Convert a TV estimate into a conservative value-difference bound.
 
-    Local ValueShare compares sampled rollout distributions directly.  For that
-    path we need to compare a
-    value bound with ``cfg.epsilon`` instead of comparing raw TV to eta.  The
-    simulation-lemma form matches the budget-allocation code path:
-
-        gamma * TV / ((1 - gamma) * (1 - gamma + TV))
-
-    and ``r_max`` scales the bound to the configured reward range.
+    Delegates to ``budget_allocation.value_gap_bound`` so the pruning path and
+    the budget-allocation path share one bound (tail correction, R_max scaling
+    and the [0, R_max] clamp included).  ``depth`` selects a depth-dependent
+    ``eps_tail`` when ``cfg.eps_tail_by_depth`` is configured.
     """
 
-    gamma = min(max(float(cfg.gamma), 0.0), 1.0 - 1e-8)
-    tv = max(float(tv), 0.0)
-    denom = (1.0 - gamma) * (1.0 - gamma + tv)
-    if denom <= 0.0 or not math.isfinite(denom):
-        return float("inf")
-    return max(float(cfg.r_max), 0.0) * gamma * tv / denom
+    return value_gap_bound(
+        tv,
+        gamma=cfg.gamma,
+        r_max=cfg.r_max,
+        eps_tail=eps_tail_for_depth(cfg, depth),
+        bound_form=cfg.bound_form,
+    )

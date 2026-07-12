@@ -4,8 +4,10 @@ import pytest
 
 from treetune.gear.budget_allocation import (
     allocate_branch_factors,
+    apply_tail_correction,
     reward_variance_from_pair_tvs,
     simulation_lemma_gap,
+    value_gap_bound,
 )
 
 
@@ -16,13 +18,66 @@ def test_simulation_lemma_gap_formula():
     assert simulation_lemma_gap(tv, gamma) == pytest.approx(expected)
 
 
-def test_reward_variance_uses_ordered_pair_normalization():
+def test_apply_tail_correction():
+    assert apply_tail_correction(0.0, 0.0) == 0.0
+    assert apply_tail_correction(0.3, 0.0) == pytest.approx(0.3)
+    assert apply_tail_correction(0.3, 0.5) == pytest.approx(0.3 + 0.7 * 0.5)
+    # eps_tail = 1 saturates the bound regardless of the short-horizon TV.
+    assert apply_tail_correction(0.3, 1.0) == pytest.approx(1.0)
+    # Inputs are clamped into [0, 1].
+    assert apply_tail_correction(1.7, 0.0) == 1.0
+    assert apply_tail_correction(-0.2, 0.0) == 0.0
+
+
+def test_value_gap_bound_linear_default():
+    # Default: |V_i - V_j| <= r_max * TV, no gamma amplification.
+    assert value_gap_bound(0.3) == pytest.approx(0.3)
+    assert value_gap_bound(0.3, r_max=2.0) == pytest.approx(0.6)
+    # eps_tail widens the bound before scaling.
+    assert value_gap_bound(0.3, eps_tail=0.5) == pytest.approx(0.3 + 0.7 * 0.5)
+
+
+def test_value_gap_bound_simulation_lemma_form_is_clamped():
+    # gamma=0.9, tv=1.0: raw gap = 0.9/(0.1*1.1) ≈ 8.18 must clamp to r_max.
+    bound = value_gap_bound(1.0, gamma=0.9, r_max=1.0, bound_form="simulation_lemma")
+    assert bound == pytest.approx(1.0)
+    # Small TV keeps the un-clamped discounted form.
+    tv = 0.001
+    raw = simulation_lemma_gap(tv, 0.9)
+    assert raw < 1.0
+    assert value_gap_bound(
+        tv, gamma=0.9, r_max=1.0, bound_form="simulation_lemma"
+    ) == pytest.approx(raw)
+
+
+def test_value_gap_bound_rejects_unknown_form():
+    with pytest.raises(ValueError):
+        value_gap_bound(0.3, bound_form="quadratic")
+
+
+def test_reward_variance_matches_summary_normalization():
+    # Summary.md §8: C_s = sum_{i<j} B_ij^2 / n^2 with B = value_gap_bound(TV).
     pair_tvs = {(0, 1): 0.2, (0, 2): 0.4, (1, 2): 0.1}
-    gamma = 0.5
-    expected = sum(2 * simulation_lemma_gap(tv, gamma) ** 2 for tv in pair_tvs.values()) / (
-        2 * 3 * 2
+    expected = sum(tv * tv for tv in pair_tvs.values()) / 9.0
+    assert reward_variance_from_pair_tvs(pair_tvs, n=3, gamma=0.5) == pytest.approx(expected)
+
+
+def test_reward_variance_canonicalizes_ordered_pairs():
+    unordered = {(0, 1): 0.2, (1, 2): 0.4}
+    with_duplicates = {(0, 1): 0.2, (1, 0): 0.2, (1, 2): 0.4, (2, 2): 0.9}
+    assert reward_variance_from_pair_tvs(
+        with_duplicates, n=3, gamma=0.5
+    ) == pytest.approx(reward_variance_from_pair_tvs(unordered, n=3, gamma=0.5))
+
+
+def test_reward_variance_honors_bound_options():
+    pair_tvs = {(0, 1): 0.2}
+    expected_gap = value_gap_bound(
+        0.2, gamma=0.9, r_max=2.0, eps_tail=0.1, bound_form="simulation_lemma"
     )
-    assert reward_variance_from_pair_tvs(pair_tvs, n=3, gamma=gamma) == pytest.approx(expected)
+    assert reward_variance_from_pair_tvs(
+        pair_tvs, n=2, gamma=0.9, r_max=2.0, eps_tail=0.1, bound_form="simulation_lemma"
+    ) == pytest.approx(expected_gap * expected_gap / 4.0)
 
 
 def test_allocate_branch_factors_keeps_floor_underallocation():
@@ -68,8 +123,40 @@ def test_allocate_branch_factors_handles_zero_margin():
 
     summary = allocate_branch_factors(nodes, total_budget=5, lambda_=0.25, n_min=2)
 
+    # Zero-margin nodes keep zero weight but still receive the n_min floor.
     assert summary.weights == {"equal": 0.0}
-    assert summary.allocations == {"equal": 0}
+    assert summary.allocations == {"equal": 2}
+
+
+def test_allocation_floor_prevents_discarding_zero_dispersion_nodes():
+    # Summary.md §10: k_s = n_min + (B - |Q|*n_min) * w_s / sum w.  A node with
+    # C_s = 0 must keep the floor instead of being pruned to zero.
+    nodes = [
+        {"gear_segment_id": "flat", "gear_reward_variance": 0.0},
+        {"gear_segment_id": "spread", "gear_reward_variance": 0.9},
+    ]
+
+    summary = allocate_branch_factors(
+        nodes, total_budget=8, lambda_=0.0, n_min=1, distribute_remainder=True
+    )
+
+    assert summary.allocations["flat"] == 1
+    assert summary.allocations["spread"] == 7
+    assert summary.allocated_budget == 8
+    assert summary.underallocated_budget == 0
+
+
+def test_allocation_floor_falls_back_to_even_split_when_floor_exceeds_budget():
+    nodes = [
+        {"gear_segment_id": "a", "gear_reward_variance": 0.9},
+        {"gear_segment_id": "b", "gear_reward_variance": 0.1},
+        {"gear_segment_id": "c", "gear_reward_variance": 0.5},
+    ]
+
+    summary = allocate_branch_factors(nodes, total_budget=4, lambda_=0.0, n_min=2)
+
+    assert sum(summary.allocations.values()) == 4
+    assert all(v >= 1 for v in summary.allocations.values())
 
 
 def test_allocate_branch_factors_handles_zero_budget_and_fallback_ids():

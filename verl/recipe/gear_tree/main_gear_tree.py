@@ -17,15 +17,26 @@ from omegaconf import OmegaConf
 from verl.trainer.main_ppo import TaskRunner, create_rl_dataset, create_rl_sampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 
-# Import for decorator side effects (registers treetune_ppo + gear_math).
+# Import for decorator side effects (registers treetune_ppo + gear_math + the
+# gear_tree_agent agent loop for the async rollout backend).
 import recipe.gear_tree.policy_loss  # noqa: F401
 import recipe.gear_tree.reward  # noqa: F401
+import recipe.gear_tree.async_tree_rollout  # noqa: F401
 
 
 @ray.remote(num_cpus=1)
 class GearTreeTaskRunner(TaskRunner):
     def add_actor_rollout_worker(self, config):
-        """Force the synchronous SPMD tree worker (needed for segment rollout)."""
+        """Pick the worker by rollout backend.
+
+        * async (verl>=0.7): use verl's stock async worker; the tree is built by
+          the registered gear_tree_agent agent loop.
+        * spmd (verl 0.6): force the custom SPMD tree worker (build_trees).
+        """
+        backend = config.get("gear_tree", {}).get("rollout_backend", "async")
+        if backend != "spmd":
+            return super().add_actor_rollout_worker(config)
+
         from verl.single_controller.ray import RayWorkerGroup
         from verl.trainer.ppo.ray_trainer import Role
 

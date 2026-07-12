@@ -85,6 +85,11 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
         gear_root_allocation: bool = False,
         gear_use_residual_budget: bool = True,
         gear_allocation_mode: str = "budget_allocation",
+        # VDRA scoring / bound knobs ------------------------------------------
+        gear_eps_tail: float = 0.0,
+        gear_eps_tail_by_depth: Optional[Dict[int, float]] = None,
+        gear_bound_form: str = "linear",
+        gear_tv_estimator: str = "tanh",
         # Inherited ----------------------------------------------------------
         **kwargs: Any,
     ):
@@ -94,7 +99,15 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
             r_max=gear_r_max,
             gamma=gear_gamma,
             K=max(int(gear_n_tv_estimates), 1),
+            eps_tail=float(gear_eps_tail),
+            eps_tail_by_depth=(
+                {int(k): float(v) for k, v in gear_eps_tail_by_depth.items()}
+                if gear_eps_tail_by_depth
+                else None
+            ),
+            bound_form=gear_bound_form,
         )
+        self.gear_tv_estimator = gear_tv_estimator
         self.gear_score_concurrency = int(gear_score_concurrency)
         self.gear_score_timeout_seconds = float(gear_score_timeout_seconds)
         self.gear_score_retry_attempts = int(gear_score_retry_attempts)
@@ -232,6 +245,10 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
             first_phase_tokens=self.gear_tv_subnode_max_tokens,
             second_phase_tokens=self.gear_tv_second_phase_tokens,
             tv_includes_half_factor=self.gear_tv_includes_half_factor,
+            tv_estimator=self.gear_tv_estimator,
+            r_max=self.cfg_thresholds.r_max,
+            eps_tail=self.cfg_thresholds.eps_tail,
+            bound_form=self.cfg_thresholds.bound_form,
         )
 
         root_nodes: List[Node] = []
@@ -474,6 +491,10 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
             first_phase_tokens=self.gear_tv_subnode_max_tokens,
             second_phase_tokens=self.gear_tv_second_phase_tokens,
             tv_includes_half_factor=self.gear_tv_includes_half_factor,
+            tv_estimator=self.gear_tv_estimator,
+            r_max=self.cfg_thresholds.r_max,
+            eps_tail=self.cfg_thresholds.eps_tail,
+            bound_form=self.cfg_thresholds.bound_form,
         )
 
         async def _expand_raw(
@@ -704,6 +725,10 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
                     first_phase_tokens=self.gear_tv_subnode_max_tokens,
                     second_phase_tokens=self.gear_tv_second_phase_tokens,
                     tv_includes_half_factor=self.gear_tv_includes_half_factor,
+            tv_estimator=self.gear_tv_estimator,
+            r_max=self.cfg_thresholds.r_max,
+            eps_tail=self.cfg_thresholds.eps_tail,
+            bound_form=self.cfg_thresholds.bound_form,
                 )
             t_var = time.time()
             result = await estimator.estimate_k_for_parent(

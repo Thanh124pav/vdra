@@ -110,7 +110,8 @@ def test_gear_defaults_expose_only_online_gear_knobs():
         "share_pair_budget_fraction:",
         "share_use_confidence:",
         "algorithm_mode:",
-        "tv_estimator:",
+        # NOTE: 'tv_estimator:' was removed from this guard — VDRA reintroduced
+        # an estimator-selection knob ('tanh' | 'legacy_abs') with that name.
     ]:
         assert removed not in defaults
     assert "gear_K:" not in overlay
@@ -126,7 +127,7 @@ def test_gear_defaults_expose_only_online_gear_knobs():
         "gear_share_pair_budget_fraction:",
         "gear_share_use_confidence:",
         "gear_algorithm_mode:",
-        "gear_tv_estimator:",
+        # 'gear_tv_estimator:' intentionally allowed again (VDRA estimator knob).
     ]:
         assert removed not in overlay
     assert "K: 10" not in defaults

@@ -41,6 +41,15 @@ def _build_gate(gt: dict):
         skip_near_leaf_expand=g.get("skip_near_leaf_expand", True),
         max_depth=len(gt.get("tree_shape", [])) or None,
         enable_share=g.get("enable_share", False),
+        eps_tail=g.get("eps_tail", 0.0),
+        eps_tail_by_depth=g.get("eps_tail_by_depth", None),
+        bound_form=g.get("bound_form", "linear"),
+        tv_estimator=g.get("tv_estimator", "tanh"),
+        tv_first_phase_tokens=g.get("tv_first_phase_tokens", 120),
+        tv_second_phase_tokens=g.get("tv_second_phase_tokens", 60),
+        queue_count=g.get("queue_count", 1),
+        queue_timeout_seconds=g.get("queue_timeout_seconds", 0.0),
+        use_residual_budget=g.get("use_residual_budget", True),
     )
 
 

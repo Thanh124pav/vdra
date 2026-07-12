@@ -30,6 +30,23 @@
 - ✅ **11 algorithms, run scripts** — `scripts/train_{grpo,rloo,vineppo,spo_chain,spo_tree,treerl,treepo,gear_spo_chain,gear_spo_tree,gear_treerl,gear_treepo}.sh` + `_common.sh`. GRPO/RLOO route through verl-native `main_flat.py` (exact built-in estimators + `treetune_ppo` loss + `gear_math`); the rest through the tree recipe. All `bash -n` clean.
 - ✅ **Logging (treetune parity)** — `tree_logging.py` `TreeDemoLogger` reuses vendored `logging_helpers`/`tree_policy_logging` → `gear_demos/demos.jsonl` + `demos.md` (per-tree stats, per-depth counts, SHARE/PRUNE/budget demo rows) + `full_trees/tree_N.json` (one complete example tree, rate-limited) + console stats. Trainer writes `training_timing.jsonl` (per-step generation/update/wall). **Verified on GPU**: real run produced 2 demo records + 2 full-tree dumps + per-tree stats.
 
+**Async re-target for verl>=0.7 + vLLM>=0.20 (user standardized on this stack):**
+- Context: verl 0.7+ removed synchronous SPMD `vLLMRollout` (PR #4411); generation
+  now goes through an async OpenAI server + `experimental.agent_loop`. The tree
+  rollout is re-targeted onto that stack; **algorithm core untouched**.
+- ✅ `tree_rollout.async_build_tree` — async mirror of `build_tree` (awaits segment_fn).
+- ✅ `async_tree_rollout.py`: `AsyncServerSegmentGenerator` (async `segment_fn` = N
+  concurrent `server_manager.generate` calls → `SegmentSample`; `finish_reason` from
+  `TokenOutput.stop_reason`/token-cap), `TreeAgentLoop(AgentLoopBase)` (registered
+  `gear_tree_agent`, builds tree, stashes edges in `extra_fields`), `collect_tree_edges`.
+- ✅ Trainer branches on `gear_tree.rollout_backend` (`async` default / `spmd` legacy):
+  async uses stock `generate_sequences`→agent loop→`collect_tree_edges`→`edges_to_dataproto`.
+  Config: `rollout.mode=async`, `agent.default_agent_loop=gear_tree_agent`, `agent_loop.yaml`.
+- ✅ **Validated against real verl 0.7.1** (env `deeplearning`): agent-loop API imports,
+  `TreeAgentLoop` subclass OK, `gear_tree_agent` registers, `segment_fn` runs, config
+  composes. 3 async CPU tests + 33 total pass. (Full GPU E2E still needs a working
+  vLLM — this env's vllm 0.22 has the broken cu13 build.)
+
 **GPU-validated (real model, HF generation, no Ray/FSDP):**
 - ✅ **Real-model smoke** — `scratchpad/smoke_gear_tree_hf.py`: SmolLM2-135M on GPU → native tree rollout (real per-token logprobs) → MATH grading → SPO/GEAR advantages → `edges_to_dataproto` → `treetune_ppo` loss. Loss numerics verified (`approx_kl == 0.5·Δ²`). vLLM path NOT used: this env's vllm 0.22 has a broken cu13 build (engine-core subprocess crash) — the `vLLMTreeRollout` binding is code-correct but unrunnable here; HF `model.generate` drives the engine-agnostic `segment_fn` instead.
 - ✅ **GEAR-VinePPO** — `vineppo_advantage.py` ports `_compute_mc_value` + `_compute_step_advantages` byte-faithful; `build_edge_batch(vineppo_K>0)` swaps internal-node values for K-rollout MC estimates. CPU-tested.
