@@ -198,6 +198,24 @@ async def async_build_tree(
     if (
         gear_gate is not None
         and gear_node_expander is not None
+        and getattr(gear_gate, "use_online_allocation", False)
+    ):
+        return await async_build_tree_online_alloc(
+            root_prompt_text,
+            root_prompt_token_ids,
+            data_instance,
+            tree_shape=tree_shape,
+            M=M,
+            segment_fn=segment_fn,
+            grade_fn=grade_fn,
+            max_depth=max_depth,
+            gear_gate=gear_gate,
+            gear_node_expander=gear_node_expander,
+        )
+
+    if (
+        gear_gate is not None
+        and gear_node_expander is not None
         and getattr(gear_gate, "use_batch_allocation", False)
     ):
         return await async_build_tree_batch_alloc(
@@ -305,7 +323,37 @@ async def _expand_reusing_pilots(
     segment_fn,
 ) -> List[SegmentSample]:
     retained = _retained_pilot_samples(node, allocated_k)
-    missing = max(int(allocated_k) - len(retained), 0)
+    completed: List[SegmentSample] = []
+    completion_tokens = 0
+    for sample in retained:
+        if (
+            max_tokens is not None
+            and sample.finish_reason == "length"
+            and int(sample.num_tokens or len(sample.token_ids)) < int(max_tokens)
+        ):
+            remaining = int(max_tokens) - int(sample.num_tokens or len(sample.token_ids))
+            prompt_ids = list(node["full_token_ids"]) + list(sample.token_ids)
+            continuation = await segment_fn(prompt_ids, 1, remaining)
+            if continuation:
+                cont = continuation[0]
+                sample = SegmentSample(
+                    token_ids=list(sample.token_ids) + list(cont.token_ids),
+                    text=sample.text + cont.text,
+                    finish_reason=cont.finish_reason,
+                    logprobs=(
+                        (list(sample.logprobs) if sample.logprobs is not None else [])
+                        + (list(cont.logprobs) if cont.logprobs is not None else [])
+                    ) or None,
+                    sum_logprobs=(
+                        float(sample.sum_logprobs or 0.0)
+                        + float(cont.sum_logprobs or 0.0)
+                    ),
+                    num_tokens=int(sample.num_tokens or 0) + int(cont.num_tokens or 0),
+                )
+                completion_tokens += len(cont.token_ids)
+        completed.append(sample)
+
+    missing = max(int(allocated_k) - len(completed), 0)
     additional = (
         await segment_fn(node["full_token_ids"], missing, max_tokens)
         if missing
@@ -317,18 +365,209 @@ async def _expand_reusing_pilots(
         len(candidate.get("response_token_ids") or [])
         for candidate in node.get("vdra_pilot_children") or []
     )
-    node["vdra_pilot_children_reused"] = len(retained)
-    node["vdra_pilot_children_discarded"] = max(generated - len(retained), 0)
+    node["vdra_pilot_completion_generated_tokens"] = completion_tokens
+    node["vdra_pilot_children_reused"] = len(completed)
+    node["vdra_pilot_children_discarded"] = max(generated - len(completed), 0)
     node["vdra_additional_children_generated"] = len(additional)
-    node["vdra_main_expansion_generated_tokens"] = sum(
+    node["vdra_main_expansion_generated_tokens"] = completion_tokens + sum(
         len(sample.token_ids) for sample in additional
     )
     node["vdra_total_generated_tokens"] = (
         node["vdra_pilot_generated_tokens"]
         + node["vdra_main_expansion_generated_tokens"]
     )
-    node["vdra_pilot_reuse_rate"] = len(retained) / generated if generated else 0.0
-    return retained + list(additional)
+    node["vdra_pilot_reuse_rate"] = len(completed) / generated if generated else 0.0
+    return completed + list(additional)
+
+async def async_build_tree_online_alloc(
+    root_prompt_text: str,
+    root_prompt_token_ids: Sequence[int],
+    data_instance: Dict[str, Any],
+    *,
+    tree_shape: Sequence[int],
+    M: int,
+    segment_fn,
+    grade_fn: GradeFn,
+    max_depth: Optional[int] = None,
+    gear_gate: Any,
+    gear_node_expander: Any,
+) -> Dict[str, Any]:
+    """Online VDRA tree builder using one long-lived queue manager per tree."""
+
+    from recipe.gear_tree.gear_core.gear.online_budget import OnlineQueueItem
+
+    t0 = time.time()
+    if max_depth is None:
+        max_depth = len(tree_shape)
+    gear_gate.validate_main_config(
+        max_default_branch_factor=max(int(x) for x in tree_shape),
+        segment_length=M,
+    )
+    policy_snapshot_id = str(data_instance.get("_treetune__idx", "tree"))
+    manager = gear_gate.make_queue_manager(policy_snapshot_id=policy_snapshot_id)
+
+    tree: Dict[str, Any] = {
+        "text": root_prompt_text,
+        "depth": 0,
+        "full_text": root_prompt_text,
+        "stop_text": "aaa",
+        "_request_object": data_instance,
+        "leaf": False,
+        "full_token_ids": list(root_prompt_token_ids),
+        "gear_segment_id": "root",
+    }
+
+    def _default_bf(depth: int) -> int:
+        return int(tree_shape[depth] if depth < len(tree_shape) else tree_shape[-1])
+
+    def _max_tokens(depth: int) -> Optional[int]:
+        return None if depth == max_depth - 1 else M
+
+    def _sample_child(parent: Dict[str, Any], depth: int, idx: int, sample: SegmentSample) -> Dict[str, Any]:
+        prefix = parent["full_text"]
+        child = {
+            "text": sample.text,
+            "depth": depth + 1,
+            "full_text": prefix + sample.text,
+            "stop_text": None,
+            "finish_reason": sample.finish_reason,
+            "response_token_ids": list(sample.token_ids),
+            "actor_shifted_log_probs": list(sample.logprobs) if sample.logprobs is not None else None,
+            "full_token_ids": list(parent["full_token_ids"]) + list(sample.token_ids),
+            "gear_segment_id": f"{parent.get('gear_segment_id', 'root')}/{depth}/{idx}",
+            "gear_parent_segment_id": parent.get("gear_segment_id", "root"),
+        }
+        if sample.sum_logprobs is not None:
+            child["sum_logprobs"] = float(sample.sum_logprobs)
+            child["num_tokens"] = int(sample.num_tokens)
+        return child
+
+    async def _handle_flush(result) -> None:
+        for item in result.items:
+            node = item.node
+            node_key = str(node.get("gear_segment_id"))
+            allocated = int(result.summary.allocations.get(node_key, node.get("vdra_allocated_k", 0)))
+            node["vdra_allocation_seconds"] = result.allocation_seconds
+            await _expand_parent(
+                node,
+                depth=item.depth,
+                allocated_branch_factor=allocated,
+                default_branch_factor=item.default_branch_factor,
+            )
+
+    async def _flush_ready() -> None:
+        for result in await manager.flush_ready():
+            await _handle_flush(result)
+
+    async def _drain_final() -> None:
+        while True:
+            results = await manager.drain()
+            if not results:
+                break
+            for result in results:
+                await _handle_flush(result)
+
+    async def _process_expandable(node: Dict[str, Any], depth: int) -> None:
+        if depth >= max_depth:
+            node["reward"] = float(grade_fn(node["full_text"], node["text"], data_instance))
+            node["leaf"] = True
+            return
+        default_bf = _default_bf(depth)
+        near_leaf = bool(getattr(gear_gate, "skip_near_leaf_expand", False) and depth == max_depth - 1)
+        if near_leaf or (depth == 0 and not getattr(gear_gate, "root_allocation", False)):
+            await _expand_parent(
+                node,
+                depth=depth,
+                allocated_branch_factor=default_bf,
+                default_branch_factor=default_bf,
+            )
+            return
+
+        try:
+            await gear_gate.estimate_node_async(
+                node,
+                depth=depth,
+                default_bf=default_bf,
+                node_expander=gear_node_expander,
+            )
+        except Exception as exc:
+            gear_gate.allocation_error_count += 1
+            raise RuntimeError(
+                f"VDRA pilot/scoring failed at depth {depth}; no fallback is allowed"
+            ) from exc
+
+        saved_k = int(node.get("vdra_saved_k", 0) or 0)
+        if saved_k and getattr(gear_gate, "use_residual_budget", False):
+            await manager.reserve_pool.add(saved_k)
+        if int(node.get("vdra_unmet_demand", 0) or 0) <= 0:
+            await _expand_parent(
+                node,
+                depth=depth,
+                allocated_branch_factor=int(node.get("vdra_base_k", default_bf)),
+                default_branch_factor=default_bf,
+            )
+            return
+        manager.enqueue(
+            OnlineQueueItem(
+                node=node,
+                default_branch_factor=default_bf,
+                depth=depth,
+                policy_snapshot_id=policy_snapshot_id,
+            )
+        )
+        await _flush_ready()
+
+    async def _expand_parent(
+        node: Dict[str, Any], *, depth: int, allocated_branch_factor: int, default_branch_factor: int
+    ) -> None:
+        allocated_branch_factor = max(int(allocated_branch_factor), 0)
+        if allocated_branch_factor <= 0:
+            node["reward"] = float(grade_fn(node["full_text"], node["text"], data_instance))
+            node["leaf"] = True
+            return
+        samples = await _expand_reusing_pilots(
+            node, allocated_branch_factor, _max_tokens(depth), segment_fn
+        )
+        children = [
+            _sample_child(node, depth, idx, sample)
+            for idx, sample in enumerate(samples[:allocated_branch_factor])
+        ]
+        children = await _filter_children_any(gear_gate, node, depth, default_branch_factor, children)
+        node["children"] = children
+        for child in children:
+            child_depth = depth + 1
+            if child["finish_reason"] != "length" or child_depth >= max_depth:
+                child["reward"] = float(grade_fn(node["full_text"], child["full_text"], data_instance))
+                child["leaf"] = True
+            else:
+                child["leaf"] = False
+                await _process_expandable(child, child_depth)
+        child_rewards = [child["reward"] for child in children]
+        node["reward"] = float(np.mean(child_rewards)) if child_rewards else 0.0
+        node["reward_std"] = float(np.std(child_rewards)) if child_rewards else 0.0
+
+    await _process_expandable(tree, 0)
+    await _drain_final()
+
+    def backprop(node: Dict[str, Any]) -> None:
+        children = node.get("children") or []
+        for child in children:
+            backprop(child)
+        if children:
+            child_rewards = [child["reward"] for child in children]
+            node["reward"] = float(np.mean(child_rewards))
+            node["reward_std"] = float(np.std(child_rewards))
+
+    backprop(tree)
+    tree["gear_queue_flush_count"] = int(manager.flush_count)
+    tree["gear_queue_timeout_flush_count"] = int(manager.timeout_flush_count)
+    tree["vdra_queue_capacity_flush_count"] = int(manager.capacity_flush_count)
+    tree["vdra_queue_final_drain_count"] = int(manager.final_drain_count)
+    tree["gear_reserve_contributed"] = int(manager.reserve_pool.contributed)
+    tree["gear_reserve_consumed"] = int(manager.reserve_pool.consumed)
+    tree["gear_reserve_remaining"] = int(manager.reserve_pool.value)
+    tree["tree_construction_seconds"] = time.time() - t0
+    return tree
 
 async def async_build_tree_batch_alloc(
     root_prompt_text: str,

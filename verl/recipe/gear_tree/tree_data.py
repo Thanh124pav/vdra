@@ -19,9 +19,20 @@ import torch
 from tensordict import TensorDict
 
 from verl import DataProto
-from verl.utils.model import compute_position_id_with_mask
 
 from recipe.gear_tree.tree_advantage import token_fields_for_edges
+
+
+
+
+def _compute_position_id_with_mask(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Local narrow equivalent of verl.utils.model.compute_position_id_with_mask.
+
+    Avoid importing the broad upstream verl model utility in CPU VDRA tests; that
+    module eagerly imports optional HF model classes unrelated to tree data.
+    """
+
+    return (torch.cumsum(attention_mask, dim=-1) - 1).clamp(min=0)
 
 
 def _left_pad(ids: Sequence[int], length: int, pad_id: int) -> List[int]:
@@ -104,7 +115,7 @@ def edges_to_dataproto(
 
     input_ids = torch.cat([prompts, responses], dim=-1)
     attention_mask = torch.cat([prompt_mask, response_mask], dim=-1)
-    position_ids = compute_position_id_with_mask(attention_mask)
+    position_ids = _compute_position_id_with_mask(attention_mask)
 
     batch = TensorDict(
         {

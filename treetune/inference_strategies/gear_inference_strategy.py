@@ -82,12 +82,12 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
         gear_invalid_support_policy: str = "error",
         gear_budget_mode: str = "fixed_main",
         gear_allocation_proxy: str = "vdra",
-        gear_n_min: int = 0,
+        gear_n_min: int = 1,
         gear_budget_overhead_mode: str = "flexible",
-        gear_budget_queue_count: int = 2,
-        gear_budget_queue_timeout_seconds: float = 0.5,
-        gear_skip_near_leaf_expand: bool = False,
-        gear_root_allocation: bool = False,
+        gear_budget_queue_count: int = 4,
+        gear_budget_queue_timeout_seconds: float = 1.0,
+        gear_skip_near_leaf_expand: bool = True,
+        gear_root_allocation: bool = True,
         gear_use_residual_budget: bool = True,
         gear_allocation_mode: str = "budget_allocation",
         # VDRA scoring / bound knobs ------------------------------------------
@@ -109,6 +109,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
                 pilot_branch_factor=gear_pilot_branch_factor,
                 likelihood_samples_per_distribution=gear_likelihood_samples_per_distribution,
                 short_horizon=gear_tv_second_phase_tokens,
+                strict_metadata=gear_strict_vdra,
             )
             gear_eps_tail = calibration["eps_tail"]
             gear_eps_tail_by_depth = calibration["eps_tail_by_depth"]
@@ -273,15 +274,14 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
             node_expander=self.node_expander,
             gamma=self.cfg_thresholds.gamma,
             mode=self._tv_mode_for_k_algorithm(),
-            n_tv_estimates=self.gear_pilot_branch_factor,
             pilot_branch_factor=self.gear_pilot_branch_factor,
             likelihood_samples_per_distribution=self.gear_likelihood_samples_per_distribution,
-            invalid_support_policy=self.gear_invalid_support_policy,
-            strict_vdra=self.gear_strict_vdra,
+            invalid_support_policy=getattr(self, "gear_invalid_support_policy", "error"),
+            strict_vdra=getattr(self, "gear_strict_vdra", True),
             first_phase_tokens=self.gear_tv_subnode_max_tokens,
             second_phase_tokens=self.gear_tv_second_phase_tokens,
             tv_includes_half_factor=self.gear_tv_includes_half_factor,
-            tv_estimator=self.gear_tv_estimator,
+            tv_estimator=getattr(self, "gear_tv_estimator", "tanh"),
             r_max=self.cfg_thresholds.r_max,
             eps_tail=self.cfg_thresholds.eps_tail,
             bound_form=self.cfg_thresholds.bound_form,
@@ -318,7 +318,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
                 self.node_expander.branch_factor_strategy({"depth": 0})
             )
         except Exception as exc:
-            if self.gear_strict_vdra:
+            if getattr(self, "gear_strict_vdra", True):
                 raise RuntimeError("VDRA root branch-factor strategy failed") from exc
             base_branch_factor = 1
         total_root_budget = base_branch_factor * len(root_nodes)
@@ -332,10 +332,10 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
         for node, result in zip(root_nodes, estimate_results):
             from vdra_core.proxies import select_dispersion_proxy
             node["vdra_dispersion_C"] = select_dispersion_proxy(
-                self.gear_allocation_proxy,
-                vdra_dispersion_C=result.dispersion_C,
+                getattr(self, "gear_allocation_proxy", "vdra"),
+                vdra_dispersion_C=getattr(result, "dispersion_C", getattr(result, "reward_variance", 0.0)),
                 pair_tvs=result.pair_tvs,
-                pilot_count=len(result.candidates),
+                pilot_count=len(getattr(result, "candidates", getattr(result, "unique_candidates", []))),
                 node=node,
             )
             node["vdra_default_k"] = base_branch_factor
@@ -465,13 +465,13 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
         )
         queue_manager = RootQueueManager(
             queue_count=self.gear_budget_queue_count,
-            queue_capacity=self.gear_budget_queue_capacity,
+            queue_capacity=getattr(self, "gear_budget_queue_capacity", 8),
             timeout_seconds=self.gear_budget_queue_timeout_seconds,
             reserve_pool=reserve_pool,
             n_min=self.gear_n_min,
             use_residual_budget=self.gear_use_residual_budget,
             policy_snapshot_id=problem_id,
-            strict_vdra=self.gear_strict_vdra,
+            strict_vdra=getattr(self, "gear_strict_vdra", True),
         )
 
         tree: Node = {
@@ -500,7 +500,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
                     0,
                 )
             except Exception as exc:
-                if self.gear_strict_vdra:
+                if getattr(self, "gear_strict_vdra", True):
                     raise RuntimeError("VDRA branch-factor strategy failed") from exc
                 return 1
 
@@ -532,15 +532,14 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
             node_expander=self.node_expander,
             gamma=self.cfg_thresholds.gamma,
             mode=tv_mode,
-            n_tv_estimates=self.gear_pilot_branch_factor,
             pilot_branch_factor=self.gear_pilot_branch_factor,
             likelihood_samples_per_distribution=self.gear_likelihood_samples_per_distribution,
-            invalid_support_policy=self.gear_invalid_support_policy,
-            strict_vdra=self.gear_strict_vdra,
+            invalid_support_policy=getattr(self, "gear_invalid_support_policy", "error"),
+            strict_vdra=getattr(self, "gear_strict_vdra", True),
             first_phase_tokens=self.gear_tv_subnode_max_tokens,
             second_phase_tokens=self.gear_tv_second_phase_tokens,
             tv_includes_half_factor=self.gear_tv_includes_half_factor,
-            tv_estimator=self.gear_tv_estimator,
+            tv_estimator=getattr(self, "gear_tv_estimator", "tanh"),
             r_max=self.cfg_thresholds.r_max,
             eps_tail=self.cfg_thresholds.eps_tail,
             bound_form=self.cfg_thresholds.bound_form,
@@ -764,21 +763,20 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
 
             mode = "hierarchical" if self.gear_k_algorithm in {"hierarchical", "entropy_guided"} else "perplexity"
             estimator = tv_estimator
-            if estimator.mode != ("hierachical" if mode == "hierarchical" else mode):
+            if estimator.mode != mode:
                 estimator = ConditionalTVEstimator(
                     scorer=scorer,
                     node_expander=self.node_expander,
                     gamma=self.cfg_thresholds.gamma,
                     mode=mode,
-                    n_tv_estimates=self.gear_pilot_branch_factor,
-            pilot_branch_factor=self.gear_pilot_branch_factor,
+                    pilot_branch_factor=self.gear_pilot_branch_factor,
             likelihood_samples_per_distribution=self.gear_likelihood_samples_per_distribution,
-            invalid_support_policy=self.gear_invalid_support_policy,
-            strict_vdra=self.gear_strict_vdra,
+            invalid_support_policy=getattr(self, "gear_invalid_support_policy", "error"),
+            strict_vdra=getattr(self, "gear_strict_vdra", True),
                     first_phase_tokens=self.gear_tv_subnode_max_tokens,
                     second_phase_tokens=self.gear_tv_second_phase_tokens,
                     tv_includes_half_factor=self.gear_tv_includes_half_factor,
-            tv_estimator=self.gear_tv_estimator,
+            tv_estimator=getattr(self, "gear_tv_estimator", "tanh"),
             r_max=self.cfg_thresholds.r_max,
             eps_tail=self.cfg_thresholds.eps_tail,
             bound_form=self.cfg_thresholds.bound_form,
@@ -811,10 +809,10 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
             node["gear_predicted_k"] = k
             from vdra_core.proxies import select_dispersion_proxy
             node["vdra_dispersion_C"] = select_dispersion_proxy(
-                self.gear_allocation_proxy,
-                vdra_dispersion_C=result.dispersion_C,
+                getattr(self, "gear_allocation_proxy", "vdra"),
+                vdra_dispersion_C=getattr(result, "dispersion_C", getattr(result, "reward_variance", 0.0)),
                 pair_tvs=result.pair_tvs,
-                pilot_count=len(result.candidates),
+                pilot_count=len(getattr(result, "candidates", getattr(result, "unique_candidates", []))),
                 node=node,
             )
             node["gear_tv_pair_count"] = len(result.pair_tvs)
@@ -1074,7 +1072,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
         tree["gear_queue_timeout_flush_count"] = int(queue_manager.timeout_flush_count)
         tree["vdra_queue_capacity_flush_count"] = int(queue_manager.capacity_flush_count)
         tree["vdra_queue_final_drain_count"] = int(queue_manager.final_drain_count)
-        tree["vdra_budget_mode"] = self.gear_budget_mode
+        tree["vdra_budget_mode"] = getattr(self, "gear_budget_mode", "fixed_main")
         tree["gear_reserve_contributed"] = int(reserve_pool.contributed)
         tree["gear_reserve_consumed"] = int(reserve_pool.consumed)
         tree["gear_reserve_remaining"] = int(reserve_pool.value)

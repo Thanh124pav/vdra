@@ -146,6 +146,7 @@ def test_allocate_batch_async_moves_budget_to_high_dispersion_node():
         scorer=_DispersionScorer(),
         n_min=1,
         pilot_branch_factor=8,
+        allocation_runtime="depth_batch",
         skip_near_leaf_expand=False,
     )
     assert gate.use_batch_allocation
@@ -171,6 +172,7 @@ def test_allocate_batch_async_scoring_failure_is_explicit():
         k_algorithm="budget_allocation",
         scorer=BoomScorer(),
         pilot_branch_factor=2,
+        allocation_runtime="depth_batch",
         skip_near_leaf_expand=False,
     )
     nodes = [
@@ -184,3 +186,30 @@ def test_allocate_batch_async_scoring_failure_is_explicit():
             )
         )
     assert gate.allocation_error_count == 1
+
+
+
+def test_strict_main_config_rejects_insufficient_pilot_branch_factor():
+    gate = GearGate(
+        k_algorithm="budget_allocation",
+        scorer=_DispersionScorer(),
+        pilot_branch_factor=6,
+        likelihood_samples_per_distribution=2,
+        tv_first_phase_tokens=100,
+        strict_vdra=True,
+        use_residual_budget=True,
+    )
+    with pytest.raises(ValueError, match="pilot_branch_factor > max default"):
+        gate.validate_main_config(max_default_branch_factor=6, segment_length=100)
+
+
+def test_strict_main_config_rejects_pilot_longer_than_segment():
+    gate = GearGate(
+        k_algorithm="budget_allocation",
+        scorer=_DispersionScorer(),
+        pilot_branch_factor=8,
+        tv_first_phase_tokens=120,
+        strict_vdra=True,
+    )
+    with pytest.raises(ValueError, match="pilot length"):
+        gate.validate_main_config(max_default_branch_factor=6, segment_length=100)

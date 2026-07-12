@@ -27,7 +27,9 @@ def _build_gate(gt: dict, scorer=None):
         return None
     from recipe.gear_tree.gear_gate import GearGate
 
-    g = gt["gear"]
+    from recipe.gear_tree.calibration import resolve_gear_calibration
+
+    g = resolve_gear_calibration(dict(gt["gear"]))
     return GearGate(
         epsilon=g.get("epsilon", 0.02),
         r_max=g.get("r_max", 1.0),
@@ -46,9 +48,10 @@ def _build_gate(gt: dict, scorer=None):
         tv_estimator=g.get("tv_estimator", "tanh"),
         tv_first_phase_tokens=g.get("tv_first_phase_tokens", 120),
         tv_second_phase_tokens=g.get("tv_second_phase_tokens", 60),
-        queue_count=g.get("queue_count", 1), queue_capacity=g.get("queue_capacity", 8),
-        queue_timeout_seconds=g.get("queue_timeout_seconds", 0.0),
+        queue_count=g.get("queue_count", 4), queue_capacity=g.get("queue_capacity", 8),
+        queue_timeout_seconds=g.get("queue_timeout_seconds", 1.0),
         use_residual_budget=g.get("use_residual_budget", True), strict_vdra=g.get("strict_vdra", True), invalid_support_policy=g.get("invalid_support_policy", "error"), budget_mode=g.get("budget_mode", "fixed_main"),
+        allocation_runtime=g.get("allocation_runtime", "online_timeout"),
     )
 
 
@@ -66,11 +69,15 @@ class GearTreeActorRolloutWorker(ActorRolloutRefWorker):  # pragma: no cover - G
         from recipe.gear_tree.gear_core.reward_function import MathRewardFunction
         from recipe.gear_tree.tree_logging import TreeDemoLogger
 
-        gate = _build_gate(gt)
-        if gate is not None and gate.enable_share:
+        scorer = None
+        if gt.get("gear", {}).get("enabled", False) and (
+            gt.get("gear", {}).get("k_algorithm", "budget_allocation") == "budget_allocation"
+            or gt.get("gear", {}).get("enable_share", False)
+        ):
             from recipe.gear_tree.engine_scorer import EngineLPScorer
 
-            gate.scorer = EngineLPScorer(self.rollout.inference_engine, self.tokenizer)
+            scorer = EngineLPScorer(self.rollout.inference_engine, self.tokenizer)
+        gate = _build_gate(gt, scorer=scorer)
 
         reward_fn = MathRewardFunction(
             answer_prefix=gt.get("answer_prefix", "# Answer\n"),

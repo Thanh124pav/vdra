@@ -377,3 +377,71 @@ def test_estimate_k_for_parent_deduplicates_first_prefixes_by_tv():
     assert result.predicted_k == 1
     assert len(result.unique_candidates) == 1
     assert result.duplicate_pairs == [(0, 1)]
+
+
+
+def test_k0_r_semantics_and_conflicting_legacy_n_tv_estimates():
+    class CountingExpander:
+        def __init__(self):
+            self.calls = []
+
+        async def expand(self, *args, **kwargs):
+            self.calls.append(kwargs)
+            prefix = kwargs["prefix"]
+            depth = kwargs["depth"]
+            branch_factor = kwargs["branch_factor"]
+            return [
+                {
+                    "text": f" s{len(self.calls)}_{idx}",
+                    "full_text": f"{prefix} s{len(self.calls)}_{idx}",
+                    "sum_logprobs": -0.1,
+                    "num_tokens": 1,
+                    "finish_reason": "length" if len(self.calls) == 1 else "stop",
+                    "depth": depth + 1,
+                }
+                for idx in range(branch_factor)
+            ]
+
+    expander = CountingExpander()
+    estimator = ConditionalTVEstimator(
+        scorer=FakeScorer(),
+        node_expander=expander,
+        gamma=0.5,
+        mode="hierarchical",
+        pilot_branch_factor=8,
+        likelihood_samples_per_distribution=2,
+    )
+    assert estimator.pilot_branch_factor == 8
+    assert estimator.likelihood_samples_per_distribution == 2
+    assert estimator.total_support_samples == 16
+    assert estimator.n_tv_estimates == 16
+
+    asyncio.run(
+        estimator.estimate_k_for_parent(
+            {"full_text": "root"}, depth=0, duplicate_tv_threshold=0.0
+        )
+    )
+    assert expander.calls[0]["branch_factor"] == 8
+    assert sum(call["branch_factor"] for call in expander.calls[1:]) == 16
+
+    with pytest.raises(ValueError, match="deprecated alias"):
+        ConditionalTVEstimator(
+            scorer=FakeScorer(),
+            node_expander=FakeExpander(),
+            gamma=0.5,
+            pilot_branch_factor=8,
+            likelihood_samples_per_distribution=2,
+            n_tv_estimates=8,
+        )
+
+
+def test_strict_tanh_tv_rejects_no_valid_likelihood_samples():
+    estimator = ConditionalTVEstimator(
+        scorer=FakeScorer(),
+        node_expander=FakeExpander(),
+        gamma=0.5,
+        strict_vdra=True,
+        invalid_support_policy="error",
+    )
+    with pytest.raises(ValueError, match="No valid pair-specific"):
+        estimator._pair_tvs_tanh([[float("nan")], [float("nan")]], [0])

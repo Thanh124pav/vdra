@@ -271,7 +271,9 @@ try:  # keep CPU-importable when agent_loop isn't installed
             return None
         from recipe.gear_tree.gear_gate import GearGate
 
-        g = gt["gear"]
+        from recipe.gear_tree.calibration import resolve_gear_calibration
+
+        g = resolve_gear_calibration(dict(gt["gear"]))
         scorer = _build_scorer(g, tokenizer)
         return GearGate(
             epsilon=g.get("epsilon", 0.02), r_max=g.get("r_max", 1.0), gamma=g.get("gamma", 0.9),
@@ -286,9 +288,10 @@ try:  # keep CPU-importable when agent_loop isn't installed
             tv_estimator=g.get("tv_estimator", "tanh"),
             tv_first_phase_tokens=g.get("tv_first_phase_tokens", 120),
             tv_second_phase_tokens=g.get("tv_second_phase_tokens", 60),
-            queue_count=g.get("queue_count", 1), queue_capacity=g.get("queue_capacity", 8),
-            queue_timeout_seconds=g.get("queue_timeout_seconds", 0.0),
+            queue_count=g.get("queue_count", 4), queue_capacity=g.get("queue_capacity", 8),
+            queue_timeout_seconds=g.get("queue_timeout_seconds", 1.0),
             use_residual_budget=g.get("use_residual_budget", True), strict_vdra=g.get("strict_vdra", True), invalid_support_policy=g.get("invalid_support_policy", "error"), budget_mode=g.get("budget_mode", "fixed_main"),
+            allocation_runtime=g.get("allocation_runtime", "online_timeout"),
         )
 
     def _build_scorer(g: dict, tokenizer: Any):

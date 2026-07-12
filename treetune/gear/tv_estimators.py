@@ -21,7 +21,9 @@ from treetune.gear.budget_allocation import reward_variance_from_pair_tvs
 PairKey = Tuple[int, int]
 
 
-def pairwise_tv_tanh(logps_i: Sequence[float], logps_j: Sequence[float]) -> float:
+def _pairwise_tv_tanh_with_count(
+    logps_i: Sequence[float], logps_j: Sequence[float]
+) -> Tuple[float, int]:
     """Likelihood-based short-horizon TV estimator (Summary.md §9).
 
     Uses the identity |a-b|/(a+b) = |tanh((log a - log b)/2)| so the estimate
@@ -51,8 +53,13 @@ def pairwise_tv_tanh(logps_i: Sequence[float], logps_j: Sequence[float]) -> floa
             continue
         vals.append(abs(math.tanh((a - b) / 2.0)))
     if not vals:
-        return 0.0
-    return sum(vals) / len(vals)
+        return 0.0, 0
+    return sum(vals) / len(vals), len(vals)
+
+
+def pairwise_tv_tanh(logps_i: Sequence[float], logps_j: Sequence[float]) -> float:
+    value, _ = _pairwise_tv_tanh_with_count(logps_i, logps_j)
+    return value
 
 
 @dataclass
@@ -88,7 +95,7 @@ class ConditionalTVEstimator:
         node_expander: Any,
         gamma: float,
         mode: str = "subnode",
-        n_tv_estimates: int = 8,
+        n_tv_estimates: Optional[int] = None,
         first_phase_tokens: int = 120,
         second_phase_tokens: int = 60,
         tv_includes_half_factor: bool = True,
@@ -101,7 +108,9 @@ class ConditionalTVEstimator:
         invalid_support_policy: str = "error",
         strict_vdra: bool = True,
     ):
-        if mode not in {"subnode", "hierachical", "hierarchical", "perplexity"}:
+        if mode == "hierachical":
+            mode = "hierarchical"
+        if mode not in {"subnode", "hierarchical", "perplexity"}:
             raise ValueError(f"Unsupported TV estimator mode: {mode}")
         if tv_estimator not in {"tanh", "legacy_abs"}:
             raise ValueError(f"Unsupported tv_estimator: {tv_estimator}")
@@ -114,14 +123,29 @@ class ConditionalTVEstimator:
         self.scorer = scorer
         self.node_expander = node_expander
         self.gamma = float(gamma)
-        self.mode = "hierachical" if mode == "hierarchical" else mode
-        self.pilot_branch_factor = max(int(pilot_branch_factor or n_tv_estimates), 2)
+        self.mode = mode
+        if pilot_branch_factor is None:
+            if n_tv_estimates is None:
+                pilot_branch_factor = 8
+            else:
+                pilot_branch_factor = int(n_tv_estimates)
+        self.pilot_branch_factor = max(int(pilot_branch_factor), 2)
         self.likelihood_samples_per_distribution = max(
             int(likelihood_samples_per_distribution), 1
         )
-        self.n_tv_estimates = (
+        self.total_support_samples = (
             self.pilot_branch_factor * self.likelihood_samples_per_distribution
         )
+        if n_tv_estimates is not None and int(n_tv_estimates) != self.total_support_samples:
+            raise ValueError(
+                "n_tv_estimates is a deprecated alias for "
+                "pilot_branch_factor * likelihood_samples_per_distribution; "
+                f"got n_tv_estimates={int(n_tv_estimates)} but "
+                f"{self.pilot_branch_factor} * "
+                f"{self.likelihood_samples_per_distribution} = "
+                f"{self.total_support_samples}"
+            )
+        self.n_tv_estimates = self.total_support_samples
         self.first_phase_tokens = max(int(first_phase_tokens), 1)
         self.second_phase_tokens = max(int(second_phase_tokens), 1)
         self.tv_includes_half_factor = bool(tv_includes_half_factor)
@@ -259,7 +283,7 @@ class ConditionalTVEstimator:
     async def _generate_samples(
         self, parent: Node, *, depth: int
     ) -> Tuple[List[TVSample], List[Node]]:
-        if self.mode == "hierachical":
+        if self.mode == "hierarchical":
             first_count = self.pilot_branch_factor
             second_per_first = self.likelihood_samples_per_distribution
         elif self.mode == "perplexity":
@@ -314,7 +338,7 @@ class ConditionalTVEstimator:
     async def _generate_first_prefix_support(
         self, parent: Node, *, depth: int
     ) -> Tuple[List[Node], List[Node], List[int]]:
-        if self.mode == "hierachical":
+        if self.mode == "hierarchical":
             first_count = self.pilot_branch_factor
             second_per_first = self.likelihood_samples_per_distribution
         elif self.mode == "perplexity":
@@ -404,7 +428,7 @@ class ConditionalTVEstimator:
         return sorted(best_by_root.values())
 
     def _hierarchical_first_count(self) -> int:
-        return max(2, int(math.ceil(math.sqrt(self.n_tv_estimates))))
+        return max(2, int(math.ceil(math.sqrt(self.total_support_samples))))
 
     def _perplexity_branch_factor(self, node: Mapping[str, Any], *, fallback: int) -> int:
         perplexity = self._node_perplexity(node)
@@ -548,10 +572,19 @@ class ConditionalTVEstimator:
                     if self.invalid_support_policy == "resample":
                         raise RuntimeError(f"Pair ({i}, {j}) requires support resampling")
                     raise ValueError(f"Pair ({i}, {j}) has no pair-specific TV support")
-                pair_tvs[(i, j)] = pairwise_tv_tanh(
+                tv, valid_count = _pairwise_tv_tanh_with_count(
                     [logp_matrix[i][k] for k in cols],
                     [logp_matrix[j][k] for k in cols],
                 )
+                if valid_count == 0:
+                    if self.invalid_support_policy == "exclude":
+                        continue
+                    if self.invalid_support_policy == "resample":
+                        raise RuntimeError(f"Pair ({i}, {j}) requires support resampling")
+                    raise ValueError(
+                        "No valid pair-specific likelihood-ratio samples for TV estimation"
+                    )
+                pair_tvs[(i, j)] = tv
         return pair_tvs
 
 

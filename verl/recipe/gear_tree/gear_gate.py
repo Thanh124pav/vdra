@@ -11,7 +11,7 @@ Wraps the vendored ``gear_core`` and hooks into the tree builders through:
     value-dispersion bound C_s (tail-corrected, ``value_gap_bound``), then a
     queue-batched ``allocate_branch_factors`` solve (``k_s ∝ sqrt(C_s)`` with
     the ``n_min`` floor).  Results are written to
-    ``node['gear_branch_allocation']``.
+    ``node['vdra_allocated_k']`` (with legacy allocation aliases).
   * ``filter_children`` / ``filter_children_async`` — sibling-local **share**
     via ``gear_core.local_value_share``.  The async variant awaits async
     scorers (``lp_scorer.LPScorer``); the sync variant drives them with
@@ -30,6 +30,8 @@ import inspect
 import logging
 import math
 from typing import Any, Dict, List, Mapping, Optional
+
+from vdra_core.logging_schema import node_allocated_k, write_node_accounting
 
 from recipe.gear_tree.gear_core.gear.thresholds import (
     ThresholdConfig,
@@ -57,7 +59,7 @@ class GearGate:
         root_allocation: bool = True,
         skip_near_leaf_expand: bool = True,
         max_depth: Optional[int] = None,
-        enable_share: bool = True,
+        enable_share: bool = False,
         scorer: Any = None,
         # --- VDRA additions -------------------------------------------------
         eps_tail: float = 0.0,
@@ -66,14 +68,15 @@ class GearGate:
         tv_estimator: str = "tanh",
         tv_first_phase_tokens: int = 120,
         tv_second_phase_tokens: int = 60,
-        queue_count: int = 1,
+        queue_count: int = 4,
         queue_capacity: int = 8,
-        queue_timeout_seconds: float = 0.0,
+        queue_timeout_seconds: float = 1.0,
         use_residual_budget: bool = True,
         strict_vdra: bool = True,
         invalid_support_policy: str = "error",
         budget_mode: str = "fixed_main",
         allocation_proxy: str = "vdra",
+        allocation_runtime: str = "online_timeout",
     ) -> None:
         self.cfg = ThresholdConfig(
             epsilon=epsilon,
@@ -89,6 +92,9 @@ class GearGate:
             bound_form=bound_form,
         )
         self.k_algorithm = k_algorithm
+        if allocation_runtime not in {"online_timeout", "depth_batch"}:
+            raise ValueError(f"Unsupported VDRA allocation_runtime: {allocation_runtime}")
+        self.allocation_runtime = allocation_runtime
         self.n_min = max(int(n_min), 0)
         self.pilot_branch_factor = pilot_branch_factor
         self.likelihood_samples_per_distribution = max(
@@ -125,8 +131,32 @@ class GearGate:
     # --- capabilities -------------------------------------------------------- #
     @property
     def use_batch_allocation(self) -> bool:
-        """True when the VDRA depth-batched allocation path should run."""
-        return self.k_algorithm == "budget_allocation"
+        """True when the legacy depth-batched allocation path should run."""
+        return self.k_algorithm == "budget_allocation" and self.allocation_runtime == "depth_batch"
+
+    @property
+    def use_online_allocation(self) -> bool:
+        """True when the main online timeout allocation path should run."""
+        return self.k_algorithm == "budget_allocation" and self.allocation_runtime == "online_timeout"
+
+    def validate_main_config(self, *, max_default_branch_factor: int, segment_length: Optional[int]) -> None:
+        if not self.strict_vdra:
+            return
+        if self.tv_first_phase_tokens > int(segment_length or self.tv_first_phase_tokens):
+            raise ValueError(
+                "VDRA pilot length cannot exceed the main segment length "
+                "when pilots are reused as tree children."
+            )
+        if (
+            self.k_algorithm == "budget_allocation"
+            and self.use_residual_budget
+            and self.pilot_branch_factor_for(max_default_branch_factor) <= int(max_default_branch_factor)
+        ):
+            raise ValueError(
+                "The current cluster-count k predictor requires "
+                "pilot_branch_factor > max default branch factor "
+                "for positive unmet demand and residual redistribution."
+            )
 
     def pilot_branch_factor_for(self, branch_factor: int) -> int:
         """Return k0, defaulting to the configured branch factor."""
@@ -153,8 +183,8 @@ class GearGate:
         # Near-leaf: skip TV/budget, expand uniformly (gear_defaults semantics).
         if self.skip_near_leaf_expand and self.max_depth is not None and depth == self.max_depth - 1:
             return default_bf
-        # Batch allocation writes gear_branch_allocation via allocate_batch_async.
-        allocated = parent.get("gear_branch_allocation")
+        # Batch allocation writes vdra_allocated_k via allocate_batch_async.
+        allocated = node_allocated_k(parent)
         if self.use_batch_allocation and allocated is not None:
             return max(int(allocated), 0)
         if self.k_algorithm != "simple":
@@ -164,6 +194,105 @@ class GearGate:
             return default_bf
         # Clamp to [n_min, default_bf]: never widen beyond the SPO width.
         return max(self.n_min, min(int(k), int(default_bf)))
+
+    def make_queue_manager(self, *, policy_snapshot_id: str, reserve_pool: Any = None):
+        from recipe.gear_tree.gear_core.gear.online_budget import (
+            RootQueueManager,
+            SharedReservePool,
+        )
+
+        if reserve_pool is None:
+            reserve_pool = SharedReservePool(queue_count=self.queue_count)
+        return RootQueueManager(
+            queue_count=self.queue_count,
+            queue_capacity=self.queue_capacity,
+            timeout_seconds=self.queue_timeout_seconds,
+            reserve_pool=reserve_pool,
+            n_min=self.n_min,
+            use_residual_budget=self.use_residual_budget,
+            policy_snapshot_id=policy_snapshot_id,
+            strict_vdra=self.strict_vdra,
+        )
+
+    async def estimate_node_async(
+        self,
+        node: Dict[str, Any],
+        *,
+        depth: int,
+        default_bf: int,
+        node_expander: Any,
+    ) -> Dict[str, Any]:
+        from recipe.gear_tree.gear_core.gear.tv_estimators import (
+            ConditionalTVEstimator,
+        )
+        from vdra_core.proxies import select_dispersion_proxy
+
+        estimator = ConditionalTVEstimator(
+            scorer=self.scorer,
+            node_expander=node_expander,
+            gamma=self.cfg.gamma,
+            mode="subnode",
+            pilot_branch_factor=self.pilot_branch_factor_for(default_bf),
+            likelihood_samples_per_distribution=self.likelihood_samples_per_distribution,
+            invalid_support_policy=self.invalid_support_policy,
+            strict_vdra=self.strict_vdra,
+            first_phase_tokens=self.tv_first_phase_tokens,
+            second_phase_tokens=self.tv_second_phase_tokens,
+            tv_estimator=self.tv_estimator,
+            r_max=self.cfg.r_max,
+            eps_tail=eps_tail_for_depth(self.cfg, depth),
+            bound_form=self.cfg.bound_form,
+        )
+        score_keys_before = set(estimator._score_cache)
+        result = await estimator.estimate_k_for_parent(
+            node, depth=depth, duplicate_tv_threshold=self.cfg.epsilon
+        )
+        node["vdra_dispersion_C"] = select_dispersion_proxy(
+            self.allocation_proxy,
+            vdra_dispersion_C=result.dispersion_C,
+            pair_tvs=result.pair_tvs,
+            pilot_count=len(result.candidates),
+            node=node,
+        )
+        pilots = list(result.unique_candidates or result.candidates)
+        node["vdra_pilot_children"] = pilots
+        node["vdra_pilot_children_generated"] = len(result.candidates)
+        node["vdra_pilot_children_reused"] = len(pilots)
+        node["vdra_pilot_children_discarded"] = max(len(result.candidates) - len(pilots), 0)
+        node["gear_predicted_k"] = int(result.predicted_k)
+        node["vdra_predicted_k"] = int(result.predicted_k)
+        node["gear_pair_tvs"] = {
+            f"{i},{j}": float(tv) for (i, j), tv in result.pair_tvs.items()
+        }
+        node["gear_prob_matrix"] = result.prob_matrix
+        score_keys = list(set(estimator._score_cache) - score_keys_before)
+        node["vdra_likelihood_scoring_requests"] = len(score_keys)
+        tokenize = getattr(self.scorer, "tokenize_fn", None)
+        if tokenize is not None:
+            node["vdra_likelihood_scored_prompt_tokens"] = sum(
+                len(tokenize(prefix)) for prefix, _ in score_keys
+            )
+            node["vdra_likelihood_scored_continuation_tokens"] = sum(
+                len(tokenize(text)) for _, text in score_keys
+            )
+            node["vdra_total_scored_tokens"] = (
+                node.get("vdra_likelihood_scored_prompt_tokens", 0)
+                + node.get("vdra_likelihood_scored_continuation_tokens", 0)
+            )
+        predicted_k = max(int(result.predicted_k), self.n_min)
+        write_node_accounting(
+            node,
+            default_k=int(default_bf),
+            predicted_k=predicted_k,
+            allocated_k=min(int(default_bf), predicted_k),
+            k_min=self.n_min,
+            dispersion_C=float(node.get("vdra_dispersion_C", 0.0) or 0.0),
+        )
+        return {
+            "predicted_k": predicted_k,
+            "candidates": pilots,
+            "weight_key": None,
+        }
 
     # --- VDRA batch allocation (Summary.md §10-§11) -------------------------- #
     async def allocate_batch_async(
@@ -193,7 +322,13 @@ class GearGate:
             return
         if not self.use_batch_allocation:
             for node in nodes:
-                node["gear_branch_allocation"] = int(default_bf)
+                write_node_accounting(
+                    node,
+                    default_k=int(default_bf),
+                    predicted_k=int(default_bf),
+                    allocated_k=int(default_bf),
+                    k_min=self.n_min,
+                )
             return
 
         estimator = ConditionalTVEstimator(
@@ -201,7 +336,6 @@ class GearGate:
             node_expander=node_expander,
             gamma=self.cfg.gamma,
             mode="subnode",
-            n_tv_estimates=self.pilot_branch_factor_for(default_bf),
             pilot_branch_factor=self.pilot_branch_factor_for(default_bf),
             likelihood_samples_per_distribution=self.likelihood_samples_per_distribution,
             invalid_support_policy=self.invalid_support_policy,
@@ -229,8 +363,13 @@ class GearGate:
                     pilot_count=len(result.candidates),
                     node=node,
                 )
-                node["vdra_pilot_children"] = list(result.unique_candidates or result.candidates)
+                pilots = list(result.unique_candidates or result.candidates)
+                node["vdra_pilot_children"] = pilots
+                node["vdra_pilot_children_generated"] = len(result.candidates)
+                node["vdra_pilot_children_reused"] = len(pilots)
+                node["vdra_pilot_children_discarded"] = max(len(result.candidates) - len(pilots), 0)
                 node["gear_predicted_k"] = int(result.predicted_k)
+                node["vdra_predicted_k"] = int(result.predicted_k)
                 node["gear_pair_tvs"] = {
                     f"{i},{j}": float(tv) for (i, j), tv in result.pair_tvs.items()
                 }
@@ -244,6 +383,10 @@ class GearGate:
                     )
                     node["vdra_likelihood_scored_continuation_tokens"] = sum(
                         len(tokenize(text)) for _, text in score_keys
+                    )
+                    node["vdra_total_scored_tokens"] = (
+                        node.get("vdra_likelihood_scored_prompt_tokens", 0)
+                        + node.get("vdra_likelihood_scored_continuation_tokens", 0)
                     )
         except Exception as exc:
             self.allocation_error_count += 1
@@ -265,17 +408,17 @@ class GearGate:
             predicted_k = max(int(node["gear_predicted_k"]), self.n_min)
             base_k = min(int(default_bf), predicted_k)
             saved_k = max(int(default_bf) - base_k, 0)
-            node["vdra_default_k"] = int(default_bf)
-            node["vdra_predicted_k"] = predicted_k
-            node["vdra_base_k"] = base_k
-            node["vdra_saved_k"] = saved_k
-            node["vdra_unmet_demand"] = max(predicted_k - base_k, 0)
+            write_node_accounting(
+                node,
+                default_k=int(default_bf),
+                predicted_k=predicted_k,
+                allocated_k=base_k,
+                k_min=self.n_min,
+            )
             if saved_k and self.use_residual_budget:
                 await manager.reserve_pool.add(saved_k)
             if node["vdra_unmet_demand"] <= 0:
-                node["gear_branch_allocation"] = base_k
-                node["vdra_additional_k"] = 0
-                node["vdra_allocated_k"] = base_k
+                node["vdra_additional_children_generated"] = max(base_k - int(node.get("vdra_pilot_children_reused", 0) or 0), 0)
                 continue
             manager.enqueue(
                 OnlineQueueItem(
@@ -292,12 +435,18 @@ class GearGate:
                 allocated = flush.summary.allocations.get(node_id)
                 if allocated is None:
                     raise RuntimeError(f"VDRA allocation missing node {node_id}")
-                node["gear_branch_allocation"] = int(allocated)
-                node["vdra_base_k"] = flush.summary.base_allocations[node_id]
-                node["vdra_saved_k"] = flush.summary.saved_allocations[node_id]
-                node["vdra_unmet_demand"] = flush.summary.unmet_demands[node_id]
-                node["vdra_additional_k"] = flush.summary.additional_allocations[node_id]
-                node["vdra_allocated_k"] = int(allocated)
+                write_node_accounting(
+                    node,
+                    default_k=int(default_bf),
+                    predicted_k=int(node["vdra_predicted_k"]),
+                    allocated_k=int(allocated),
+                    k_min=self.n_min,
+                    allocation_weight=flush.summary.weights[node_id],
+                )
+                node["vdra_allocation_seconds"] = flush.allocation_seconds
+                node["vdra_additional_children_generated"] = max(
+                    int(allocated) - int(node.get("vdra_pilot_children_reused", 0) or 0), 0
+                )
 
     # --- sibling-local value share ------------------------------------------ #
     def _annotate_children(

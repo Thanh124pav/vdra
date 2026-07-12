@@ -11,6 +11,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 
+from vdra_core.logging_schema import node_allocated_k
+
 
 def branch_factors_from_shape(shape: Optional[str]) -> Dict[int, int]:
     if not shape:
@@ -181,7 +183,7 @@ def render_full_tree_markdown(tree: Mapping[str, Any], *, tree_idx: int, questio
         action = node.get("gear_action", node.get("action", ""))
         reward = node.get("reward")
         predicted_k = node.get("gear_predicted_k")
-        allocated = node.get("gear_allocated_branch_factor")
+        allocated = node_allocated_k(node)
         default_b = node.get("gear_default_branch_factor")
         lines.append(
             f"{pad}- node={seg_id} depth={depth} action={action} "

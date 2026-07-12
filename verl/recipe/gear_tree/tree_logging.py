@@ -91,10 +91,14 @@ class TreeDemoLogger:
     def log_tree(self, tree: Dict[str, Any], question_id: Any) -> Dict[str, Any]:
         self._seen += 1
         basic = basic_tree_stats(tree)
+        stored_stats = dict(tree.get("gear_stats", {}) or {})
         try:
-            gear_stats = lh.aggregate_tree_stats(tree)
+            derived_stats = lh.aggregate_tree_stats(tree)
         except Exception:
-            gear_stats = {}
+            derived_stats = {}
+        # Runtime counters stored by rollout/queue code take precedence over
+        # recomputed summaries when the same metric key exists.
+        gear_stats = {**derived_stats, **stored_stats}
         try:
             per_depth = lh.per_depth_action_counts(tree)
         except Exception:

@@ -82,13 +82,20 @@ def make_strategy(
     strategy.gear_k_algorithm = "simple"
     strategy.gear_generation_mode = generation_mode
     strategy.gear_budget_queue_count = 2
+    strategy.gear_budget_queue_capacity = 8
     strategy.gear_budget_queue_timeout_seconds = 999.0
     strategy.gear_budget_lambda = 0.02
     strategy.gear_n_min = 0
-    strategy.gear_n_tv_estimates = 2
+    strategy.gear_pilot_branch_factor = 2
+    strategy.gear_likelihood_samples_per_distribution = 1
     strategy.gear_tv_subnode_max_tokens = 5
     strategy.gear_tv_second_phase_tokens = 3
     strategy.gear_tv_includes_half_factor = True
+    strategy.gear_strict_vdra = True
+    strategy.gear_invalid_support_policy = "error"
+    strategy.gear_budget_mode = "fixed_main"
+    strategy.gear_allocation_proxy = "vdra"
+    strategy.gear_tv_estimator = "tanh"
     strategy.gear_budget_overhead_mode = "flexible"
     strategy.gear_allocation_mode = allocation_mode
     strategy.gear_use_residual_budget = use_residual_budget
@@ -156,13 +163,14 @@ def test_queue_flush_draws_reserve_share_and_uses_largest_remainder():
         await reserve.add(3)
         manager = RootQueueManager(
             queue_count=2,
+            queue_capacity=1,
             timeout_seconds=0.0,
             reserve_pool=reserve,
             lambda_=0.0,
         )
         nodes = [
-            {"gear_segment_id": "a", "gear_reward_variance": 1.0},
-            {"gear_segment_id": "b", "gear_reward_variance": 1.0},
+            {"gear_segment_id": "a", "gear_reward_variance": 1.0, "vdra_predicted_k": 3},
+            {"gear_segment_id": "b", "gear_reward_variance": 1.0, "vdra_predicted_k": 3},
         ]
         for node in nodes:
             manager.enqueue(OnlineQueueItem(node=node, default_branch_factor=1, depth=1))
@@ -184,14 +192,15 @@ def test_queue_flush_can_ignore_residual_reserve():
         await reserve.add(3)
         manager = RootQueueManager(
             queue_count=2,
+            queue_capacity=1,
             timeout_seconds=0.0,
             reserve_pool=reserve,
             lambda_=0.0,
             use_residual_budget=False,
         )
         nodes = [
-            {"gear_segment_id": "a", "gear_reward_variance": 1.0},
-            {"gear_segment_id": "b", "gear_reward_variance": 1.0},
+            {"gear_segment_id": "a", "gear_reward_variance": 1.0, "vdra_predicted_k": 3},
+            {"gear_segment_id": "b", "gear_reward_variance": 1.0, "vdra_predicted_k": 3},
         ]
         for node in nodes:
             manager.enqueue(OnlineQueueItem(node=node, default_branch_factor=1, depth=1))
@@ -320,7 +329,7 @@ def test_one_depth_root_predicts_k_and_prunes_without_allocation_when_k_is_small
         use_residual_budget=True,
     )
     strategy.gear_k_algorithm = "hierarchical"
-    strategy.gear_n_tv_estimates = 2
+    strategy.gear_pilot_branch_factor = 2
 
     tree = asyncio.run(strategy._construct_budget_allocated_tree("Q", max_depth=1))
 

@@ -10,6 +10,8 @@ from collections import Counter, defaultdict
 from statistics import pstdev
 from typing import Any, Dict, List, Optional
 
+from vdra_core.logging_schema import node_allocated_k, summarize_vdra_tree
+
 _DEMO_TEXT_TRUNC = 240
 
 
@@ -36,9 +38,9 @@ BUDGET_DEMO_COLUMNS = [
     "seg_id",
     "parent_text",
     "node_text",
-    "budget_weight",
-    "reward_variance",
-    "allocated_branch_factor",
+    "allocation_weight",
+    "dispersion_C",
+    "allocated_k",
     "built_children",
     "discarded_candidates",
 ]
@@ -85,7 +87,7 @@ def aggregate_tree_stats(
         while stack:
             node = stack.pop()
             children = node.get("children") or []
-            allocated = node.get("gear_allocated_branch_factor")
+            allocated = node_allocated_k(node)
             if allocated is not None:
                 allocated_int = int(allocated)
                 expandable_parent_nodes += 1
@@ -174,6 +176,9 @@ def aggregate_tree_stats(
             totals["vdra/pilot_children_reused"] / generated if generated else 0.0
         )
         out.update(totals)
+        vdra_totals = summarize_vdra_tree(tree)
+        out.update(vdra_totals)
+        out.update({f"vdra/{k[5:]}": v for k, v in vdra_totals.items() if k.startswith("vdra_")})
         return out
 
     counts: Counter = Counter()
@@ -223,7 +228,7 @@ def per_depth_action_counts(tree) -> Dict[str, float]:
         while stack:
             node = stack.pop()
             children = node.get("children") or []
-            allocated = node.get("gear_allocated_branch_factor")
+            allocated = node_allocated_k(node)
             depth = _node_depth(node)
             if allocated is not None and depth is not None:
                 allocated_int = int(allocated)
@@ -313,7 +318,7 @@ def collect_demo_rows(
         while stack:
             n = stack.pop()
             stack.extend(n.get("children") or [])
-            allocated = n.get("gear_allocated_branch_factor")
+            allocated = node_allocated_k(n)
             if allocated is None:
                 continue
             depth = _node_depth(n)
@@ -332,7 +337,7 @@ def collect_demo_rows(
                         ).get("full_text")
                     ),
                     truncate(n.get("text") or n.get("full_text")),
-                    float(n.get("gear_budget_weight") or 0.0),
+                    float(n.get("vdra_allocation_weight", n.get("gear_budget_weight", 0.0)) or 0.0),
                     (
                         float(n.get("vdra_dispersion_C") or 0.0)
                         if n.get("vdra_dispersion_C") is not None
@@ -437,9 +442,9 @@ def render_md_section(
             d = row_to_dict(row, BUDGET_DEMO_COLUMNS)
             out.append(
                 f"- depth={d['depth']}  seg={d['seg_id']}  "
-                f"weight={float(d['budget_weight']):.4f}  "
-                f"sigma2={float(d['reward_variance'] or 0.0):.4f}  "
-                f"allocated={int(d['allocated_branch_factor'])}  "
+                f"weight={float(d['allocation_weight']):.4f}  "
+                f"dispersion_C={float(d['dispersion_C'] or 0.0):.4f}  "
+                f"allocated_k={int(d['allocated_k'])}  "
                 f"built={int(d['built_children'])}  "
                 f"discarded={int(d['discarded_candidates'])}\n"
             )

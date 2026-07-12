@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from .rounding import round_bounded
+from .logging_schema import node_id, write_node_accounting
 
 PairKey = Tuple[int, int]
 
@@ -89,16 +90,6 @@ def dispersion_bound_from_pair_tvs(
         )
         total += bound * bound
     return total / float(n * n)
-
-
-def _node_id(node: Mapping[str, Any], fallback: int) -> str:
-    return str(
-        node.get("vdra_node_id")
-        or node.get("gear_segment_id")
-        or node.get("segment_id")
-        or node.get("id")
-        or f"node_{fallback}"
-    )
 
 
 def largest_remainder_rounding(
@@ -223,7 +214,7 @@ def allocate_branch_factors(
     unmet: Dict[str, int] = {}
 
     for idx, node in enumerate(nodes):
-        key = _node_id(node, idx)
+        key = node_id(node, idx)
         raw_c = node.get("vdra_dispersion_C", node.get("gear_reward_variance", 0.0))
         c_value = float(raw_c or 0.0)
         if not math.isfinite(c_value) or c_value < 0.0:
@@ -269,6 +260,24 @@ def allocate_branch_factors(
     )
     weights = {key: math.sqrt(value) for key, value in dispersion.items()}
     additional = {key: allocations[key] - base[key] for key in allocations}
+    for idx, node in enumerate(nodes):
+        if isinstance(node, MutableMapping):
+            key = node_id(node, idx)
+            write_node_accounting(
+                node,
+                default_k=int(node.get("vdra_default_k", node.get("default_k", requested)) or 0),
+                predicted_k=int(
+                    node.get(
+                        "vdra_predicted_k",
+                        node.get("gear_predicted_k", node.get("predicted_k", base[key])),
+                    )
+                    or 0
+                ),
+                dispersion_C=dispersion[key],
+                allocated_k=allocations[key],
+                k_min=floor,
+                allocation_weight=weights[key],
+            )
     allocated = sum(allocations.values())
     return AllocationSummary(
         allocations=allocations,

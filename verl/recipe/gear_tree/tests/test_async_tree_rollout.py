@@ -111,6 +111,7 @@ def test_batch_allocation_path_builds_valid_tree():
         scorer=scorer,
         n_min=1,
         pilot_branch_factor=2,
+        allocation_runtime="depth_batch",
         skip_near_leaf_expand=True,
         max_depth=3,
     )
@@ -143,3 +144,39 @@ def test_vineppo_async_annotation_runs():
         )
     )
     assert edges  # MC-value annotation path executed without error
+
+
+
+def test_retained_pilot_is_completed_to_main_segment_length():
+    from recipe.gear_tree.tree_rollout import _expand_reusing_pilots
+
+    calls = []
+
+    async def segment_fn(prompt_ids, branch_factor, max_tokens):
+        calls.append((list(prompt_ids), branch_factor, max_tokens))
+        return [types.SimpleNamespace(
+            token_ids=[9, 10][:max_tokens],
+            text="XY"[:max_tokens],
+            finish_reason="length",
+            logprobs=[-0.1] * int(max_tokens),
+            sum_logprobs=-0.1 * int(max_tokens),
+            num_tokens=int(max_tokens),
+        )]
+
+    node = {
+        "full_token_ids": [1, 2],
+        "vdra_pilot_children": [{
+            "text": "A",
+            "full_text": "QA",
+            "finish_reason": "length",
+            "response_token_ids": [3],
+            "actor_shifted_log_probs": [-0.2],
+            "sum_logprobs": -0.2,
+            "num_tokens": 1,
+        }],
+    }
+    samples = asyncio.run(_expand_reusing_pilots(node, 1, 3, segment_fn))
+    assert samples[0].token_ids == [3, 9, 10]
+    assert samples[0].num_tokens == 3
+    assert calls == [([1, 2, 3], 1, 2)]
+    assert node["vdra_pilot_completion_generated_tokens"] == 2

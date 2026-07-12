@@ -89,12 +89,12 @@ gear_tree:
 
 
     # k0 pilot children and r likelihood samples per child.
-    pilot_branch_factor: null
+    pilot_branch_factor: 8
     likelihood_samples_per_distribution: 2
 
     # Estimate root dispersion bounds and allocate depth-0 budget across the
     # minibatch's roots before building each tree.
-    root_allocation: false
+    root_allocation: true
 
     skip_near_leaf_expand: true
 
@@ -121,11 +121,14 @@ gear_tree:
 
     tv_second_phase_tokens: 60
 
+    # online_timeout (main) | depth_batch (legacy ablation).
+    allocation_runtime: online_timeout
+
     # Online queues flush on capacity or timeout; final drain only at rollout end.
-    queue_count: 1
+    queue_count: 4
     queue_capacity: 8
 
-    queue_timeout_seconds: 0.0
+    queue_timeout_seconds: 1.0
 
     # Share unused floor budget across queues via the reserve pool.
     use_residual_budget: true

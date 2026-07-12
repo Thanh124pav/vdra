@@ -14,11 +14,16 @@ def resolve_gear_calibration(gear: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("strict VDRA requires eps_tail_calibration_path")
     calibration = load_tail_calibration(
         str(path),
+        model=resolved.get("model") or resolved.get("scorer_model"),
+        checkpoint=resolved.get("checkpoint"),
+        dataset=resolved.get("dataset"),
         pilot_branch_factor=resolved.get("pilot_branch_factor"),
         likelihood_samples_per_distribution=resolved.get(
             "likelihood_samples_per_distribution", 2
         ),
         short_horizon=resolved.get("tv_second_phase_tokens", 60),
+        quantile=resolved.get("eps_tail_quantile", 0.99),
+        strict_metadata=resolved.get("strict_vdra", True),
     )
     resolved["eps_tail"] = calibration["eps_tail"]
     resolved["eps_tail_by_depth"] = calibration["eps_tail_by_depth"]

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, List, MutableMapping, Optional
 
 from .core import AllocationSummary, allocate_branch_factors
+from .logging_schema import node_id, write_node_accounting
 
 
 @dataclass
@@ -26,16 +27,22 @@ class SharedReservePool:
             self.contributed += amount
             return self.value
 
-    async def draw_queue_share(self) -> int:
+    async def draw_queue_share(self, max_amount: Optional[int] = None) -> int:
         async with self._lock:
             if self.value <= 0:
                 return 0
-            amount = min(
-                int(math.ceil(self.value / max(self.queue_count, 1))), self.value
-            )
+            queue_share = int(math.ceil(self.value / max(self.queue_count, 1)))
+            amount = min(queue_share, self.value)
+            if max_amount is not None:
+                amount = min(amount, max(int(max_amount), 0))
             self.value -= amount
-            self.consumed += amount
             return amount
+
+    async def consume(self, amount: int) -> int:
+        amount = max(int(amount), 0)
+        async with self._lock:
+            self.consumed += amount
+            return self.consumed
 
 
 @dataclass
@@ -76,8 +83,9 @@ class OnlineBudgetQueue:
         if len(self.items) >= self.capacity:
             return "capacity"
         current = time.monotonic() if now is None else now
-        if timeout_seconds <= 0 or (
-            self.first_enqueued_at is not None
+        if (
+            timeout_seconds > 0
+            and self.first_enqueued_at is not None
             and current - self.first_enqueued_at >= timeout_seconds
         ):
             return "timeout"
@@ -101,10 +109,38 @@ class QueueFlushResult:
     flush_reason: str
     queue_wait_seconds: float
     reserve_available_at_flush: int
+    reserve_after_flush: int
+    allocation_seconds: float
 
     @property
     def timed_out(self) -> bool:
         return self.flush_reason == "timeout"
+
+    @property
+    def reserve_consumed(self) -> int:
+        return int(sum(self.summary.additional_allocations.values()))
+
+    @property
+    def unallocated_residual_budget(self) -> int:
+        return max(int(self.reserve_draw) - self.reserve_consumed, 0)
+
+    def to_record(self) -> dict:
+        return {
+            "queue_id": self.queue_id,
+            "policy_snapshot_id": self.items[0].policy_snapshot_id if self.items else None,
+            "flush_reason": self.flush_reason,
+            "queue_wait_seconds": self.queue_wait_seconds,
+            "queue_size_at_flush": len(self.items),
+            "default_queue_budget": self.base_budget,
+            "total_saved_budget": int(sum(self.summary.saved_allocations.values())),
+            "total_unmet_demand": int(sum(self.summary.unmet_demands.values())),
+            "reserve_before_flush": self.reserve_available_at_flush,
+            "reserve_drawn": self.reserve_draw,
+            "reserve_after_flush": self.reserve_after_flush,
+            "allocated_residual_budget": self.reserve_consumed,
+            "unallocated_residual_budget": self.unallocated_residual_budget,
+            "allocation_seconds": self.allocation_seconds,
+        }
 
 
 class RootQueueManager:
@@ -123,6 +159,7 @@ class RootQueueManager:
         strict_vdra: bool = True,
         rounding_strategy: str = "largest_remainder",
         rounding_seed: int = 0,
+        lambda_: Optional[float] = None,
     ):
         self.queue_count = max(int(queue_count), 1)
         self.queue_capacity = max(int(queue_capacity), 1)
@@ -161,7 +198,7 @@ class RootQueueManager:
     async def drain(self, now: Optional[float] = None) -> List[QueueFlushResult]:
         results: List[QueueFlushResult] = []
         for queue in self.queues:
-            result = await self._flush_queue(queue, reason="final", now=now)
+            result = await self._flush_queue(queue, reason="final_drain", now=now)
             if result:
                 results.append(result)
         return results
@@ -175,11 +212,6 @@ class RootQueueManager:
         wait = max(current - (queue.first_enqueued_at or current), 0.0)
         items = queue.pop_all()
         reserve_before = self.reserve_pool.value
-        reserve_draw = (
-            await self.reserve_pool.draw_queue_share()
-            if self.use_residual_budget
-            else 0
-        )
         for item in items:
             item.node["vdra_default_k"] = int(item.default_branch_factor)
             if "vdra_predicted_k" not in item.node:
@@ -193,12 +225,29 @@ class RootQueueManager:
             )
             for item in items
         )
+        total_unmet_demand = sum(
+            max(
+                max(int(item.node["vdra_predicted_k"]), self.n_min)
+                - min(
+                    max(int(item.default_branch_factor), self.n_min),
+                    max(int(item.node["vdra_predicted_k"]), self.n_min),
+                ),
+                0,
+            )
+            for item in items
+        )
+        reserve_draw = (
+            await self.reserve_pool.draw_queue_share(max_amount=total_unmet_demand)
+            if self.use_residual_budget
+            else 0
+        )
         total_budget = base_budget + reserve_draw
         weight_key = (
             "gear_allocation_weight_override"
             if any(item.weight_key == "gear_allocation_weight_override" for item in items)
             else None
         )
+        t0 = time.perf_counter()
         summary = allocate_branch_factors(
             [item.node for item in items],
             total_budget=total_budget,
@@ -208,11 +257,28 @@ class RootQueueManager:
             rounding_strategy=self.rounding_strategy,
             rounding_seed=self.rounding_seed,
         )
+        allocation_seconds = time.perf_counter() - t0
+        for idx, item in enumerate(items):
+            key = node_id(item.node, idx)
+            write_node_accounting(
+                item.node,
+                default_k=item.default_branch_factor,
+                predicted_k=int(item.node["vdra_predicted_k"]),
+                allocated_k=summary.allocations[key],
+                k_min=self.n_min,
+                dispersion_C=float(item.node.get("vdra_dispersion_C", item.node.get("gear_reward_variance", 0.0)) or 0.0),
+                allocation_weight=summary.weights[key],
+            )
+            item.node["vdra_queue_wait_seconds"] = wait
+            item.node["vdra_flush_reason"] = reason
         self.flush_count += 1
         self.timeout_flush_count += int(reason == "timeout")
         self.capacity_flush_count += int(reason == "capacity")
-        self.final_drain_count += int(reason == "final")
-        self.reserve_consumed += reserve_draw
+        self.final_drain_count += int(reason == "final_drain")
+        residual_used = int(sum(summary.additional_allocations.values()))
+        await self.reserve_pool.consume(residual_used)
+        self.reserve_consumed += residual_used
+        reserve_after = self.reserve_pool.value
         return QueueFlushResult(
             queue_id=queue.queue_id,
             items=items,
@@ -223,4 +289,6 @@ class RootQueueManager:
             flush_reason=reason,
             queue_wait_seconds=wait,
             reserve_available_at_flush=reserve_before,
+            reserve_after_flush=reserve_after,
+            allocation_seconds=allocation_seconds,
         )
