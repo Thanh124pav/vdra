@@ -237,6 +237,44 @@ class VLLMLogprobClient:
         return list(token_logprobs)
 
 
+def resolve_vllm_model_id(
+    api_base: str,
+    explicit_model: Optional[str] = None,
+    *,
+    api_key: str = "EMPTY",
+    timeout: float = 10.0,
+) -> str:
+    """Resolve a non-empty OpenAI-compatible model id for scorer requests."""
+
+    if explicit_model and str(explicit_model).strip():
+        return str(explicit_model).strip()
+    if not api_base:
+        raise ValueError("scorer_api_base is required when scorer_model is not set")
+    url = f"{str(api_base).rstrip('/')}/models"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            response = client.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not resolve scorer_model from the vLLM /models endpoint. "
+            f"Set gear_tree.gear.scorer_model explicitly or make {url!r} reachable."
+        ) from exc
+    models = data.get("data") or []
+    if not models:
+        raise RuntimeError(
+            f"No served models returned by {url!r}; set gear_tree.gear.scorer_model explicitly."
+        )
+    model_id = models[0].get("id") if isinstance(models[0], dict) else None
+    if not model_id:
+        raise RuntimeError(
+            f"Could not read a model id from {url!r}; set gear_tree.gear.scorer_model explicitly."
+        )
+    return str(model_id)
+
+
 def make_lp_scorer(client: VLLMLogprobClient, tokenize_fn) -> LPScorer:
     async def score_fn(prompt: str, **_):
         return await client.prompt_logprobs(prompt)

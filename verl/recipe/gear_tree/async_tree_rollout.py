@@ -144,11 +144,17 @@ async def build_tree_edges_async(
     unfinished_penalty: float = 0.0,
     demo_logger: Any = None,
     gear_node_expander: Any = None,
+    policy_snapshot_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Build one tree via the async server and return its SPO/GEAR edges."""
 
     def grade_fn(query, response, inst):
         return float(reward_fn(query, response, inst)[0])
+
+    if policy_snapshot_id is not None:
+        data_instance = dict(data_instance)
+        data_instance["policy_snapshot_id"] = str(policy_snapshot_id)
+        data_instance["current_rollout_snapshot_id"] = str(policy_snapshot_id)
 
     tree = await async_build_tree(
         prompt_text, prompt_token_ids, data_instance,
@@ -173,11 +179,15 @@ async def build_tree_edges_async(
         except Exception:
             pass
 
-    return extract_edges_from_tree(
+    edges = extract_edges_from_tree(
         tree, adv_method=adv_method, only_adv_greater_than_zero=only_adv_greater_than_zero,
         tree_update_mode=tree_update_mode, treepo_global_weight=treepo_global_weight,
         treerl_gamma=treerl_gamma,
     )
+    if policy_snapshot_id is not None:
+        for edge in edges:
+            edge.setdefault("policy_snapshot_id", str(policy_snapshot_id))
+    return edges
 
 
 async def _annotate_mc_async(tree, data_instance, mc_rollout, grade_fn, K, unfinished_penalty):
@@ -231,11 +241,19 @@ try:  # keep CPU-importable when agent_loop isn't installed
 
             rm = kwargs.get("reward_model", {}) or {}
             extra = kwargs.get("extra_info", {}) or {}
+            snapshot_id = (
+                kwargs.get("policy_snapshot_id")
+                or kwargs.get("current_rollout_snapshot_id")
+                or self._gt.get("policy_snapshot_id")
+                or "rollout_step:unknown"
+            )
             data_instance = {
                 "problem": extra.get("problem") or rm.get("problem"),
                 "answer": rm.get("ground_truth"),
                 "reward_model": rm,
                 "_treetune__idx": kwargs.get("index"),
+                "policy_snapshot_id": snapshot_id,
+                "current_rollout_snapshot_id": snapshot_id,
             }
 
             edges = await build_tree_edges_async(
@@ -250,6 +268,7 @@ try:  # keep CPU-importable when agent_loop isn't installed
                 only_adv_greater_than_zero=self._gt.get("only_adv_greater_than_zero", True),
                 vineppo_K=self._gt.get("vineppo_K", 0),
                 gear_node_expander=self._node_expander,
+                policy_snapshot_id=snapshot_id,
             )
 
             # Placeholder response (first edge) keeps the AgentLoopOutput schema
@@ -275,6 +294,8 @@ try:  # keep CPU-importable when agent_loop isn't installed
         from recipe.gear_tree.calibration import resolve_gear_calibration
 
         g = resolve_gear_calibration(dict(gt["gear"]))
+        if gt.get("policy_snapshot_id") is not None:
+            g.setdefault("policy_snapshot_id", gt.get("policy_snapshot_id"))
         scorer = _build_scorer(g, tokenizer)
         # Defaults here must match the GearGate signature so a missing config
         # key behaves identically no matter which entry point built the gate.
@@ -330,14 +351,34 @@ try:  # keep CPU-importable when agent_loop isn't installed
             make_lp_scorer,
         )
 
+        from recipe.gear_tree.gear_core.gear.vllm_scorer import resolve_vllm_model_id
+
+        rollout_snapshot = g.get("policy_snapshot_id")
+        scorer_snapshot = g.get("scorer_snapshot_id", rollout_snapshot)
+        if rollout_snapshot is not None and scorer_snapshot != rollout_snapshot:
+            raise RuntimeError(
+                "VDRA scorer snapshot does not match rollout snapshot: "
+                f"{scorer_snapshot!r} != {rollout_snapshot!r}"
+            )
+        model_id = resolve_vllm_model_id(
+            str(api_base),
+            g.get("scorer_model"),
+            api_key=str(g.get("scorer_api_key", "EMPTY")),
+            timeout=float(g.get("scorer_model_resolve_timeout", 10.0)),
+        )
         client = VLLMLogprobClient(
             api_base=str(api_base),
-            model=str(g.get("scorer_model", "")),
+            model=model_id,
+            api_key=str(g.get("scorer_api_key", "EMPTY")),
             max_concurrency=int(g.get("scorer_max_concurrency", 64)),
         )
-        return make_lp_scorer(
+        scorer = make_lp_scorer(
             client, lambda text: tokenizer.encode(text, add_special_tokens=False)
         )
+        scorer.policy_snapshot_id = rollout_snapshot
+        scorer.scorer_snapshot_id = scorer_snapshot
+        scorer.scorer_model = model_id
+        return scorer
 
 except Exception:  # pragma: no cover
     TreeAgentLoop = None  # type: ignore

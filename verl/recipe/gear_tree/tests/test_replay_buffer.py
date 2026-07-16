@@ -113,3 +113,13 @@ def test_same_sampler_is_method_independent():
     sampled, _ = buf.sample_for_update(current_step=1)
     assert len(sampled) == 4
     assert all(edge["tree_update_mode"] == "spo" for edge in sampled)
+
+
+def test_peek_sampling_does_not_remove_until_explicit_remove():
+    buf = _buffer(target_edges_per_update=4, max_edges_per_question=10)
+    buf.add([_edge(i, question_id=i) for i in range(4)], generation_step=0, policy_snapshot_id="snap")
+    sampled, stats = buf.sample_for_update(current_step=1, remove=False)
+    assert len(sampled) == 4
+    assert len(buf) == 4
+    assert buf.remove(stats["removed_edge_ids"]) == stats["removed_edge_ids"]
+    assert len(buf) == 0

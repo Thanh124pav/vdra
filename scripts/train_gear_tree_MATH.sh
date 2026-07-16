@@ -13,7 +13,10 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
-: "${EPS_TAIL_CALIBRATION_PATH:?set EPS_TAIL_CALIBRATION_PATH=<artifact.json> for VDRA}"
+TAIL_MODE="${TAIL_MODE:-${GEAR_TAIL_MODE:-none}}"
+if [[ "${TAIL_MODE}" == "calibrated" ]]; then
+  : "${EPS_TAIL_CALIBRATION_PATH:?set EPS_TAIL_CALIBRATION_PATH=<artifact.json> when TAIL_MODE=calibrated}"
+fi
 
 MODEL="${MODEL:-deepseekR1Qwen}"
 TREE="${TREE:-${GEAR_TREE:-666}}"

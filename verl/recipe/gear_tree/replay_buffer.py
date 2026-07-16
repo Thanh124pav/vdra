@@ -88,7 +88,9 @@ class GearTreeReplayBuffer:
         self.metrics["expired_edges"] += len(expired)
         return sorted(expired)
 
-    def sample_for_update(self, *, current_step: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    def sample_for_update(
+        self, *, current_step: int, remove: bool = True
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         size_before = len(self._edges)
         expired_ids = self.expire(current_step=current_step)
         grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -114,8 +116,8 @@ class GearTreeReplayBuffer:
             sampled = candidates
 
         sampled_ids = {str(edge["edge_id"]) for edge in sampled}
-        for edge_id in sampled_ids:
-            self._edges.pop(edge_id, None)
+        if remove:
+            self.remove(sampled_ids)
         self.metrics["sampled_edges"] += len(sampled)
 
         ages = [int(current_step) - int(edge.get("generation_step", current_step)) for edge in sampled]
@@ -140,6 +142,13 @@ class GearTreeReplayBuffer:
                 1 for edge in sampled if int(edge.get("depth", -1)) == depth
             )
         return [dict(edge) for edge in sampled], stats
+
+    def remove(self, edge_ids: Iterable[str]) -> List[str]:
+        removed: List[str] = []
+        for edge_id in sorted(str(edge_id) for edge_id in edge_ids):
+            if self._edges.pop(edge_id, None) is not None:
+                removed.append(edge_id)
+        return removed
 
     def save(self, checkpoint_dir: str | Path) -> None:
         target = Path(checkpoint_dir)

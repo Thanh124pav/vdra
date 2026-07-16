@@ -338,6 +338,8 @@ def allocate_branch_factors_integer(
         if value < lower[key] or value > upper[key]:
             raise RuntimeError(f"Allocation for {key!r} violates bounds: {value}")
 
+    solver_elapsed_ms = (time.perf_counter() - start) * 1000.0
+
     reference = {
         key: min(max(default[key], lower[key]), upper[key])
         for key in allocation
@@ -351,8 +353,6 @@ def allocate_branch_factors_integer(
     expanded = {key: max(allocation[key] - default[key], 0) for key in allocation}
     transferred = min(sum(pruned.values()), sum(expanded.values()))
     weights = {key: math.sqrt(value) for key, value in dispersion.items()}
-    elapsed_ms = (time.perf_counter() - start) * 1000.0
-
     for idx, node in enumerate(nodes):
         if isinstance(node, MutableMapping):
             key = node_id(node, idx)
@@ -382,7 +382,7 @@ def allocate_branch_factors_integer(
         allocated_budget=allocated,
         objective_before=objective_before,
         objective_after=objective_after,
-        solver_time_ms=elapsed_ms,
+        solver_time_ms=solver_elapsed_ms,
         solver_name="bounded_marginal_integer",
         feasibility_repair_count=repair_count,
         weights=weights,

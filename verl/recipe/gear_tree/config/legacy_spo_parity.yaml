@@ -10,6 +10,7 @@ gear_tree:
     max_edges_per_question: 32
     max_edge_age: 8
     underfill_policy: use_available
+    underfilled_update_policy: postpone_until_divisible
     sampling_seed: 0
     checkpoint: true
 

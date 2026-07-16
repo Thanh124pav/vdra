@@ -12,6 +12,7 @@ import json
 import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List
 
 from verl import DataProto
@@ -42,20 +43,49 @@ class RayGearTreeTrainer(RayPPOTrainer):
             "underfill_policy": "use_available",
             "sampling_seed": 0,
             "checkpoint": True,
+            "underfilled_update_policy": "postpone_until_divisible",
             **dict(gt.get("replay_buffer") or {}),
         }
 
-    def _ensure_replay_buffer(self) -> GearTreeReplayBuffer:
+    def _new_replay_buffer(self) -> GearTreeReplayBuffer:
         replay_cfg = self._replay_config()
+        return GearTreeReplayBuffer(
+            target_edges_per_update=replay_cfg["target_edges_per_update"],
+            max_edges_per_question=replay_cfg["max_edges_per_question"],
+            max_edge_age=replay_cfg["max_edge_age"],
+            underfill_policy=replay_cfg.get("underfill_policy", "use_available"),
+            sampling_seed=replay_cfg.get("sampling_seed", 0),
+        )
+
+    def _ensure_replay_buffer(self) -> GearTreeReplayBuffer:
         if not hasattr(self, "replay_buffer"):
-            self.replay_buffer = GearTreeReplayBuffer(
-                target_edges_per_update=replay_cfg["target_edges_per_update"],
-                max_edges_per_question=replay_cfg["max_edges_per_question"],
-                max_edge_age=replay_cfg["max_edge_age"],
-                underfill_policy=replay_cfg.get("underfill_policy", "use_available"),
-                sampling_seed=replay_cfg.get("sampling_seed", 0),
-            )
+            self.replay_buffer = self._new_replay_buffer()
         return self.replay_buffer
+
+    def _checkpoint_dir_for_step(self, step: int) -> str:
+        return os.path.join(self.config.trainer.default_local_dir, f"global_step_{int(step)}")
+
+    def _restore_or_init_replay_buffer(self) -> Dict[str, Any]:
+        replay_cfg = self._replay_config()
+        metrics = {
+            "buffer/checkpoint_restored": 0.0,
+            "buffer/reset_on_resume": 0.0,
+        }
+        if int(getattr(self, "global_steps", 0) or 0) <= 0:
+            self.replay_buffer = self._new_replay_buffer()
+            return metrics
+
+        ckpt_dir = Path(self._checkpoint_dir_for_step(self.global_steps))
+        meta_path = ckpt_dir / "gear_tree_replay_buffer_meta.json"
+        if replay_cfg.get("checkpoint", True) and meta_path.exists():
+            self.replay_buffer = GearTreeReplayBuffer.load(ckpt_dir)
+            metrics["buffer/checkpoint_restored"] = 1.0
+            metrics["buffer/restored_edges"] = float(len(self.replay_buffer))
+        else:
+            self.replay_buffer = self._new_replay_buffer()
+            metrics["buffer/reset_on_resume"] = 1.0
+        self.replay_buffer_resume_metrics = metrics
+        return metrics
 
     def _current_policy_snapshot_id(self) -> str:
         return f"global_step:{int(self.global_steps)}"
@@ -70,10 +100,28 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 "actor_rollout_ref.actor.ppo_mini_batch_size"
             )
 
+    def _should_postpone_sampled_update(self, sampled_edges: List[Dict[str, Any]]) -> bool:
+        replay_cfg = self._replay_config()
+        policy = replay_cfg.get("underfilled_update_policy", "postpone_until_divisible")
+        if policy == "use_available":
+            return False
+        if policy != "postpone_until_divisible":
+            raise ValueError(f"Unknown underfilled_update_policy: {policy!r}")
+        if not sampled_edges:
+            return False
+        ppo_mini = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
+        target = int(replay_cfg["target_edges_per_update"])
+        return len(sampled_edges) < target and len(sampled_edges) % ppo_mini != 0
+
     def _generate_tree_edges(self, gen_batch: DataProto) -> List[Dict[str, Any]]:
         """Run tree rollout and return raw replayable edge records."""
         gt = self._gear_tree_config()
         snapshot_id = self._current_policy_snapshot_id()
+        gt["policy_snapshot_id"] = snapshot_id
+        gt["current_rollout_snapshot_id"] = snapshot_id
+        gear_cfg = gt.setdefault("gear", {})
+        if isinstance(gear_cfg, dict):
+            gear_cfg["policy_snapshot_id"] = snapshot_id
         gen_batch.meta_info["gear_tree_config"] = gt
         gen_batch.meta_info["global_steps"] = self.global_steps
         gen_batch.meta_info["policy_snapshot_id"] = snapshot_id
@@ -143,10 +191,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
         replay_cfg = self._replay_config()
         if not replay_cfg.get("checkpoint", True) or not hasattr(self, "replay_buffer"):
             return {"buffer/checkpoint_saved": 0.0}
-        ckpt_dir = os.path.join(
-            self.config.trainer.default_local_dir,
-            f"global_step_{int(self.global_steps)}",
-        )
+        ckpt_dir = self._checkpoint_dir_for_step(self.global_steps)
         self.replay_buffer.save(ckpt_dir)
         return {"buffer/checkpoint_saved": 1.0}
 
@@ -164,6 +209,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
         self.global_steps = 0
         self._load_checkpoint()
         self._validate_replay_startup()
+        replay_resume_metrics = self._restore_or_init_replay_buffer()
         replay_buffer = self._ensure_replay_buffer()
 
         os.makedirs(self.config.trainer.default_local_dir, exist_ok=True)
@@ -175,6 +221,8 @@ class RayGearTreeTrainer(RayPPOTrainer):
             val_metrics = self._validate()
             if val_metrics:
                 logger.log(data=val_metrics, step=self.global_steps)
+        if replay_resume_metrics:
+            logger.log(data=replay_resume_metrics, step=self.global_steps)
 
         self.global_steps += 1
         test_freq = self.config.trainer.get("test_freq", -1)
@@ -197,11 +245,18 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     policy_snapshot_id=self._current_policy_snapshot_id(),
                 )
                 sampled_edges, sample_stats = replay_buffer.sample_for_update(
-                    current_step=self.global_steps
+                    current_step=self.global_steps, remove=False
                 )
                 metrics.update({k: v for k, v in sample_stats.items() if k != "removed_edge_ids"})
                 metrics["buffer/new_edges"] = len(new_edges)
+                metrics["buffer/postponed_update"] = 0.0
                 if not sampled_edges:
+                    logger.log(data=metrics, step=self.global_steps)
+                    self.global_steps += 1
+                    continue
+                if self._should_postpone_sampled_update(sampled_edges):
+                    metrics["buffer/postponed_update"] = 1.0
+                    metrics["buffer/size_after"] = float(len(replay_buffer))
                     logger.log(data=metrics, step=self.global_steps)
                     self.global_steps += 1
                     continue
@@ -209,9 +264,17 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 edge_batch = self._edges_to_update_batch(sampled_edges, metrics)
 
                 t0 = time.time()
+                actor_updated = False
                 if self.config.trainer.critic_warmup <= self.global_steps:
                     actor_output = self.actor_rollout_wg.update_actor(edge_batch)
+                    actor_updated = True
                     metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+                if actor_updated:
+                    removed = replay_buffer.remove(sample_stats.get("removed_edge_ids", []))
+                    if sorted(removed) != sorted(sample_stats.get("removed_edge_ids", [])):
+                        raise RuntimeError("Replay buffer removal did not match sampled update edges")
+                    metrics["buffer/removed_edges"] = float(len(removed))
+                    metrics["buffer/size_after"] = float(len(replay_buffer))
                 t_update = time.time() - t0
 
                 response_tokens = edge_batch.batch["response_mask"].sum().item()

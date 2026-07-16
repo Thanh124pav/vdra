@@ -103,6 +103,10 @@ ensure_runtime_config() {
   if [[ -n "${GEAR_SCORE_CONCURRENCY:-}" ]]; then
     gear_inference_overrides+="      gear_score_concurrency: ${GEAR_SCORE_CONCURRENCY},"$'\n'
   fi
+  if [[ -n "${TAIL_MODE:-${GEAR_TAIL_MODE:-}}" ]]; then
+    local gear_tail_mode="${TAIL_MODE:-${GEAR_TAIL_MODE:-}}"
+    gear_inference_overrides+="      gear_tail_mode: '${gear_tail_mode}',"$'\n'
+  fi
   if [[ -n "${EPS_TAIL_CALIBRATION_PATH:-}" ]]; then
     gear_inference_overrides+="      gear_eps_tail_calibration_path: '${EPS_TAIL_CALIBRATION_PATH}',"$'\n'
   fi

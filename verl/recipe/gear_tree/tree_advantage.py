@@ -49,6 +49,12 @@ def extract_edges_from_tree(
     data_instance = tree_copy.get("_request_object", {})
     question_id = data_instance.get("_treetune__idx", data_instance.get("uid"))
     root_reward = _node_reward(tree_copy)
+    policy_snapshot_id = (
+        tree_copy.get("policy_snapshot_id")
+        or tree_copy.get("vdra_policy_snapshot_id")
+        or data_instance.get("policy_snapshot_id")
+        or data_instance.get("current_rollout_snapshot_id")
+    )
 
     def visit(node: dict[str, Any], parent: dict[str, Any] | None = None) -> None:
         if parent is not None:
@@ -73,6 +79,7 @@ def extract_edges_from_tree(
 
             edge = {
                 "question_id": question_id,
+                "policy_snapshot_id": policy_snapshot_id,
                 "instance": data_instance,
                 "query_text": parent.get("full_text", parent.get("text", "")),
                 "response_text": node.get("text", ""),

@@ -1,4 +1,5 @@
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -21,12 +22,12 @@ class _Tokenizer:
     eos_token_id = 1
 
 
-def _trainer(balance_batch=False, target_edges=512, mini_batch=128):
+def _trainer(balance_batch=False, target_edges=512, mini_batch=128, default_local_dir="/tmp"):
     obj = object.__new__(RayGearTreeTrainer)
     obj.tokenizer = _Tokenizer()
     obj.config = _Cfg(
         data=_Cfg(max_prompt_length=4, max_response_length=3),
-        trainer=_Cfg(balance_batch=balance_batch, default_local_dir="/tmp"),
+        trainer=_Cfg(balance_batch=balance_batch, default_local_dir=default_local_dir),
         actor_rollout_ref=_Cfg(actor=_Cfg(ppo_mini_batch_size=mini_batch)),
         gear_tree={
             "replay_buffer": {
@@ -93,3 +94,47 @@ def test_generated_edges_require_stored_generation_logprobs():
 def test_trainer_source_does_not_recompute_old_log_probs_in_fit():
     source = inspect.getsource(RayGearTreeTrainer.fit)
     assert "compute_log_prob" not in source
+
+
+def test_underfilled_indivisible_update_is_postponed():
+    trainer = _trainer(target_edges=512, mini_batch=128)
+    edges = [_edge(str(i)) for i in range(300)]
+    assert trainer._should_postpone_sampled_update(edges) is True
+    assert trainer._should_postpone_sampled_update(edges[:256]) is False
+
+
+def test_restore_replay_buffer_from_checkpoint(tmp_path):
+    trainer = _trainer(default_local_dir=str(tmp_path))
+    trainer.global_steps = 3
+    buf = trainer._new_replay_buffer()
+    buf.add([_edge("saved")], generation_step=3, policy_snapshot_id="snap")
+    ckpt = tmp_path / "global_step_3"
+    buf.save(ckpt)
+    metrics = trainer._restore_or_init_replay_buffer()
+    assert metrics["buffer/checkpoint_restored"] == 1.0
+    assert len(trainer.replay_buffer) == 1
+
+
+def test_resume_without_replay_checkpoint_logs_explicit_reset(tmp_path):
+    trainer = _trainer(default_local_dir=str(tmp_path))
+    trainer.global_steps = 5
+    metrics = trainer._restore_or_init_replay_buffer()
+    assert metrics["buffer/reset_on_resume"] == 1.0
+    assert len(trainer.replay_buffer) == 0
+
+
+def test_generate_tree_edges_injects_policy_snapshot_into_config():
+    trainer = _trainer()
+    trainer.global_steps = 7
+    seen = {}
+
+    class _WG:
+        def generate_sequences(self, gen_batch):
+            seen.update(gen_batch.meta_info["gear_tree_config"])
+            return type("DP", (), {"non_tensor_batch": {"gear_tree_edges": [[_edge("e")]]}})()
+
+    trainer.actor_rollout_wg = _WG()
+    out = trainer._generate_tree_edges(type("DP", (), {"meta_info": {}})())
+    assert seen["policy_snapshot_id"] == "global_step:7"
+    assert seen["gear"]["policy_snapshot_id"] == "global_step:7"
+    assert out[0]["policy_snapshot_id"] == "global_step:7"

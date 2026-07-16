@@ -193,7 +193,7 @@ Pilot handling (updated):
 After pruning, saved branches enter a shared pool. Nodes with remaining demand
 receive additional branches through capped water filling for
 \(\min\sum_s C_s/k_s\). The continuous priority is `sqrt(C_s)` and integer
-allocations use capped rounding (`rounding_strategy`, ablation #10).
+allocations use the exact bounded marginal integer solver by default (`rounding_strategy=integer_marginal`); relax-and-round modes remain ablations only.
 `budget_lambda` is not a VDRA parameter; the solver's internal `dual_lambda`
 is computed, never tuned. In the verl online runtime sibling frontier nodes
 are expanded concurrently so allocation queues genuinely batch (check
@@ -212,13 +212,13 @@ Main configuration:
 | `budget_mode` | `fixed_main` | `fixed_main` or `fixed_total_generated` |
 | `allocation_proxy` | `vdra` | `vdra` / `uniform` / `random` / `direct_tv` / `empirical_variance` / `external_score` / `oracle` |
 | `oracle_rollouts_per_node` | 16 | Full rollouts per node for the oracle proxy (eval-only) |
-| `rounding_strategy` | `largest_remainder` | `largest_remainder` / `nearest_repair` / `stochastic` |
+| `rounding_strategy` | `integer_marginal` | `integer_marginal`; legacy ablations: `largest_remainder` / `nearest_repair` / `stochastic` |
 | `queue_capacity` | 8 | Nodes per online allocation flush |
 | `root_allocation` | backend-specific | Joint root allocation; unsupported backends reject it |
 
 `fixed_main` keeps the main-expansion budget fixed and reports pilot/scoring as
 overhead. `fixed_total_generated` (verl online runtime) places pilot, support
-and main generation under one generated-token cap equal to the uniform-SPO
+and main generation under one generated-token cap equal to the matched uniform-SPO
 expected token count; cap accounting lands in `vdra_token_cap`,
 `vdra_generated_tokens_under_cap` and `vdra_token_cap_hit_count`. Neither mode
 hides likelihood-scoring work.

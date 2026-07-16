@@ -496,7 +496,11 @@ async def async_build_tree_online_alloc(
         max_default_branch_factor=max(int(x) for x in tree_shape),
         segment_length=M,
     )
-    policy_snapshot_id = str(data_instance.get("_treetune__idx", "tree"))
+    policy_snapshot_id = str(
+        data_instance.get("policy_snapshot_id")
+        or data_instance.get("current_rollout_snapshot_id")
+        or "rollout_step:unknown"
+    )
     run_id = str(data_instance.get("run_id", policy_snapshot_id))
     tree_id = str(data_instance.get("tree_id", policy_snapshot_id))
     budget_mode = str(getattr(gear_gate, "budget_mode", "fixed_main"))
@@ -553,6 +557,8 @@ async def async_build_tree_online_alloc(
         "leaf": False,
         "full_token_ids": list(root_prompt_token_ids),
         "gear_segment_id": "root",
+        "policy_snapshot_id": policy_snapshot_id,
+        "vdra_policy_snapshot_id": policy_snapshot_id,
     }
 
     def _default_bf(depth: int) -> int:
@@ -892,6 +898,9 @@ async def async_build_tree_online_alloc(
                 "eps_tail": getattr(getattr(gear_gate, "cfg", None), "eps_tail", None),
                 "eps_tail_calibration_path": getattr(gear_gate, "eps_tail_calibration_path", None),
                 "eps_tail_calibration_metadata": getattr(gear_gate, "eps_tail_calibration_metadata", None),
+                "policy_snapshot_id": policy_snapshot_id,
+                "scorer_snapshot_id": getattr(getattr(gear_gate, "scorer", None), "scorer_snapshot_id", None),
+                "scorer_model": getattr(getattr(gear_gate, "scorer", None), "scorer_model", None),
                 "budget_mode": tree["vdra_budget_mode"],
                 "budget_claim": budget_claim_for_mode(tree["vdra_budget_mode"]),
                 "compute_proxy_definition": COMPUTE_PROXY_DEFINITION,

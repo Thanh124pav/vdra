@@ -94,6 +94,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
         gear_use_residual_budget: bool = True,
         gear_allocation_mode: str = "budget_allocation",
         # VDRA scoring / bound knobs ------------------------------------------
+        gear_tail_mode: str = "none",
         gear_eps_tail: float = 0.0,
         gear_eps_tail_calibration_path: Optional[str] = None,
         gear_eps_tail_by_depth: Optional[Dict[int, float]] = None,
@@ -103,9 +104,15 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
         **kwargs: Any,
     ):
         super().__init__(**kwargs)
-        if gear_strict_vdra:
+        gear_tail_mode = str(gear_tail_mode)
+        if gear_tail_mode not in {"none", "calibrated", "fixed"}:
+            raise ValueError("gear_tail_mode must be one of: none, calibrated, fixed")
+        if gear_tail_mode == "none":
+            gear_eps_tail = 0.0
+            gear_eps_tail_by_depth = None
+        elif gear_tail_mode == "calibrated":
             if not gear_eps_tail_calibration_path:
-                raise ValueError("strict VDRA requires gear_eps_tail_calibration_path")
+                raise ValueError("gear_tail_mode='calibrated' requires gear_eps_tail_calibration_path")
             from vdra_core.calibration import load_tail_calibration
             calibration = load_tail_calibration(
                 gear_eps_tail_calibration_path,
@@ -116,6 +123,8 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
             )
             gear_eps_tail = calibration["eps_tail"]
             gear_eps_tail_by_depth = calibration["eps_tail_by_depth"]
+        elif gear_tail_mode == "fixed":
+            gear_eps_tail = float(gear_eps_tail)
         self.cfg_thresholds = ThresholdConfig(
             epsilon=gear_epsilon,
             r_max=gear_r_max,

@@ -32,10 +32,10 @@
     // Default exact bounded marginal integer solver.
     rounding_strategy: 'integer_marginal',
     rounding_seed: 0,
-    // VDRA (Summary.md §7-§9): tail-corrected value bound + tanh TV estimator.
-    // strict_vdra requires eps_tail_calibration_path (from
-    // scripts/calibrate_tail_divergence.py); the raw eps_tail below is used
-    // only when strict_vdra is false.
+    // VDRA (Summary.md §7-§9): short-horizon proxy by default.
+    // tail_mode='none' permits strict_vdra with eps_tail=0 and no calibration
+    // artifact; tail_mode='calibrated' requires eps_tail_calibration_path.
+    tail_mode: 'none',
     eps_tail: 0.0,
     eps_tail_calibration_path: null,
     strict_vdra: true,
@@ -57,7 +57,8 @@
     // Edge handling
     // Update objective for tree-policy training. `spo` preserves the
     // existing local parent-child advantage. Use `treepo_original` or
-    // `treerl_original` for reproduction ablations.
+    // `treerl_original` for style/parity ablations; the enum names are
+    // retained for backwards-compatible config rendering.
     tree_update_mode: 'spo',
     treepo_global_weight: 0.5,
     treerl_gamma: 0.9,

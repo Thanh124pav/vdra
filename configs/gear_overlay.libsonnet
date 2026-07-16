@@ -47,6 +47,7 @@
       gear_budget_queue_timeout_seconds: $.gear.budget_queue_timeout_seconds,
       gear_skip_near_leaf_expand: $.gear.skip_near_leaf_expand,
       gear_root_allocation: $.gear.root_allocation,
+      gear_tail_mode: $.gear.tail_mode,
       gear_eps_tail: $.gear.eps_tail,
       gear_eps_tail_calibration_path: $.gear.eps_tail_calibration_path,
       gear_eps_tail_by_depth: $.gear.eps_tail_by_depth,
