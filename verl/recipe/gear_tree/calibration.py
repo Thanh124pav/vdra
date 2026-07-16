@@ -1,4 +1,4 @@
-"""Resolve and validate VDRA tail calibration for recipe workers."""
+"""Resolve and validate VDRA tail-mode configuration for recipe workers."""
 
 from typing import Any, Dict
 
@@ -7,19 +7,37 @@ from vdra_core.calibration import load_tail_calibration
 
 def resolve_gear_calibration(gear: Dict[str, Any]) -> Dict[str, Any]:
     resolved = dict(gear)
-    if not resolved.get("strict_vdra", True):
+    tail_mode = str(resolved.get("tail_mode", "none"))
+    if tail_mode not in {"none", "calibrated", "fixed"}:
+        raise ValueError("gear_tree.gear.tail_mode must be one of: none, calibrated, fixed")
+    resolved["tail_mode"] = tail_mode
+
+    if tail_mode == "none":
+        resolved["eps_tail"] = 0.0
+        resolved["eps_tail_by_depth"] = None
+        resolved["eps_tail_source"] = None
+        resolved["eps_tail_calibration_metadata"] = None
+        resolved["score_interpretation"] = "relative short-horizon proxy"
+        resolved["certified_full_horizon_bound"] = False
         return resolved
+
+    if tail_mode == "fixed":
+        resolved["eps_tail"] = float(resolved.get("eps_tail", 0.0) or 0.0)
+        resolved["eps_tail_source"] = "fixed_config"
+        resolved["score_interpretation"] = "fixed tail-corrected proxy"
+        resolved["certified_full_horizon_bound"] = False
+        return resolved
+
     path = resolved.get("eps_tail_calibration_path")
     if not path:
         raise ValueError(
-            "strict VDRA requires eps_tail_calibration_path. Produce one with:\n"
+            "tail_mode='calibrated' requires eps_tail_calibration_path. Produce one with:\n"
             "  python scripts/calibrate_tail_divergence.py \\\n"
             "    --api-base <vllm>/v1 --model <served-model> \\\n"
             "    --prompts-file <train.jsonl> --k0 8 --r 2 \\\n"
             "    --horizons 8,16,32,60 --full-tokens 512 \\\n"
             "    --out results/tail_calibration.json\n"
-            "then set gear_tree.gear.eps_tail_calibration_path to that file "
-            "(or set strict_vdra: false to use the raw eps_tail value)."
+            "then set gear_tree.gear.eps_tail_calibration_path to that file."
         )
     calibration = load_tail_calibration(
         str(path),
@@ -38,4 +56,6 @@ def resolve_gear_calibration(gear: Dict[str, Any]) -> Dict[str, Any]:
     resolved["eps_tail_by_depth"] = calibration["eps_tail_by_depth"]
     resolved["eps_tail_source"] = calibration["path"]
     resolved["eps_tail_calibration_metadata"] = calibration["metadata"]
+    resolved["score_interpretation"] = "calibrated tail-corrected proxy"
+    resolved["certified_full_horizon_bound"] = True
     return resolved

@@ -29,8 +29,8 @@
     budget_queue_capacity: 8,
     budget_queue_timeout_seconds: 1.0,
     // Integer rounding for the capped continuous allocation (ablation #10):
-    // 'largest_remainder' | 'nearest_repair' | 'stochastic'.
-    rounding_strategy: 'largest_remainder',
+    // Default exact bounded marginal integer solver.
+    rounding_strategy: 'integer_marginal',
     rounding_seed: 0,
     // VDRA (Summary.md §7-§9): tail-corrected value bound + tanh TV estimator.
     // strict_vdra requires eps_tail_calibration_path (from

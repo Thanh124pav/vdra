@@ -11,18 +11,20 @@ def _nodes():
     ]
 
 
-@pytest.mark.parametrize("strategy", ["largest_remainder", "nearest_repair", "stochastic"])
-def test_rounding_strategies_preserve_budget_and_caps(strategy):
-    out = allocate_branch_factors(
-        _nodes(), total_budget=8, rounding_strategy=strategy, rounding_seed=7
-    )
+def test_integer_solver_preserves_budget_and_caps():
+    out = allocate_branch_factors(_nodes(), total_budget=8, rounding_strategy="integer_marginal")
     assert sum(out.allocations.values()) == 8
     assert all(
-        out.base_allocations[key] <= value <= out.cap_allocations[key]
+        out.lower_bounds[key] <= value <= out.upper_bounds[key]
         for key, value in out.allocations.items()
     )
 
 
+def test_old_rounding_strategy_names_fail_on_default_path():
+    with pytest.raises(ValueError, match="Unknown rounding strategy"):
+        allocate_branch_factors(_nodes(), total_budget=8, rounding_strategy="largest_remainder")
+
+
 def test_unknown_rounding_strategy_fails():
-    with pytest.raises(ValueError, match="rounding strategy"):
+    with pytest.raises(ValueError, match="Unknown rounding strategy"):
         allocate_branch_factors(_nodes(), total_budget=8, rounding_strategy="bad")

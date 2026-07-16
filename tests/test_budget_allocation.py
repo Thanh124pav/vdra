@@ -33,49 +33,46 @@ def test_dispersion_bound_matches_summary_normalization():
     assert reward_variance_from_pair_tvs(pair_tvs, n=3, gamma=0.5) == pytest.approx(expected)
 
 
-def test_pruning_only_reports_unallocated_residual():
+def test_all_redundant_caps_cannot_drop_budget_silently():
     nodes = [_node("a", 6, 2, 0.1), _node("b", 6, 3, 1.0)]
-    out = allocate_branch_factors(nodes, total_budget=12, n_min=1)
-    assert out.base_allocations == {"a": 2, "b": 3}
-    assert out.allocations == out.base_allocations
-    assert out.saved_allocations == {"a": 4, "b": 3}
-    assert out.underallocated_budget == 7
+    with pytest.raises(ValueError, match="exceeds upper-bound"):
+        allocate_branch_factors(nodes, total_budget=12, n_min=1)
 
 
-def test_residual_budget_moves_to_high_dispersion_demand():
+def test_unified_solver_expands_high_dispersion_node():
     nodes = [
         _node("low", 6, 2, 0.01),
         _node("hot", 6, 10, 1.0),
         _node("warm", 6, 10, 0.25),
     ]
     out = allocate_branch_factors(nodes, total_budget=18, n_min=1)
-    assert out.allocations["low"] == 2
+    assert out.allocations["low"] <= 2
     assert out.allocations["hot"] > out.allocations["warm"]
     assert sum(out.allocations.values()) == 18
     assert all(
-        out.base_allocations[key] <= out.allocations[key] <= out.cap_allocations[key]
+        out.lower_bounds[key] <= out.allocations[key] <= out.upper_bounds[key]
         for key in out.allocations
     )
 
 
-def test_high_dispersion_cannot_exceed_demand_cap():
-    nodes = [_node("capped", 4, 5, 100.0), _node("other", 4, 10, 0.5)]
+def test_predicted_cap_applies_only_below_default_by_default():
+    nodes = [_node("capped", 4, 3, 100.0), _node("other", 4, 10, 0.5)]
     out = allocate_branch_factors(nodes, total_budget=8, n_min=1)
-    assert out.allocations["capped"] <= 5
-    assert out.allocations["other"] >= 3
+    assert out.allocations["capped"] <= 3
+    assert out.allocations["other"] >= 5
 
 
 def test_minimum_branch_factor_clamps_nonpositive_prediction():
-    out = allocate_branch_factors([_node("a", 6, -2, 0.0)], total_budget=6, n_min=1)
-    assert out.base_allocations["a"] == 1
-    assert out.allocations["a"] == 1
+    with pytest.raises(ValueError, match="exceeds upper-bound"):
+        allocate_branch_factors([_node("a", 6, -2, 0.0)], total_budget=6, n_min=1)
 
 
-def test_capped_largest_remainder_is_deterministic():
+def test_integer_solver_is_deterministic():
     nodes = [_node("a", 1, 5, 1.0), _node("b", 1, 5, 1.0)]
     out = allocate_branch_factors(nodes, total_budget=5, n_min=1)
     assert out.allocations == {"a": 3, "b": 2}
     assert out.allocated_budget == 5
+    assert out.solver_name == "bounded_marginal_integer"
 
 
 def test_invalid_dispersion_fails_in_strict_mode():
@@ -83,6 +80,6 @@ def test_invalid_dispersion_fails_in_strict_mode():
         allocate_branch_factors([_node("a", 1, 2, float("nan"))], total_budget=1)
 
 
-def test_budget_below_mandatory_base_fails():
-    with pytest.raises(ValueError, match="mandatory base"):
-        allocate_branch_factors([_node("a", 4, 4, 1.0)], total_budget=3)
+def test_budget_below_lower_bound_fails():
+    with pytest.raises(ValueError, match="below lower-bound"):
+        allocate_branch_factors([_node("a", 4, 4, 1.0)], total_budget=0)

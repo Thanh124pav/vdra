@@ -363,8 +363,13 @@ async def _expand_reusing_pilots(
     segment_fn,
     token_budget: Optional[Dict[str, Any]] = None,
 ) -> List[SegmentSample]:
-    shortcut = _shortcut_pilot_samples(node)
-    node["vdra_shortcut_overage"] = max(len(shortcut) - int(allocated_k), 0)
+    all_shortcuts = _shortcut_pilot_samples(node)
+    shortcut_budget = max(int(allocated_k), 0)
+    # Terminal shortcut pilots also consume final branch slots; keep a
+    # deterministic generation-order prefix so reward never influences which
+    # over-budget shortcuts survive.
+    shortcut = list(all_shortcuts[:shortcut_budget])
+    node["vdra_shortcut_overage"] = max(len(all_shortcuts) - len(shortcut), 0)
     reuse_budget = max(int(allocated_k) - len(shortcut), 0)
     retained = _retained_pilot_samples(node, reuse_budget)
     completed: List[SegmentSample] = []
@@ -699,20 +704,8 @@ async def async_build_tree_online_alloc(
                 + int(node.get("vdra_pilot_support_generated_tokens", 0) or 0)
             )
 
-        saved_k = int(node.get("vdra_saved_k", 0) or 0)
-        if saved_k and getattr(gear_gate, "use_residual_budget", False):
-            await manager.reserve_pool.add(saved_k)
-        if int(node.get("vdra_unmet_demand", 0) or 0) <= 0:
-            await _expand_parent(
-                node,
-                depth=depth,
-                allocated_branch_factor=int(node.get("vdra_base_k", default_bf)),
-                default_branch_factor=default_bf,
-            )
-            if "reward" not in node:
-                raise RuntimeError(f"VDRA direct node {node.get('gear_segment_id')} returned without reward")
-            return
-
+        # Queue every estimated node. The unified bounded integer solver decides
+        # pruning, expansion, or no-op jointly across the flush frontier.
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         pending_futures.append(future)
@@ -756,8 +749,8 @@ async def async_build_tree_online_alloc(
             node, allocated_branch_factor, _max_tokens(depth), segment_fn,
             token_budget=token_budget,
         )
-        # _expand_reusing_pilots enforces the branch budget; shortcut pilots
-        # may exceed it (vdra_shortcut_overage) and must not be dropped here.
+        # _expand_reusing_pilots enforces the final branch budget, including
+        # terminal shortcut pilots and reusable nonterminal pilots.
         children = [
             _sample_child(node, depth, idx, sample)
             for idx, sample in enumerate(samples)
@@ -791,7 +784,11 @@ async def async_build_tree_online_alloc(
         # deeper nodes that then need timeout flushes of their own.
         await _drain_final()
         while expansion_tasks:
+            expansion_tasks.difference_update(task for task in list(expansion_tasks) if task.done())
+            if not expansion_tasks:
+                break
             await asyncio.gather(*list(expansion_tasks))
+            expansion_tasks.difference_update(task for task in list(expansion_tasks) if task.done())
             await _drain_final()
     finally:
         stop_timeout_worker.set()
@@ -812,7 +809,7 @@ async def async_build_tree_online_alloc(
     backprop(tree)
 
     if getattr(gear_gate, "strict_vdra", True):
-        if manager.reserve_pool.contributed != manager.reserve_pool.consumed + manager.reserve_pool.value:
+        if manager.reserve_pool.value != 0:
             raise RuntimeError("VDRA reserve invariant failed")
         if any(queue.items for queue in manager.queues):
             raise RuntimeError("VDRA queue invariant failed: queues are not empty")
@@ -834,16 +831,16 @@ async def async_build_tree_online_alloc(
             if int(node.get("vdra_total_scored_tokens", 0) or 0) != int(node.get("vdra_likelihood_scored_prompt_tokens", 0) or 0) + int(node.get("vdra_likelihood_scored_continuation_tokens", 0) or 0):
                 raise RuntimeError("VDRA scored-token accounting invariant failed")
         totals = summarize_vdra_tree(tree)
-        if int(totals["vdra_total_redistributed_branches"]) != int(manager.reserve_pool.consumed):
+        if int(totals["vdra_total_redistributed_branches"]) != int(manager.reserve_consumed):
             raise RuntimeError("VDRA redistribution accounting invariant failed")
 
     tree["gear_queue_flush_count"] = int(manager.flush_count)
     tree["gear_queue_timeout_flush_count"] = int(manager.timeout_flush_count)
     tree["vdra_queue_capacity_flush_count"] = int(manager.capacity_flush_count)
     tree["vdra_queue_final_drain_count"] = int(manager.final_drain_count)
-    tree["gear_reserve_contributed"] = int(manager.reserve_pool.contributed)
-    tree["gear_reserve_consumed"] = int(manager.reserve_pool.consumed)
-    tree["gear_reserve_remaining"] = int(manager.reserve_pool.value)
+    tree["gear_reserve_contributed"] = int(sum(record.get("total_saved_budget", 0) for record in queue_flush_records))
+    tree["gear_reserve_consumed"] = int(manager.reserve_consumed)
+    tree["gear_reserve_remaining"] = 0
     tree["vdra_queue_flush_records"] = queue_flush_records
     tree["vdra_allocation_scope"] = "one_tree"
     tree["vdra_budget_mode"] = budget_mode

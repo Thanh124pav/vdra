@@ -158,7 +158,7 @@ class RootQueueManager:
         use_residual_budget: bool = True,
         policy_snapshot_id: str = "current",
         strict_vdra: bool = True,
-        rounding_strategy: str = "largest_remainder",
+        rounding_strategy: str = "integer_marginal",
         rounding_seed: int = 0,
         lambda_: Optional[float] = None,
     ):
@@ -219,30 +219,12 @@ class RootQueueManager:
                 item.node["vdra_predicted_k"] = int(
                     item.node.get("gear_predicted_k", item.default_branch_factor)
                 )
-        base_budget = sum(
-            min(
-                max(int(item.default_branch_factor), self.n_min),
-                max(int(item.node["vdra_predicted_k"]), self.n_min),
-            )
-            for item in items
-        )
-        total_unmet_demand = sum(
-            max(
-                max(int(item.node["vdra_predicted_k"]), self.n_min)
-                - min(
-                    max(int(item.default_branch_factor), self.n_min),
-                    max(int(item.node["vdra_predicted_k"]), self.n_min),
-                ),
-                0,
-            )
-            for item in items
-        )
-        reserve_draw = (
-            await self.reserve_pool.draw_queue_share(max_amount=total_unmet_demand)
-            if self.use_residual_budget
-            else 0
-        )
-        total_budget = base_budget + reserve_draw
+        base_budget = sum(max(int(item.default_branch_factor), self.n_min) for item in items)
+        # Unified allocation keeps the queue budget exact. Pruning and expansion
+        # are outputs of the same integer solve, so the old reserve pool is no
+        # longer an input to allocation.
+        reserve_draw = 0
+        total_budget = base_budget
         weight_key = (
             "gear_allocation_weight_override"
             if any(item.weight_key == "gear_allocation_weight_override" for item in items)
@@ -276,8 +258,7 @@ class RootQueueManager:
         self.timeout_flush_count += int(reason == "timeout")
         self.capacity_flush_count += int(reason == "capacity")
         self.final_drain_count += int(reason == "final_drain")
-        residual_used = int(sum(summary.additional_allocations.values()))
-        await self.reserve_pool.consume(residual_used)
+        residual_used = int(summary.transferred_budget)
         self.reserve_consumed += residual_used
         reserve_after = self.reserve_pool.value
         return QueueFlushResult(

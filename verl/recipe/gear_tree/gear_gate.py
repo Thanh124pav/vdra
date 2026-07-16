@@ -82,7 +82,7 @@ class GearGate:
         eps_tail_calibration_metadata: Optional[Mapping[str, Any]] = None,
         oracle_rollouts_per_node: int = 16,
         external_score_fn: Optional[Any] = None,
-        rounding_strategy: str = "largest_remainder",
+        rounding_strategy: str = "integer_marginal",
         rounding_seed: int = 0,
     ) -> None:
         self.cfg = ThresholdConfig(
@@ -133,8 +133,8 @@ class GearGate:
         self.allocation_proxy = allocation_proxy
         self.oracle_rollouts_per_node = max(int(oracle_rollouts_per_node), 2)
         self.external_score_fn = external_score_fn
-        if rounding_strategy not in {"largest_remainder", "nearest_repair", "stochastic"}:
-            raise ValueError(f"Unsupported VDRA rounding_strategy: {rounding_strategy}")
+        if rounding_strategy not in {"integer_marginal", "bounded_marginal_integer"}:
+            raise ValueError(f"Unsupported VDRA solver strategy: {rounding_strategy}")
         self.rounding_strategy = rounding_strategy
         self.rounding_seed = int(rounding_seed)
         self.eps_tail_calibration_path = eps_tail_calibration_path
@@ -498,20 +498,13 @@ class GearGate:
         )
         for node in nodes:
             predicted_k = max(int(node["gear_predicted_k"]), self.n_min)
-            base_k = min(int(default_bf), predicted_k)
-            saved_k = max(int(default_bf) - base_k, 0)
             write_node_accounting(
                 node,
                 default_k=int(default_bf),
                 predicted_k=predicted_k,
-                allocated_k=base_k,
+                allocated_k=self.n_min,
                 k_min=self.n_min,
             )
-            if saved_k and self.use_residual_budget:
-                await manager.reserve_pool.add(saved_k)
-            if node["vdra_unmet_demand"] <= 0:
-                node["vdra_additional_children_generated"] = max(base_k - int(node.get("vdra_pilot_children_reused", 0) or 0), 0)
-                continue
             manager.enqueue(
                 OnlineQueueItem(
                     node=node,

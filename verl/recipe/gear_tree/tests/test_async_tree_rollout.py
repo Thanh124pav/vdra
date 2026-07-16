@@ -263,7 +263,7 @@ def test_online_timeout_queue_flushes_before_final_drain():
     )
 
     assert tree["vdra_predicted_k"] == 2
-    assert tree["vdra_unmet_demand"] == 1
+    assert tree["vdra_unmet_demand"] == 0
     assert tree["vdra_flush_reason"] == "timeout"
     assert tree["gear_queue_timeout_flush_count"] == 1
     assert tree["vdra_queue_final_drain_count"] == 0
@@ -434,8 +434,8 @@ def test_parallel_cold_siblings_fund_hot_sibling_via_reserve():
 
 def test_all_terminal_pilots_shortcut_into_graded_leaves():
     """Both pilots hit EOS in phase 1: no TV pair exists, the build must not
-    crash (old D1 behavior) and the complete pilot answers become graded leaf
-    children counted against (and here exceeding) the branch budget."""
+    crash (old D1 behavior) and complete pilot answers become graded leaf
+    children, capped by the final allocated branch budget."""
 
     from recipe.gear_tree.tree_rollout import async_build_tree
 
@@ -489,10 +489,10 @@ def test_all_terminal_pilots_shortcut_into_graded_leaves():
     )
 
     children = tree.get("children") or []
-    assert len(children) == 2  # both complete answers kept
+    assert len(children) == 1
     assert all(child["leaf"] and "reward" in child for child in children)
-    assert tree["vdra_pilot_children_shortcut"] == 2
-    assert tree["vdra_shortcut_overage"] == 1  # budget was 1 branch
+    assert tree["vdra_pilot_children_shortcut"] == 1
+    assert tree["vdra_shortcut_overage"] == 1  # one terminal pilot exceeded the 1-branch budget
     assert tree["vdra_predicted_k"] == 2
     assert tree["vdra_dispersion_C"] == 0.0
     assert "reward" in tree

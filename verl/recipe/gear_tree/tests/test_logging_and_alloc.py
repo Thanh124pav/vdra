@@ -82,15 +82,19 @@ def test_budget_claim_follows_budget_mode():
         budget_claim_for_mode("free_lunch")
 
 
-def test_strict_calibration_error_names_the_calibration_script():
+def test_tail_mode_none_allows_strict_direct_vdra_without_artifact():
     import pytest
     from recipe.gear_tree.calibration import resolve_gear_calibration
 
+    resolved = resolve_gear_calibration({"strict_vdra": True, "tail_mode": "none", "eps_tail": 0.5})
+    assert resolved["eps_tail"] == 0.0
+    assert resolved["certified_full_horizon_bound"] is False
+
+    fixed = resolve_gear_calibration({"strict_vdra": True, "tail_mode": "fixed", "eps_tail": 0.05})
+    assert fixed["eps_tail"] == 0.05
+
     with pytest.raises(ValueError, match="calibrate_tail_divergence"):
-        resolve_gear_calibration({"strict_vdra": True})
-    # Non-strict runs keep the raw eps_tail without an artifact.
-    resolved = resolve_gear_calibration({"strict_vdra": False, "eps_tail": 0.05})
-    assert resolved["eps_tail"] == 0.05
+        resolve_gear_calibration({"strict_vdra": True, "tail_mode": "calibrated"})
 
 
 def test_demo_logger_manifest_reflects_tree_budget_mode(tmp_path: Path):

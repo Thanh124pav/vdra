@@ -43,12 +43,18 @@ EXP_NAME="${EXP_NAME:-gear_tree-${ALGO}}"
 
 VDRA_OVERRIDES=()
 if [[ "${GEAR}" == "true" ]]; then
-  : "${EPS_TAIL_CALIBRATION_PATH:?set EPS_TAIL_CALIBRATION_PATH=<artifact.json> for VDRA}"
+  TAIL_MODE="${TAIL_MODE:-none}"
   SCORER_API_BASE="${SCORER_API_BASE:-http://127.0.0.1:8000/v1}"
   VDRA_OVERRIDES+=(
-    "gear_tree.gear.eps_tail_calibration_path=${EPS_TAIL_CALIBRATION_PATH}"
+    "gear_tree.gear.tail_mode=${TAIL_MODE}"
     "gear_tree.gear.scorer_api_base=${SCORER_API_BASE}"
   )
+  if [[ "${TAIL_MODE}" == "calibrated" ]]; then
+    : "${EPS_TAIL_CALIBRATION_PATH:?set EPS_TAIL_CALIBRATION_PATH=<artifact.json> when TAIL_MODE=calibrated}"
+    VDRA_OVERRIDES+=(
+      "gear_tree.gear.eps_tail_calibration_path=${EPS_TAIL_CALIBRATION_PATH}"
+    )
+  fi
 fi
 
 python -m recipe.gear_tree.main_gear_tree \

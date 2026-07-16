@@ -301,7 +301,7 @@ try:  # keep CPU-importable when agent_loop isn't installed
             eps_tail_calibration_metadata=g.get("eps_tail_calibration_metadata"),
             oracle_rollouts_per_node=g.get("oracle_rollouts_per_node", 16),
             external_score_fn=_resolve_external_score_fn(g),
-            rounding_strategy=g.get("rounding_strategy", "largest_remainder"),
+            rounding_strategy=g.get("rounding_strategy", "integer_marginal"),
             rounding_seed=g.get("rounding_seed", 0),
         )
 

@@ -41,6 +41,8 @@ def write_node_accounting(
     dispersion_C: Optional[float] = None,
     allocated_k: Optional[int] = None,
     k_min: int = 1,
+    lower_bound: Optional[int] = None,
+    upper_bound: Optional[int] = None,
     allocation_weight: Optional[float] = None,
 ) -> MutableMapping[str, Any]:
     """Write the complete canonical pruning/allocation trace onto ``node``.
@@ -63,14 +65,24 @@ def write_node_accounting(
         else node.get("vdra_predicted_k", node.get("gear_predicted_k", node.get("predicted_k", default)))
         or 0
     )
-    cap = max(floor, predicted)
-    base = min(default, cap)
-    saved = max(default - base, 0)
-    unmet = max(cap - base, 0)
     existing_allocated = node_allocated_k(node)
-    allocated = int(allocated_k if allocated_k is not None else existing_allocated if existing_allocated is not None else base)
-    allocated = min(max(allocated, base), cap)
-    additional = max(allocated - base, 0)
+    lower = max(int(lower_bound if lower_bound is not None else floor), floor)
+    allocated_seed = int(
+        allocated_k
+        if allocated_k is not None
+        else existing_allocated
+        if existing_allocated is not None
+        else lower
+    )
+    cap = max(
+        int(upper_bound if upper_bound is not None else max(floor, predicted, allocated_seed)),
+        lower,
+    )
+    base = lower
+    allocated = min(max(allocated_seed, lower), cap)
+    saved = max(default - allocated, 0)
+    unmet = max(allocated - default, 0)
+    additional = max(allocated - default, 0)
     c_value = (
         float(dispersion_C)
         if dispersion_C is not None
@@ -84,6 +96,8 @@ def write_node_accounting(
     node["vdra_predicted_k"] = predicted
     node["vdra_cap_k"] = cap
     node["vdra_base_k"] = base
+    node["vdra_lower_bound_k"] = lower
+    node["vdra_upper_bound_k"] = cap
     node["vdra_saved_k"] = saved
     node["vdra_unmet_demand"] = unmet
     node["vdra_dispersion_C"] = c_value
@@ -115,11 +129,11 @@ def validate_node_accounting(node: Mapping[str, Any], *, k_min: int = 1) -> None
     reserve_received = int(node["vdra_reserve_received"])
     floor = max(int(k_min), 0)
 
-    assert cap == max(floor, predicted)
-    assert base == min(default, cap)
-    assert saved == default - base
-    assert unmet == max(cap - base, 0)
-    assert additional == allocated - base
+    assert base >= floor
+    assert cap >= base
+    assert saved == max(default - allocated, 0)
+    assert unmet == max(allocated - default, 0)
+    assert additional == max(allocated - default, 0)
     assert reserve_contribution == saved
     assert reserve_received == additional
     assert base <= allocated <= cap

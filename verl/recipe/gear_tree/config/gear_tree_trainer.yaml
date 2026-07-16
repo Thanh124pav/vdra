@@ -102,15 +102,15 @@ gear_tree:
     enable_share: false
 
     # --- VDRA scoring / bound knobs ----------------------------------------
-    # Tail-divergence correction (Summary.md §7): D_L <= D_m + (1-D_m)*eps_tail.
-    # strict_vdra: true REQUIRES eps_tail_calibration_path (produced by
-    # scripts/calibrate_tail_divergence.py, RQ3); the calibrated value then
-    # overrides eps_tail. The raw eps_tail below is used ONLY when
-    # strict_vdra: false.
+    # tail_mode: none uses short-horizon divergence as a relative allocation
+    # proxy and intentionally permits strict_vdra with eps_tail=0 and no
+    # calibration artifact. Use calibrated only when a tail-calibration file is
+    # available; fixed is an explicit ablation-style numeric correction.
+    tail_mode: none
     eps_tail: 0.0
     eps_tail_calibration_path: null
 
-    # Optional depth-indexed override, e.g. {0: 0.3, 2: 0.15}. null => global.
+    # Optional depth-indexed override for calibrated/fixed modes. null => global.
     eps_tail_by_depth: null
 
     # 'linear' (|dV| <= r_max * TV, exact for terminal bounded reward) |
@@ -135,8 +135,8 @@ gear_tree:
     queue_timeout_seconds: 1.0
 
     # Integer rounding of the capped continuous allocation (ablation #10):
-    # largest_remainder | nearest_repair | stochastic.
-    rounding_strategy: largest_remainder
+    # Default exact bounded marginal integer solver.
+    rounding_strategy: integer_marginal
     rounding_seed: 0
 
     # Share unused floor budget across queues via the reserve pool.

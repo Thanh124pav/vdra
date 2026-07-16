@@ -1,22 +1,9 @@
-"""``RayGearTreeTrainer`` — verl RL loop driven by native segment-tree rollout.
+"""``RayGearTreeTrainer`` - VERL loop driven by native segment-tree rollout.
 
-Subclasses ``RayPPOTrainer`` and overrides ``fit()`` so generation is the GEAR/
-SPO tree rollout (variable number of edge rows with **precomputed advantages**)
-instead of verl's fixed-size ``generate_sequences`` + ``compute_advantage`` flow.
-Everything else (worker init, actor update, checkpoint, validation) reuses the
-base class unchanged.
-
-Per step:
-  prompts -> ``actor_rollout_wg.build_trees`` (tree rollout + SPO/GEAR advantages)
-          -> ``actor_rollout_wg.compute_log_prob`` (old log-probs)
-          -> ``actor_rollout_wg.update_actor`` (uses the ``treetune_ppo`` loss).
-
-Advantage is produced in generation (``tree_advantage``), so verl's
-``compute_advantage`` is intentionally bypassed. Per-step timing is written to
-``training_timing.jsonl`` (treetune-style); tree stats + full-tree examples are
-logged by the rollout worker to ``gear_demos/``.
-
-Requires a GPU + Ray cluster; the tree/advantage/loss core is CPU-tested.
+Generation builds tree edges with precomputed advantages and generation-time
+behavior log-probabilities. A trainer-owned replay buffer applies the same edge
+sampling protocol across SPO-tree and VDRA tree-family methods before forwarding
+sampled edges to the actor update.
 """
 
 from __future__ import annotations
@@ -24,10 +11,14 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
+from typing import Any, Dict, List
 
 from verl import DataProto
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.metric_utils import reduce_metrics
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
+from recipe.gear_tree.replay_buffer import GearTreeReplayBuffer
 
 
 class RayGearTreeTrainer(RayPPOTrainer):
@@ -35,37 +26,129 @@ class RayGearTreeTrainer(RayPPOTrainer):
         """Resolve the top-level ``gear_tree`` block to a plain dict + demos_dir."""
         from omegaconf import OmegaConf
 
-        gt = OmegaConf.to_container(self.config.get("gear_tree", {}), resolve=True) or {}
+        raw = self.config.get("gear_tree", {})
+        gt = OmegaConf.to_container(raw, resolve=True) if OmegaConf.is_config(raw) else dict(raw or {})
         if not gt.get("demos_dir"):
             gt["demos_dir"] = os.path.join(self.config.trainer.default_local_dir, "gear_demos")
         return gt
 
-    def _generate_edge_batch(self, gen_batch: DataProto) -> DataProto:
-        """Run the tree rollout and return a flat edge DataProto.
-
-        Two backends:
-          * ``async`` (verl >= 0.7 + vLLM >= 0.20): standard ``generate_sequences``
-            routes to the ``gear_tree_agent`` agent loop, which returns per-prompt
-            edges in ``non_tensor_batch['gear_tree_edges']``; we flatten them.
-          * ``spmd`` (verl 0.6): the custom ``build_trees`` worker method.
-        Advantages are precomputed in either case (verl ``compute_advantage`` bypassed).
-        """
+    def _replay_config(self) -> Dict[str, Any]:
         gt = self._gear_tree_config()
-        gen_batch.meta_info["gear_tree_config"] = gt
-        backend = gt.get("rollout_backend", "async")
-        if backend == "async":
-            from recipe.gear_tree.async_tree_rollout import collect_tree_edges
-            from recipe.gear_tree.tree_data import edges_to_dataproto
+        return {
+            "enabled": True,
+            "target_edges_per_update": 512,
+            "max_edges_per_question": 32,
+            "max_edge_age": 8,
+            "underfill_policy": "use_available",
+            "sampling_seed": 0,
+            "checkpoint": True,
+            **dict(gt.get("replay_buffer") or {}),
+        }
 
-            rollout_out = self.actor_rollout_wg.generate_sequences(gen_batch)
-            edges = collect_tree_edges(rollout_out)
-            return edges_to_dataproto(
-                edges,
-                self.tokenizer,
-                max_prompt_length=self.config.data.max_prompt_length,
-                max_response_length=self.config.data.max_response_length,
+    def _ensure_replay_buffer(self) -> GearTreeReplayBuffer:
+        replay_cfg = self._replay_config()
+        if not hasattr(self, "replay_buffer"):
+            self.replay_buffer = GearTreeReplayBuffer(
+                target_edges_per_update=replay_cfg["target_edges_per_update"],
+                max_edges_per_question=replay_cfg["max_edges_per_question"],
+                max_edge_age=replay_cfg["max_edge_age"],
+                underfill_policy=replay_cfg.get("underfill_policy", "use_available"),
+                sampling_seed=replay_cfg.get("sampling_seed", 0),
             )
-        return self.actor_rollout_wg.build_trees(gen_batch)
+        return self.replay_buffer
+
+    def _current_policy_snapshot_id(self) -> str:
+        return f"global_step:{int(self.global_steps)}"
+
+    def _validate_replay_startup(self) -> None:
+        replay_cfg = self._replay_config()
+        target = int(replay_cfg["target_edges_per_update"])
+        ppo_mini = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
+        if target % ppo_mini != 0:
+            raise ValueError(
+                "gear_tree.replay_buffer.target_edges_per_update must be divisible by "
+                "actor_rollout_ref.actor.ppo_mini_batch_size"
+            )
+
+    def _generate_tree_edges(self, gen_batch: DataProto) -> List[Dict[str, Any]]:
+        """Run tree rollout and return raw replayable edge records."""
+        gt = self._gear_tree_config()
+        snapshot_id = self._current_policy_snapshot_id()
+        gen_batch.meta_info["gear_tree_config"] = gt
+        gen_batch.meta_info["global_steps"] = self.global_steps
+        gen_batch.meta_info["policy_snapshot_id"] = snapshot_id
+        gen_batch.meta_info["current_rollout_snapshot_id"] = snapshot_id
+        backend = gt.get("rollout_backend", "async")
+        if backend != "async":
+            raise NotImplementedError(
+                "Replay-buffered RayGearTreeTrainer currently requires rollout_backend='async' "
+                "so raw generation-time log-probability edges are available."
+            )
+
+        from recipe.gear_tree.async_tree_rollout import collect_tree_edges
+
+        rollout_out = self.actor_rollout_wg.generate_sequences(gen_batch)
+        edges = collect_tree_edges(rollout_out)
+        return self._normalize_generated_edges(edges, snapshot_id=snapshot_id)
+
+    def _normalize_generated_edges(
+        self, edges: List[Dict[str, Any]], *, snapshot_id: str
+    ) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for idx, edge in enumerate(edges):
+            record = dict(edge)
+            record.setdefault("edge_id", f"{snapshot_id}:{idx}:{uuid.uuid4().hex}")
+            record.setdefault("policy_snapshot_id", snapshot_id)
+            if record["policy_snapshot_id"] != snapshot_id:
+                raise ValueError("Generated edge policy_snapshot_id mismatches rollout snapshot")
+            response = list(record.get("response_token_ids") or [])
+            log_probs = record.get("actor_shifted_log_probs")
+            if log_probs is None:
+                raise ValueError("Generated edge is missing generation-time actor_shifted_log_probs")
+            if len(log_probs) != len(response):
+                raise ValueError("Generated edge log-probs do not align with response tokens")
+            record.setdefault("depth", int(record.get("depth", 0) or 0))
+            record.setdefault("leaf", bool(record.get("leaf", False)))
+            record.setdefault("pruned", bool(record.get("pruned", False)))
+            record.setdefault("tree_update_mode", record.get("tree_update_mode", "spo"))
+            normalized.append(record)
+        return normalized
+
+    def _edges_to_update_batch(self, sampled_edges: List[Dict[str, Any]], metrics: Dict[str, Any]) -> DataProto:
+        from recipe.gear_tree.tree_data import edges_to_dataproto
+
+        edge_batch = edges_to_dataproto(
+            sampled_edges,
+            self.tokenizer,
+            max_prompt_length=self.config.data.max_prompt_length,
+            max_response_length=self.config.data.max_response_length,
+            include_old_log_probs=True,
+        )
+        if self.config.trainer.get("balance_batch", False):
+            self._balance_batch(edge_batch, metrics=metrics)
+        edge_batch.meta_info["global_token_num"] = edge_batch.batch["attention_mask"].sum(dim=-1).tolist()
+        edge_batch.meta_info["multi_turn"] = False
+        if "old_log_probs" not in edge_batch.batch:
+            raise AssertionError("edge_batch is missing stored old_log_probs")
+        if edge_batch.batch["old_log_probs"].shape != edge_batch.batch["responses"].shape:
+            raise AssertionError("old_log_probs shape must match responses shape")
+        return edge_batch
+
+    def _generate_edge_batch(self, gen_batch: DataProto) -> DataProto:
+        """Compatibility helper for callers that still expect a DataProto."""
+        metrics: Dict[str, Any] = {}
+        return self._edges_to_update_batch(self._generate_tree_edges(gen_batch), metrics)
+
+    def _maybe_save_replay_buffer(self) -> Dict[str, Any]:
+        replay_cfg = self._replay_config()
+        if not replay_cfg.get("checkpoint", True) or not hasattr(self, "replay_buffer"):
+            return {"buffer/checkpoint_saved": 0.0}
+        ckpt_dir = os.path.join(
+            self.config.trainer.default_local_dir,
+            f"global_step_{int(self.global_steps)}",
+        )
+        self.replay_buffer.save(ckpt_dir)
+        return {"buffer/checkpoint_saved": 1.0}
 
     def fit(self):
         from omegaconf import OmegaConf
@@ -80,8 +163,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
 
         self.global_steps = 0
         self._load_checkpoint()
+        self._validate_replay_startup()
+        replay_buffer = self._ensure_replay_buffer()
 
-        # Offline per-iteration timing log (matches treetune training_timing.jsonl).
         os.makedirs(self.config.trainer.default_local_dir, exist_ok=True)
         timing_path = os.path.join(self.config.trainer.default_local_dir, "training_timing.jsonl")
         loop_start = time.time()
@@ -93,33 +177,45 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 logger.log(data=val_metrics, step=self.global_steps)
 
         self.global_steps += 1
-        total_epochs = self.config.trainer.total_epochs
         test_freq = self.config.trainer.get("test_freq", -1)
         save_freq = self.config.trainer.get("save_freq", -1)
 
-        for _epoch in range(total_epochs):
+        while self.global_steps <= self.total_training_steps:
             for batch_dict in self.train_dataloader:
-                metrics = {}
+                if self.global_steps > self.total_training_steps:
+                    break
+                metrics: Dict[str, Any] = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 gen_batch = self._get_gen_batch(batch)
-                gen_batch.meta_info["global_steps"] = self.global_steps
 
-                # --- native segment-tree rollout (advantages precomputed) ----
                 t0 = time.time()
-                edge_batch = self._generate_edge_batch(gen_batch)
+                new_edges = self._generate_tree_edges(gen_batch)
                 t_gen = time.time() - t0
+                replay_buffer.add(
+                    new_edges,
+                    generation_step=self.global_steps,
+                    policy_snapshot_id=self._current_policy_snapshot_id(),
+                )
+                sampled_edges, sample_stats = replay_buffer.sample_for_update(
+                    current_step=self.global_steps
+                )
+                metrics.update({k: v for k, v in sample_stats.items() if k != "removed_edge_ids"})
+                metrics["buffer/new_edges"] = len(new_edges)
+                if not sampled_edges:
+                    logger.log(data=metrics, step=self.global_steps)
+                    self.global_steps += 1
+                    continue
 
-                # --- old log-probs recomputed with the actor -----------------
-                old_log_prob = self.actor_rollout_wg.compute_log_prob(edge_batch)
-                edge_batch = edge_batch.union(old_log_prob)
+                edge_batch = self._edges_to_update_batch(sampled_edges, metrics)
 
-                # --- actor PPO update (treetune_ppo loss) --------------------
                 t0 = time.time()
                 if self.config.trainer.critic_warmup <= self.global_steps:
                     actor_output = self.actor_rollout_wg.update_actor(edge_batch)
                     metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
                 t_update = time.time() - t0
 
+                response_tokens = edge_batch.batch["response_mask"].sum().item()
+                ages = [self.global_steps - int(edge.get("generation_step", self.global_steps)) for edge in sampled_edges]
                 cum_train += t_gen + t_update
                 timing = {
                     "step": self.global_steps,
@@ -129,20 +225,34 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     "timing/cumulative_train_seconds": cum_train,
                     "timing/wall_seconds": time.time() - loop_start,
                     "train/num_edges": float(len(edge_batch)),
+                    "train/num_response_tokens": float(response_tokens),
+                    "train/unique_questions": float(len({edge.get("question_id") for edge in sampled_edges})),
+                    "train/mean_edge_age": float(sum(ages) / len(ages) if ages else 0.0),
+                    "train/max_edge_age": float(max(ages) if ages else 0),
                 }
-                with open(timing_path, "a") as fh:
+                with open(timing_path, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps(timing) + "\n")
                 metrics.update(timing)
                 logger.log(data=metrics, step=self.global_steps)
 
-                if test_freq > 0 and self.global_steps % test_freq == 0 and self.val_reward_fn is not None:
+                is_last_step = self.global_steps >= self.total_training_steps
+                if (
+                    test_freq > 0
+                    and (self.global_steps % test_freq == 0 or is_last_step)
+                    and self.val_reward_fn is not None
+                ):
                     val_metrics = self._validate()
                     if val_metrics:
                         logger.log(data=val_metrics, step=self.global_steps)
 
-                if save_freq > 0 and self.global_steps % save_freq == 0:
+                if save_freq > 0 and (self.global_steps % save_freq == 0 or is_last_step):
                     self._save_checkpoint()
+                    replay_metrics = self._maybe_save_replay_buffer()
+                    logger.log(data=replay_metrics, step=self.global_steps)
 
+                if is_last_step:
+                    return
                 self.global_steps += 1
 
         self._save_checkpoint()
+        self._maybe_save_replay_buffer()

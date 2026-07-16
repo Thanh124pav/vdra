@@ -32,7 +32,10 @@ def test_treetune_and_verl_use_the_same_allocator():
     nodes = [_node("a", 6, 2, 0.1), _node("b", 6, 10, 1.0)]
     left = treetune_alloc.allocate_branch_factors(nodes, total_budget=12)
     right = verl_alloc.allocate_branch_factors(nodes, total_budget=12)
-    assert left == right
+    assert left.allocations == right.allocations
+    assert left.lower_bounds == right.lower_bounds
+    assert left.upper_bounds == right.upper_bounds
+    assert left.solver_name == right.solver_name
 
 
 def test_queue_flushes_on_capacity_and_preserves_snapshot():
@@ -125,10 +128,11 @@ def test_canonical_vdra_field_is_visible_to_logging_helpers():
 
 def test_pruning_trace_identities():
     node = _node("a", 6, 3, 0.5)
-    allocate_branch_factors([node], total_budget=6, n_min=1)
+    allocate_branch_factors([node], total_budget=3, n_min=1)
     validate_node_accounting(node, k_min=1)
     assert node["vdra_cap_k"] == 3
-    assert node["vdra_base_k"] == 3
+    assert node["vdra_base_k"] == 1
+    assert node["vdra_lower_bound_k"] == 1
     assert node["vdra_saved_k"] == 3
     assert node["vdra_unmet_demand"] == 0
     assert node["vdra_additional_k"] == 0
@@ -147,22 +151,16 @@ def test_redistribution_trace_transfers_saved_budget_to_unmet_demand():
     assert sum(n["vdra_additional_k"] for n in nodes) == 4
 
 
-def test_capped_allocation_cannot_exceed_unmet_demand():
+def test_infeasible_upper_budget_fails_without_silent_drop():
     node = _node("hot", 6, 7, 1e9)
-    allocate_branch_factors([node], total_budget=100, n_min=1)
-    validate_node_accounting(node, k_min=1)
-    assert node["vdra_unmet_demand"] == 1
-    assert node["vdra_additional_k"] == 1
-    assert node["vdra_allocated_k"] == 7
+    with pytest.raises(ValueError, match="exceeds upper-bound"):
+        allocate_branch_factors([node], total_budget=100, n_min=1)
 
 
 def test_minimum_branch_factor_caps_zero_prediction():
     node = _node("cold", 6, 0, 0.0)
-    allocate_branch_factors([node], total_budget=6, n_min=1)
-    validate_node_accounting(node, k_min=1)
-    assert node["vdra_cap_k"] == 1
-    assert node["vdra_base_k"] == 1
-    assert node["vdra_allocated_k"] >= 1
+    with pytest.raises(ValueError, match="exceeds upper-bound"):
+        allocate_branch_factors([node], total_budget=6, n_min=1)
 
 
 def test_queue_zero_timeout_does_not_emit_timeout_flush():
@@ -341,7 +339,7 @@ def test_persist_vdra_artifacts_writes_canonical_files(tmp_path):
 
 
 
-def test_reserve_draw_is_capped_by_total_unmet_demand():
+def test_unified_queue_allocation_does_not_draw_reserve_pool():
     async def run():
         pool = SharedReservePool(queue_count=1)
         await pool.add(10)
@@ -357,11 +355,11 @@ def test_reserve_draw_is_capped_by_total_unmet_demand():
         return pool, await manager.flush_ready(now=0.0)
 
     pool, flushed = asyncio.run(run())
-    assert flushed[0].reserve_draw == 3
-    assert flushed[0].reserve_consumed == 3
+    assert flushed[0].reserve_draw == 0
+    assert flushed[0].reserve_consumed == 0
     assert pool.contributed == 10
-    assert pool.consumed == 3
-    assert pool.value == 7
+    assert pool.consumed == 0
+    assert pool.value == 10
 
 
 def test_strict_calibration_requires_metadata_and_matching_k0(tmp_path):
