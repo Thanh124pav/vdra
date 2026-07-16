@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -83,6 +84,13 @@ class TVEstimateResult:
     predicted_k: int = 0
     unique_candidates: List[Node] = field(default_factory=list)
     duplicate_pairs: List[PairKey] = field(default_factory=list)
+    # Pilots that terminated (EOS) inside the first phase. They are complete
+    # trajectories: the caller must attach them as graded leaf children counted
+    # against the node's branch budget instead of scoring TV on them.
+    shortcut_candidates: List[Node] = field(default_factory=list)
+    # Second-phase support blocks. Exposed so callers can charge their
+    # generation cost (tokens/requests) to the pilot overhead accounting.
+    support_nodes: List[Node] = field(default_factory=list)
 
 
 class ConditionalTVEstimator:
@@ -187,6 +195,12 @@ class ConditionalTVEstimator:
         prefixes as candidate rollouts, scores every second-phase continuation
         under every first prefix, then clusters first prefixes whose pairwise TV
         is below ``duplicate_tv_threshold``.
+
+        Pilots that terminate (EOS) inside the first phase are complete
+        trajectories: they are excluded from the TV matrix entirely and
+        returned as ``shortcut_candidates`` so the caller can attach them as
+        graded leaf children (counted against the branch budget). Pair indices
+        in ``pair_tvs`` therefore refer to the *continuable* pilot list.
         """
 
         first_nodes, support_nodes, support_origins = (
@@ -204,12 +218,24 @@ class ConditionalTVEstimator:
                 unique_candidates=[],
             )
 
+        shortcut_nodes = [
+            node for node in first_nodes if node.get("finish_reason") != "length"
+        ]
+        continuable_pairs = [
+            (idx, node)
+            for idx, node in enumerate(first_nodes)
+            if node.get("finish_reason") == "length"
+        ]
+        continuable_nodes = [node for _, node in continuable_pairs]
+        local_index = {orig: local for local, (orig, _) in enumerate(continuable_pairs)}
+        local_origins = [local_index[origin] for origin in support_origins]
+
         samples = [
             TVSample(first=first, second=second)
-            for first in first_nodes
+            for first in continuable_nodes
             for second in support_nodes
         ]
-        if len(first_nodes) < 2 or not support_nodes:
+        if len(continuable_nodes) < 2 or not support_nodes:
             return TVEstimateResult(
                 samples=samples,
                 logp_matrix=[],
@@ -217,26 +243,28 @@ class ConditionalTVEstimator:
                 pair_tvs={},
                 dispersion_C=0.0,
                 candidates=first_nodes,
-                predicted_k=len(first_nodes),
-                unique_candidates=first_nodes,
+                predicted_k=len(shortcut_nodes) + len(continuable_nodes),
+                unique_candidates=continuable_nodes,
+                shortcut_candidates=shortcut_nodes,
+                support_nodes=support_nodes,
             )
 
-        prefixes = [node.get("full_text", "") for node in first_nodes]
+        prefixes = [node.get("full_text", "") for node in continuable_nodes]
         support = [node.get("text", "") for node in support_nodes]
         logp_matrix = await self._score_matrix(prefixes, support)
         prob_matrix = [self._support_probabilities(row) for row in logp_matrix]
         if self.tv_estimator == "tanh":
-            pair_tvs = self._pair_tvs_tanh(logp_matrix, support_origins)
+            pair_tvs = self._pair_tvs_tanh(logp_matrix, local_origins)
         else:
             pair_tvs = self._pair_tvs(prob_matrix)
         duplicate_pairs = [
             pair for pair, tv in pair_tvs.items() if tv < float(duplicate_tv_threshold)
         ]
         unique_indices = self._unique_prefix_indices(
-            first_nodes, pair_tvs, duplicate_tv_threshold
+            continuable_nodes, pair_tvs, duplicate_tv_threshold
         )
-        unique_candidates = [first_nodes[idx] for idx in unique_indices]
-        variance = self._reward_variance(pair_tvs, len(first_nodes))
+        unique_candidates = [continuable_nodes[idx] for idx in unique_indices]
+        variance = self._reward_variance(pair_tvs, len(continuable_nodes))
         return TVEstimateResult(
             samples=samples,
             logp_matrix=logp_matrix,
@@ -244,9 +272,11 @@ class ConditionalTVEstimator:
             pair_tvs=pair_tvs,
             dispersion_C=variance,
             candidates=first_nodes,
-            predicted_k=len(unique_candidates),
+            predicted_k=len(shortcut_nodes) + len(unique_candidates),
             unique_candidates=unique_candidates,
             duplicate_pairs=duplicate_pairs,
+            shortcut_candidates=shortcut_nodes,
+            support_nodes=support_nodes,
         )
 
     async def estimate_from_samples(self, samples: Sequence[TVSample]) -> TVEstimateResult:
@@ -398,34 +428,30 @@ class ConditionalTVEstimator:
         pair_tvs: Mapping[PairKey, float],
         duplicate_tv_threshold: float,
     ) -> List[int]:
-        parent = list(range(len(first_nodes)))
+        """Prune duplicates by duplicate-degree, not by generation score.
 
-        def find(idx: int) -> int:
-            while parent[idx] != idx:
-                parent[idx] = parent[parent[idx]]
-                idx = parent[idx]
-            return idx
+        Two prefixes with pairwise TV below ``duplicate_tv_threshold`` are
+        duplicates. We repeatedly prune the prefix with the most duplicate
+        partners (ties broken toward the larger index so earlier pilots
+        survive) until no duplicate pair remains. Survivor selection carries
+        no likelihood bias, so downstream reuse can sample uniformly.
+        """
 
-        def union(a: int, b: int) -> None:
-            ra, rb = find(a), find(b)
-            if ra == rb:
-                return
-            if _candidate_score(first_nodes[rb]) > _candidate_score(first_nodes[ra]):
-                parent[ra] = rb
-            else:
-                parent[rb] = ra
-
+        n = len(first_nodes)
+        adjacency: Dict[int, set] = {idx: set() for idx in range(n)}
         for (i, j), tv in pair_tvs.items():
-            if tv < float(duplicate_tv_threshold):
-                union(i, j)
+            if i != j and tv < float(duplicate_tv_threshold):
+                adjacency[i].add(j)
+                adjacency[j].add(i)
 
-        best_by_root: Dict[int, int] = {}
-        for idx in range(len(first_nodes)):
-            root = find(idx)
-            best = best_by_root.get(root)
-            if best is None or _candidate_score(first_nodes[idx]) > _candidate_score(first_nodes[best]):
-                best_by_root[root] = idx
-        return sorted(best_by_root.values())
+        alive = set(range(n))
+        while alive:
+            degree = {idx: len(adjacency[idx] & alive) for idx in alive}
+            worst = max(alive, key=lambda idx: (degree[idx], idx))
+            if degree[worst] == 0:
+                break
+            alive.remove(worst)
+        return sorted(alive)
 
     def _hierarchical_first_count(self) -> int:
         return max(2, int(math.ceil(math.sqrt(self.total_support_samples))))
@@ -586,6 +612,23 @@ class ConditionalTVEstimator:
                     )
                 pair_tvs[(i, j)] = tv
         return pair_tvs
+
+
+def select_reuse_candidates(
+    candidates: Sequence[Node], count: int, *, seed: Any
+) -> List[Node]:
+    """Uniformly sample ``count`` reuse pilots from the post-pruning survivors.
+
+    Reuse selection must not prefer high-likelihood pilots (that would bias the
+    child sample the node value is estimated from), so the only allowed
+    selection rule is a seeded uniform draw over the surviving candidates.
+    """
+
+    pool = list(candidates)
+    count = max(int(count), 0)
+    if count >= len(pool):
+        return pool
+    return random.Random(seed).sample(pool, count)
 
 
 def _candidate_score(node: Mapping[str, Any]) -> float:

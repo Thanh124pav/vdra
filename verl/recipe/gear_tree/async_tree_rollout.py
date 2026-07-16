@@ -155,6 +155,7 @@ async def build_tree_edges_async(
         tree_shape=tree_shape, M=M,
         segment_fn=segment_generator.segment_fn, grade_fn=grade_fn, gear_gate=gear_gate,
         gear_node_expander=gear_node_expander,
+        free_max_tokens=int(getattr(segment_generator, "free_max_tokens", 1024)),
     )
 
     if vineppo_K > 0:
@@ -275,10 +276,12 @@ try:  # keep CPU-importable when agent_loop isn't installed
 
         g = resolve_gear_calibration(dict(gt["gear"]))
         scorer = _build_scorer(g, tokenizer)
+        # Defaults here must match the GearGate signature so a missing config
+        # key behaves identically no matter which entry point built the gate.
         return GearGate(
             epsilon=g.get("epsilon", 0.02), r_max=g.get("r_max", 1.0), gamma=g.get("gamma", 0.9),
             alpha=g.get("alpha", 0.05), k_algorithm=g.get("k_algorithm", "budget_allocation"),
-            n_min=g.get("n_min", 1), pilot_branch_factor=g.get("pilot_branch_factor", None), likelihood_samples_per_distribution=g.get("likelihood_samples_per_distribution", 2), root_allocation=g.get("root_allocation", True),
+            n_min=g.get("n_min", 1), pilot_branch_factor=g.get("pilot_branch_factor", None), likelihood_samples_per_distribution=g.get("likelihood_samples_per_distribution", 2), root_allocation=g.get("root_allocation", False),
             skip_near_leaf_expand=g.get("skip_near_leaf_expand", True),
             max_depth=len(gt.get("tree_shape", [])) or None, enable_share=g.get("enable_share", False),
             scorer=scorer,
@@ -286,13 +289,32 @@ try:  # keep CPU-importable when agent_loop isn't installed
             eps_tail_by_depth=g.get("eps_tail_by_depth", None),
             bound_form=g.get("bound_form", "linear"),
             tv_estimator=g.get("tv_estimator", "tanh"),
-            tv_first_phase_tokens=g.get("tv_first_phase_tokens", 120),
+            tv_first_phase_tokens=g.get("tv_first_phase_tokens", 60),
             tv_second_phase_tokens=g.get("tv_second_phase_tokens", 60),
             queue_count=g.get("queue_count", 4), queue_capacity=g.get("queue_capacity", 8),
             queue_timeout_seconds=g.get("queue_timeout_seconds", 1.0),
             use_residual_budget=g.get("use_residual_budget", True), strict_vdra=g.get("strict_vdra", True), invalid_support_policy=g.get("invalid_support_policy", "error"), budget_mode=g.get("budget_mode", "fixed_main"),
+            allocation_proxy=g.get("allocation_proxy", "vdra"),
             allocation_runtime=g.get("allocation_runtime", "online_timeout"),
+            artifact_dir=g.get("artifact_dir"),
+            eps_tail_calibration_path=g.get("eps_tail_source"),
+            eps_tail_calibration_metadata=g.get("eps_tail_calibration_metadata"),
+            oracle_rollouts_per_node=g.get("oracle_rollouts_per_node", 16),
+            external_score_fn=_resolve_external_score_fn(g),
+            rounding_strategy=g.get("rounding_strategy", "largest_remainder"),
+            rounding_seed=g.get("rounding_seed", 0),
         )
+
+    def _resolve_external_score_fn(g: dict):
+        """Import ``module:attr`` (default attr ``score_node``) if configured."""
+        spec = g.get("external_score_module")
+        if not spec:
+            return None
+        import importlib
+
+        module_name, _, attr = str(spec).partition(":")
+        module = importlib.import_module(module_name)
+        return getattr(module, attr or "score_node")
 
     def _build_scorer(g: dict, tokenizer: Any):
         """Build the log-prob scorer for share / budget-allocation paths.

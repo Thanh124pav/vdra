@@ -46,6 +46,8 @@
       gear_invalid_support_policy: $.gear.invalid_support_policy,
       gear_budget_mode: $.gear.budget_mode,
       gear_allocation_proxy: $.gear.allocation_proxy,
+      gear_rounding_strategy: $.gear.rounding_strategy,
+      gear_rounding_seed: $.gear.rounding_seed,
     },
 
     gear_full_tree_demo_every_n_trees: $.gear.full_tree_demo_every_n_trees,

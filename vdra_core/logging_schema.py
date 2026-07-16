@@ -144,10 +144,15 @@ def summarize_vdra_tree(tree: Mapping[str, Any]) -> Dict[str, float]:
         "vdra_main_expansion_built_branches": 0.0,
         "vdra_pilot_children_generated": 0.0,
         "vdra_pilot_children_reused": 0.0,
+        "vdra_pilot_children_shortcut": 0.0,
+        "vdra_shortcut_overage": 0.0,
         "vdra_pilot_children_discarded": 0.0,
         "vdra_additional_children_generated": 0.0,
         "vdra_pilot_generated_tokens": 0.0,
+        "vdra_pilot_support_children_generated": 0.0,
+        "vdra_pilot_support_generated_tokens": 0.0,
         "vdra_main_expansion_generated_tokens": 0.0,
+        "vdra_proxy_rollout_tokens": 0.0,
         "vdra_generation_request_count": 0.0,
         "vdra_scoring_request_count": 0.0,
         "vdra_scoring_prefill_tokens": 0.0,
@@ -165,10 +170,15 @@ def summarize_vdra_tree(tree: Mapping[str, Any]) -> Dict[str, float]:
         totals["vdra_reserve_consumed"] += float(node.get("vdra_reserve_received", 0) or 0)
         totals["vdra_pilot_children_generated"] += float(node.get("vdra_pilot_children_generated", 0) or 0)
         totals["vdra_pilot_children_reused"] += float(node.get("vdra_pilot_children_reused", 0) or 0)
+        totals["vdra_pilot_children_shortcut"] += float(node.get("vdra_pilot_children_shortcut", 0) or 0)
+        totals["vdra_shortcut_overage"] += float(node.get("vdra_shortcut_overage", 0) or 0)
         totals["vdra_pilot_children_discarded"] += float(node.get("vdra_pilot_children_discarded", 0) or 0)
         totals["vdra_additional_children_generated"] += float(node.get("vdra_additional_children_generated", 0) or 0)
         totals["vdra_pilot_generated_tokens"] += float(node.get("vdra_pilot_generated_tokens", 0) or 0)
+        totals["vdra_pilot_support_children_generated"] += float(node.get("vdra_pilot_support_children_generated", 0) or 0)
+        totals["vdra_pilot_support_generated_tokens"] += float(node.get("vdra_pilot_support_generated_tokens", 0) or 0)
         totals["vdra_main_expansion_generated_tokens"] += float(node.get("vdra_main_expansion_generated_tokens", 0) or 0)
+        totals["vdra_proxy_rollout_tokens"] += float(node.get("vdra_proxy_rollout_tokens", 0) or 0)
         totals["vdra_generation_request_count"] += float(node.get("vdra_generation_request_count", 0) or 0)
         totals["vdra_scoring_request_count"] += float(node.get("vdra_likelihood_scoring_requests", 0) or 0)
         totals["vdra_scoring_prefill_tokens"] += float(node.get("vdra_likelihood_scored_prompt_tokens", 0) or 0)
@@ -179,14 +189,18 @@ def summarize_vdra_tree(tree: Mapping[str, Any]) -> Dict[str, float]:
     )
     totals["vdra_reserve_remaining"] = totals["vdra_total_unallocated_reserve"]
     totals["vdra_total_generated_tokens"] = (
-        totals["vdra_pilot_generated_tokens"] + totals["vdra_main_expansion_generated_tokens"]
+        totals["vdra_pilot_generated_tokens"]
+        + totals["vdra_pilot_support_generated_tokens"]
+        + totals["vdra_main_expansion_generated_tokens"]
     )
     totals["vdra_total_scored_tokens"] = (
         totals["vdra_scoring_prefill_tokens"] + totals["vdra_scoring_continuation_tokens"]
     )
     totals["vdra_generation_decode_tokens"] = totals["vdra_total_generated_tokens"]
     totals["vdra_token_equivalent_compute_proxy"] = (
-        totals["vdra_generation_decode_tokens"] + totals["vdra_total_scored_tokens"]
+        totals["vdra_generation_decode_tokens"]
+        + totals["vdra_total_scored_tokens"]
+        + totals["vdra_proxy_rollout_tokens"]
     )
     # Back-compat alias with explicit units; not a forward-call count.
     totals["vdra_total_forward_pass_cost"] = totals["vdra_token_equivalent_compute_proxy"]
@@ -215,15 +229,44 @@ NODE_RECORD_FIELDS = (
     "reserve_received",
     "pilot_children_generated",
     "pilot_children_reused",
+    "pilot_children_shortcut",
+    "shortcut_overage",
     "pilot_children_discarded",
     "additional_children_generated",
     "pilot_generated_tokens",
+    "pilot_support_generated_tokens",
     "main_expansion_generated_tokens",
+    "proxy_rollout_tokens",
     "scored_tokens",
     "queue_id",
     "queue_wait_seconds",
     "flush_reason",
 )
+
+
+BUDGET_CLAIMS = {
+    "fixed_main": (
+        "fixed main expansion budget; pilot and scoring overhead reported separately"
+    ),
+    "fixed_total_generated": (
+        "fixed total generated tokens (pilot + support + main expansion under one cap); "
+        "likelihood scoring reported separately"
+    ),
+}
+
+COMPUTE_PROXY_DEFINITION = (
+    "pilot decode tokens + pilot-support decode tokens + main-expansion decode tokens "
+    "+ scored prompt tokens + scored continuation tokens"
+)
+
+
+def budget_claim_for_mode(budget_mode: Optional[str]) -> str:
+    """Return the manifest budget claim string for a VDRA budget mode."""
+
+    mode = str(budget_mode or "fixed_main")
+    if mode not in BUDGET_CLAIMS:
+        raise ValueError(f"Unknown VDRA budget mode: {mode!r}")
+    return BUDGET_CLAIMS[mode]
 
 
 def node_record(
@@ -254,10 +297,14 @@ def node_record(
         "reserve_received": int(node.get("vdra_reserve_received", 0) or 0),
         "pilot_children_generated": int(node.get("vdra_pilot_children_generated", 0) or 0),
         "pilot_children_reused": int(node.get("vdra_pilot_children_reused", 0) or 0),
+        "pilot_children_shortcut": int(node.get("vdra_pilot_children_shortcut", 0) or 0),
+        "shortcut_overage": int(node.get("vdra_shortcut_overage", 0) or 0),
         "pilot_children_discarded": int(node.get("vdra_pilot_children_discarded", 0) or 0),
         "additional_children_generated": int(node.get("vdra_additional_children_generated", 0) or 0),
         "pilot_generated_tokens": int(node.get("vdra_pilot_generated_tokens", 0) or 0),
+        "pilot_support_generated_tokens": int(node.get("vdra_pilot_support_generated_tokens", 0) or 0),
         "main_expansion_generated_tokens": int(node.get("vdra_main_expansion_generated_tokens", 0) or 0),
+        "proxy_rollout_tokens": int(node.get("vdra_proxy_rollout_tokens", 0) or 0),
         "scored_tokens": int(node.get("vdra_total_scored_tokens", 0) or 0),
         "queue_id": node.get("vdra_queue_id"),
         "queue_wait_seconds": float(node.get("vdra_queue_wait_seconds", 0.0) or 0.0),

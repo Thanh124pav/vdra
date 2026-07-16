@@ -178,29 +178,55 @@ node produces two separate signals:
 - `predicted_k`: useful branch demand and pruning cap;
 - `vdra_dispersion_C`: the upper bound \(C_s\) used to prioritize residual budget.
 
+Pilot handling (updated):
+
+- Pilots that emit EOS inside the first phase are **shortcut** children: they
+  are complete trajectories, excluded from TV estimation, graded immediately
+  and counted against the node's branch budget (`vdra_pilot_children_shortcut`,
+  `vdra_shortcut_overage`).
+- Duplicate pruning removes the pilot with the **most duplicate partners**
+  (pairwise TV below the threshold) until no duplicate pair remains.
+- Reuse selection among the surviving pilots is a **seeded uniform draw** —
+  never likelihood-ranked, so the reused children stay an unbiased sample of
+  the continuation distribution as far as pruning permits.
+
 After pruning, saved branches enter a shared pool. Nodes with remaining demand
 receive additional branches through capped water filling for
 \(\min\sum_s C_s/k_s\). The continuous priority is `sqrt(C_s)` and integer
-allocations use capped largest-remainder rounding. `budget_lambda` is not a
-VDRA parameter; the solver's internal `dual_lambda` is computed, never tuned.
+allocations use capped rounding (`rounding_strategy`, ablation #10).
+`budget_lambda` is not a VDRA parameter; the solver's internal `dual_lambda`
+is computed, never tuned. In the verl online runtime sibling frontier nodes
+are expanded concurrently so allocation queues genuinely batch (check
+`queue_size_at_flush` in `queue_flushes.jsonl`).
 
 Main configuration:
 
 | Parameter | Default | Meaning |
 |---|---:|---|
-| `pilot_branch_factor` | branch factor | Pilot children \(k_0\) |
+| `pilot_branch_factor` | branch factor | Pilot children \(k_0\); must exceed the max default branch factor for residual redistribution |
 | `likelihood_samples_per_distribution` | 2 | Mixture samples \(r\) per pilot child |
 | `tv_second_phase_tokens` | 60 | Short horizon \(m\) |
 | `n_min` | 1 | Minimum retained branch demand |
 | `strict_vdra` | true | Fail rather than changing estimator/allocation behavior |
 | `invalid_support_policy` | `error` | Handling for missing pair-specific support |
-| `budget_mode` | `fixed_main` | Fixed main-expansion branch budget |
+| `budget_mode` | `fixed_main` | `fixed_main` or `fixed_total_generated` |
+| `allocation_proxy` | `vdra` | `vdra` / `uniform` / `random` / `direct_tv` / `empirical_variance` / `external_score` / `oracle` |
+| `oracle_rollouts_per_node` | 16 | Full rollouts per node for the oracle proxy (eval-only) |
+| `rounding_strategy` | `largest_remainder` | `largest_remainder` / `nearest_repair` / `stochastic` |
 | `queue_capacity` | 8 | Nodes per online allocation flush |
 | `root_allocation` | backend-specific | Joint root allocation; unsupported backends reject it |
 
 `fixed_main` keeps the main-expansion budget fixed and reports pilot/scoring as
-overhead. `fixed_total_generated` places pilot and main generation under one
-generated-token cap. Neither mode hides likelihood-scoring work.
+overhead. `fixed_total_generated` (verl online runtime) places pilot, support
+and main generation under one generated-token cap equal to the uniform-SPO
+expected token count; cap accounting lands in `vdra_token_cap`,
+`vdra_generated_tokens_under_cap` and `vdra_token_cap_hit_count`. Neither mode
+hides likelihood-scoring work.
+
+The `empirical_variance` and `oracle` proxies generate and grade full rollouts
+per node (cost in `vdra_proxy_rollout_tokens`); oracle runs are flagged
+`run_valid_for_main_results: false` in the manifest. `external_score` takes an
+import path via `external_score_module` (`module:callable`).
 
 Strict main runs require a compatible tail-calibration artifact:
 
@@ -217,9 +243,19 @@ EPS_TAIL_CALIBRATION_PATH=artifacts/tail_calibration/<artifact>.json \
 The calibration grader evaluates `pilot_response + continuation`. Artifacts
 record model/checkpoint, dataset, \(k_0\), \(r\), horizons, seed and quantile.
 
-Legacy `simple`, `perplexity`, `legacy_abs`, no-tail, no-floor and no-queue
-paths are explicit ablations only. Presets live in `configs/ablations/` and are
-launched through `scripts/run_ablations.sh`.
+Legacy `simple`, `perplexity`, `legacy_abs`, `simulation_lemma`, no-tail,
+no-floor and no-queue paths are explicit ablations only. Presets live in
+`configs/ablations/` and are launched through `scripts/run_ablations.sh`.
+
+Offline experiment scripts:
+
+- `scripts/calibrate_tail_divergence.py` — RQ2/RQ3/RQ4 + Direction A/B/D
+  (tail quantiles, adaptive lookahead report, oracle dispersion, allocation
+  regret);
+- `scripts/eval_value_mse.py` — RQ5: MSE of \(\hat V(s)\) vs a high-budget
+  reference under each allocation method;
+- `scripts/eval_gradient_quality.py` — RQ6: cos/L2/variance of the segment
+  gradient vs a high-budget reference gradient (small HF model, offline).
 
 ## Logging offline (no internet)
 

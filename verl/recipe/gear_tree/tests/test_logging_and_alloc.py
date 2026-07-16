@@ -69,3 +69,37 @@ def test_allocation_uses_positive_dispersion_without_threshold():
     summ = allocate_branch_factors(nodes, total_budget=4)
     assert summ.weights["a"] == math.sqrt(0.1)
     assert summ.allocations["a"] == 4
+
+
+def test_budget_claim_follows_budget_mode():
+    import pytest
+    from vdra_core.logging_schema import budget_claim_for_mode
+
+    assert "fixed main expansion budget" in budget_claim_for_mode("fixed_main")
+    assert "one cap" in budget_claim_for_mode("fixed_total_generated")
+    assert "fixed main expansion budget" in budget_claim_for_mode(None)
+    with pytest.raises(ValueError, match="Unknown VDRA budget mode"):
+        budget_claim_for_mode("free_lunch")
+
+
+def test_strict_calibration_error_names_the_calibration_script():
+    import pytest
+    from recipe.gear_tree.calibration import resolve_gear_calibration
+
+    with pytest.raises(ValueError, match="calibrate_tail_divergence"):
+        resolve_gear_calibration({"strict_vdra": True})
+    # Non-strict runs keep the raw eps_tail without an artifact.
+    resolved = resolve_gear_calibration({"strict_vdra": False, "eps_tail": 0.05})
+    assert resolved["eps_tail"] == 0.05
+
+
+def test_demo_logger_manifest_reflects_tree_budget_mode(tmp_path: Path):
+    tree = _mk_tree()
+    tree["vdra_budget_mode"] = "fixed_total_generated"
+    logger = TreeDemoLogger(tmp_path, demo_examples_per_tree=0, full_tree_every_n_trees=0)
+    logger.log_tree(tree, question_id=1)
+    logger.close()
+    manifest = json.loads((tmp_path / "run_manifest.json").read_text())
+    assert manifest["budget_mode"] == "fixed_total_generated"
+    assert "one cap" in manifest["budget_claim"]
+    assert "pilot-support decode tokens" in manifest["compute_proxy_definition"]

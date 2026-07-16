@@ -30,6 +30,8 @@ def _build_gate(gt: dict, scorer=None):
     from recipe.gear_tree.calibration import resolve_gear_calibration
 
     g = resolve_gear_calibration(dict(gt["gear"]))
+    # Defaults here must match the GearGate signature so a missing config key
+    # behaves identically no matter which entry point built the gate.
     return GearGate(
         epsilon=g.get("epsilon", 0.02),
         r_max=g.get("r_max", 1.0),
@@ -37,7 +39,7 @@ def _build_gate(gt: dict, scorer=None):
         alpha=g.get("alpha", 0.05),
         k_algorithm=g.get("k_algorithm", "budget_allocation"),
         n_min=g.get("n_min", 1), pilot_branch_factor=g.get("pilot_branch_factor", None), likelihood_samples_per_distribution=g.get("likelihood_samples_per_distribution", 2),
-        root_allocation=g.get("root_allocation", True),
+        root_allocation=g.get("root_allocation", False),
         skip_near_leaf_expand=g.get("skip_near_leaf_expand", True),
         max_depth=len(gt.get("tree_shape", [])) or None,
         enable_share=g.get("enable_share", False),
@@ -46,12 +48,16 @@ def _build_gate(gt: dict, scorer=None):
         eps_tail_by_depth=g.get("eps_tail_by_depth", None),
         bound_form=g.get("bound_form", "linear"),
         tv_estimator=g.get("tv_estimator", "tanh"),
-        tv_first_phase_tokens=g.get("tv_first_phase_tokens", 120),
+        tv_first_phase_tokens=g.get("tv_first_phase_tokens", 60),
         tv_second_phase_tokens=g.get("tv_second_phase_tokens", 60),
         queue_count=g.get("queue_count", 4), queue_capacity=g.get("queue_capacity", 8),
         queue_timeout_seconds=g.get("queue_timeout_seconds", 1.0),
         use_residual_budget=g.get("use_residual_budget", True), strict_vdra=g.get("strict_vdra", True), invalid_support_policy=g.get("invalid_support_policy", "error"), budget_mode=g.get("budget_mode", "fixed_main"),
+        allocation_proxy=g.get("allocation_proxy", "vdra"),
         allocation_runtime=g.get("allocation_runtime", "online_timeout"),
+        artifact_dir=g.get("artifact_dir"),
+        eps_tail_calibration_path=g.get("eps_tail_source"),
+        eps_tail_calibration_metadata=g.get("eps_tail_calibration_metadata"),
     )
 
 
@@ -78,6 +84,15 @@ class GearTreeActorRolloutWorker(ActorRolloutRefWorker):  # pragma: no cover - G
 
             scorer = EngineLPScorer(self.rollout.inference_engine, self.tokenizer)
         gate = _build_gate(gt, scorer=scorer)
+        # The SPMD path drives the synchronous build_tree, which has no
+        # online/batch allocation branch: running VDRA there would silently
+        # degrade to uniform SPO expansion. Fail loudly instead.
+        if gate is not None and gate.k_algorithm == "budget_allocation":
+            raise ValueError(
+                "VDRA budget_allocation is not supported on the SPMD rollout "
+                "backend (sync build_tree has no allocation path). Set "
+                "gear_tree.rollout_backend: async, or use k_algorithm: simple."
+            )
 
         reward_fn = MathRewardFunction(
             answer_prefix=gt.get("answer_prefix", "# Answer\n"),

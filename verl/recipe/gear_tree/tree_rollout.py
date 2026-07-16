@@ -182,6 +182,7 @@ async def async_build_tree(
     max_depth: Optional[int] = None,
     gear_gate: Optional[Any] = None,
     gear_node_expander: Optional[Any] = None,
+    free_max_tokens: int = 1024,
 ) -> Dict[str, Any]:
     """Async mirror of :func:`build_tree` for verl's async (agent-loop) rollout.
 
@@ -211,6 +212,7 @@ async def async_build_tree(
             max_depth=max_depth,
             gear_gate=gear_gate,
             gear_node_expander=gear_node_expander,
+            free_max_tokens=free_max_tokens,
         )
 
     if (
@@ -289,30 +291,68 @@ async def async_build_tree(
     return tree
 
 
-def _retained_pilot_samples(node: Dict[str, Any], allocated_k: int) -> List[SegmentSample]:
+def _uniform_generated_token_cap(
+    tree_shape: Sequence[int], M: int, max_depth: int, free_max_tokens: int
+) -> int:
+    """Expected generated tokens of the uniform SPO tree with the same shape.
+
+    This is the ``fixed_total_generated`` budget cap: pilot, support and main
+    expansion generation must all fit under the token count the uniform
+    baseline would have spent on main expansion alone.
+    """
+
+    total = 0
+    width = 1
+    for depth in range(max_depth):
+        width *= int(tree_shape[depth] if depth < len(tree_shape) else tree_shape[-1])
+        per_node = int(free_max_tokens) if depth == max_depth - 1 else int(M)
+        total += width * per_node
+    return total
+
+
+def _candidate_to_sample(node: Dict[str, Any], candidate: Dict[str, Any]) -> Optional[SegmentSample]:
+    token_ids = candidate.get("response_token_ids")
+    if token_ids is None:
+        parent_ids = list(node.get("full_token_ids") or [])
+        full_ids = list(candidate.get("full_token_ids") or [])
+        token_ids = full_ids[len(parent_ids):] if full_ids[:len(parent_ids)] == parent_ids else []
+    if not token_ids:
+        return None
+    return SegmentSample(
+        token_ids=list(token_ids),
+        text=str(candidate.get("text", "")),
+        finish_reason=str(candidate.get("finish_reason", "length")),
+        logprobs=(
+            list(candidate["actor_shifted_log_probs"])
+            if candidate.get("actor_shifted_log_probs") is not None
+            else None
+        ),
+        sum_logprobs=candidate.get("sum_logprobs"),
+        num_tokens=candidate.get("num_tokens"),
+    )
+
+
+def _shortcut_pilot_samples(node: Dict[str, Any]) -> List[SegmentSample]:
+    """Terminal phase-1 pilots: complete answers attached as graded leaves."""
+
     samples: List[SegmentSample] = []
-    for candidate in list(node.get("vdra_reusable_pilot_children") or node.get("vdra_pilot_children") or [])[:allocated_k]:
-        token_ids = candidate.get("response_token_ids")
-        if token_ids is None:
-            parent_ids = list(node.get("full_token_ids") or [])
-            full_ids = list(candidate.get("full_token_ids") or [])
-            token_ids = full_ids[len(parent_ids):] if full_ids[:len(parent_ids)] == parent_ids else []
-        if not token_ids:
-            continue
-        samples.append(
-            SegmentSample(
-                token_ids=list(token_ids),
-                text=str(candidate.get("text", "")),
-                finish_reason=str(candidate.get("finish_reason", "length")),
-                logprobs=(
-                    list(candidate["actor_shifted_log_probs"])
-                    if candidate.get("actor_shifted_log_probs") is not None
-                    else None
-                ),
-                sum_logprobs=candidate.get("sum_logprobs"),
-                num_tokens=candidate.get("num_tokens"),
-            )
-        )
+    for candidate in list(node.get("vdra_shortcut_children") or []):
+        sample = _candidate_to_sample(node, candidate)
+        if sample is not None:
+            samples.append(sample)
+    return samples
+
+
+def _retained_pilot_samples(node: Dict[str, Any], count: int) -> List[SegmentSample]:
+    from recipe.gear_tree.gear_core.gear.tv_estimators import select_reuse_candidates
+
+    pool = list(node.get("vdra_reusable_pilot_children") or node.get("vdra_pilot_children") or [])
+    seed = f"vdra-reuse:{node.get('gear_segment_id', node.get('vdra_node_id', 'root'))}"
+    samples: List[SegmentSample] = []
+    for candidate in select_reuse_candidates(pool, count, seed=seed):
+        sample = _candidate_to_sample(node, candidate)
+        if sample is not None:
+            samples.append(sample)
     return samples
 
 
@@ -321,65 +361,101 @@ async def _expand_reusing_pilots(
     allocated_k: int,
     max_tokens: Optional[int],
     segment_fn,
+    token_budget: Optional[Dict[str, Any]] = None,
 ) -> List[SegmentSample]:
-    retained = _retained_pilot_samples(node, allocated_k)
+    shortcut = _shortcut_pilot_samples(node)
+    node["vdra_shortcut_overage"] = max(len(shortcut) - int(allocated_k), 0)
+    reuse_budget = max(int(allocated_k) - len(shortcut), 0)
+    retained = _retained_pilot_samples(node, reuse_budget)
     completed: List[SegmentSample] = []
     completion_tokens = 0
+    completion_requests = 0
     for sample in retained:
-        if (
-            max_tokens is not None
-            and sample.finish_reason == "length"
-            and int(sample.num_tokens or len(sample.token_ids)) < int(max_tokens)
-        ):
-            remaining = int(max_tokens) - int(sample.num_tokens or len(sample.token_ids))
-            prompt_ids = list(node["full_token_ids"]) + list(sample.token_ids)
-            continuation = await segment_fn(prompt_ids, 1, remaining)
-            if continuation:
-                cont = continuation[0]
-                sample = SegmentSample(
-                    token_ids=list(sample.token_ids) + list(cont.token_ids),
-                    text=sample.text + cont.text,
-                    finish_reason=cont.finish_reason,
-                    logprobs=(
-                        (list(sample.logprobs) if sample.logprobs is not None else [])
-                        + (list(cont.logprobs) if cont.logprobs is not None else [])
-                    ) or None,
-                    sum_logprobs=(
-                        float(sample.sum_logprobs or 0.0)
-                        + float(cont.sum_logprobs or 0.0)
-                    ),
-                    num_tokens=int(sample.num_tokens or 0) + int(cont.num_tokens or 0),
-                )
-                completion_tokens += len(cont.token_ids)
+        if sample.finish_reason == "length":
+            # Free-budget depths (max_tokens None) must also finish the pilot,
+            # otherwise a truncated 60-token prefix would be graded as final.
+            remaining = (
+                None
+                if max_tokens is None
+                else int(max_tokens) - int(sample.num_tokens or len(sample.token_ids))
+            )
+            if remaining is None or remaining > 0:
+                prompt_ids = list(node["full_token_ids"]) + list(sample.token_ids)
+                continuation = await segment_fn(prompt_ids, 1, remaining)
+                completion_requests += 1
+                if continuation:
+                    cont = continuation[0]
+                    sample = SegmentSample(
+                        token_ids=list(sample.token_ids) + list(cont.token_ids),
+                        text=sample.text + cont.text,
+                        finish_reason=cont.finish_reason,
+                        logprobs=(
+                            (list(sample.logprobs) if sample.logprobs is not None else [])
+                            + (list(cont.logprobs) if cont.logprobs is not None else [])
+                        ) or None,
+                        sum_logprobs=(
+                            float(sample.sum_logprobs or 0.0)
+                            + float(cont.sum_logprobs or 0.0)
+                        ),
+                        num_tokens=int(sample.num_tokens or 0) + int(cont.num_tokens or 0),
+                    )
+                    completion_tokens += len(cont.token_ids)
         completed.append(sample)
 
-    missing = max(int(allocated_k) - len(completed), 0)
+    if token_budget is not None:
+        token_budget["used"] = int(token_budget.get("used", 0)) + completion_tokens
+
+    missing = max(reuse_budget - len(completed), 0)
+    if token_budget is not None and missing:
+        # fixed_total_generated: fresh branches only while the shared cap has
+        # room for a full segment each (completions may overshoot by at most
+        # one segment).
+        per_branch = (
+            int(max_tokens)
+            if max_tokens is not None
+            else int(token_budget.get("free_max_tokens", 1024))
+        )
+        remaining = max(int(token_budget["cap"]) - int(token_budget["used"]), 0)
+        allowed = min(missing, remaining // per_branch) if per_branch > 0 else missing
+        if allowed < missing:
+            node["vdra_token_cap_hit"] = True
+            token_budget["cap_hit_count"] = int(token_budget.get("cap_hit_count", 0)) + 1
+        missing = max(allowed, 0)
     additional = (
         await segment_fn(node["full_token_ids"], missing, max_tokens)
         if missing
         else []
     )
+    if token_budget is not None and additional:
+        token_budget["used"] = int(token_budget["used"]) + sum(
+            len(sample.token_ids) for sample in additional
+        )
     all_pilots = list(node.get("vdra_all_pilot_children") or node.get("vdra_pilot_children") or [])
     generated = len(all_pilots)
+    reused = len(completed) + len(shortcut)
     node["vdra_pilot_children_generated"] = generated
     node["vdra_pilot_generated_tokens"] = sum(
         len(candidate.get("response_token_ids") or [])
         for candidate in all_pilots
     )
     node["vdra_pilot_completion_generated_tokens"] = completion_tokens
-    node["vdra_pilot_children_reused"] = len(completed)
-    node["vdra_pilot_children_discarded"] = max(generated - len(completed), 0)
+    node["vdra_pilot_children_shortcut"] = len(shortcut)
+    node["vdra_pilot_children_reused"] = reused
+    node["vdra_pilot_children_discarded"] = max(generated - reused, 0)
     node["vdra_additional_children_generated"] = len(additional)
-    node["vdra_generation_request_count"] = node.get("vdra_generation_request_count", 0) + int(bool(completion_tokens)) + len(additional)
+    node["vdra_generation_request_count"] = (
+        node.get("vdra_generation_request_count", 0) + completion_requests + len(additional)
+    )
     node["vdra_main_expansion_generated_tokens"] = completion_tokens + sum(
         len(sample.token_ids) for sample in additional
     )
     node["vdra_total_generated_tokens"] = (
         node["vdra_pilot_generated_tokens"]
+        + int(node.get("vdra_pilot_support_generated_tokens", 0) or 0)
         + node["vdra_main_expansion_generated_tokens"]
     )
-    node["vdra_pilot_reuse_rate"] = len(completed) / generated if generated else 0.0
-    return completed + list(additional)
+    node["vdra_pilot_reuse_rate"] = reused / generated if generated else 0.0
+    return shortcut + completed + list(additional)
 
 async def async_build_tree_online_alloc(
     root_prompt_text: str,
@@ -393,12 +469,15 @@ async def async_build_tree_online_alloc(
     max_depth: Optional[int] = None,
     gear_gate: Any,
     gear_node_expander: Any,
+    free_max_tokens: int = 1024,
 ) -> Dict[str, Any]:
     """Online VDRA tree builder using one long-lived queue manager per tree."""
 
     from recipe.gear_tree.gear_core.gear.online_budget import OnlineQueueItem
     from vdra_core.logging_schema import (
+        COMPUTE_PROXY_DEFINITION,
         allocation_node_records,
+        budget_claim_for_mode,
         persist_vdra_artifacts,
         summarize_vdra_tree,
         validate_node_accounting,
@@ -415,6 +494,44 @@ async def async_build_tree_online_alloc(
     policy_snapshot_id = str(data_instance.get("_treetune__idx", "tree"))
     run_id = str(data_instance.get("run_id", policy_snapshot_id))
     tree_id = str(data_instance.get("tree_id", policy_snapshot_id))
+    budget_mode = str(getattr(gear_gate, "budget_mode", "fixed_main"))
+    token_budget: Optional[Dict[str, Any]] = None
+    if budget_mode == "fixed_total_generated":
+        token_budget = {
+            "cap": _uniform_generated_token_cap(tree_shape, M, max_depth, free_max_tokens),
+            "used": 0,
+            "cap_hit_count": 0,
+            "free_max_tokens": int(free_max_tokens),
+        }
+
+    allocation_proxy = str(getattr(gear_gate, "allocation_proxy", "vdra"))
+    proxy_rollout_fn = None
+    if allocation_proxy in {"empirical_variance", "oracle"}:
+        async def proxy_rollout_fn(node: Dict[str, Any], rollouts: int) -> List[float]:
+            """Grade ``rollouts`` free continuations of ``node`` (proxy input).
+
+            Unfinished continuations score 0.0. Token cost is charged to
+            ``vdra_proxy_rollout_tokens`` (and the shared cap when active),
+            never to pilot or main-expansion counters.
+            """
+
+            samples = await segment_fn(node["full_token_ids"], int(rollouts), None)
+            generated = sum(len(sample.token_ids) for sample in samples)
+            node["vdra_proxy_rollout_tokens"] = (
+                int(node.get("vdra_proxy_rollout_tokens", 0) or 0) + generated
+            )
+            node["vdra_generation_request_count"] = (
+                node.get("vdra_generation_request_count", 0) + len(samples)
+            )
+            if token_budget is not None:
+                token_budget["used"] = int(token_budget["used"]) + generated
+            return [
+                float(grade_fn(node["full_text"], node["full_text"] + sample.text, data_instance))
+                if sample.finish_reason != "length"
+                else 0.0
+                for sample in samples
+            ]
+
     manager = gear_gate.make_queue_manager(policy_snapshot_id=policy_snapshot_id)
     poll_interval = max(min(float(manager.timeout_seconds) / 4.0, 0.1), 0.01)
     stop_timeout_worker = asyncio.Event()
@@ -462,28 +579,41 @@ async def async_build_tree_online_alloc(
         if worker_error is not None:
             raise RuntimeError("VDRA queue timeout worker failed") from worker_error
 
+    expansion_tasks: set = set()
+
+    async def _expand_flushed_item(result, item) -> None:
+        node = item.node
+        node_key = str(node.get("gear_segment_id"))
+        try:
+            allocated = int(result.summary.allocations.get(node_key, node.get("vdra_allocated_k", 0)))
+            node["vdra_allocation_seconds"] = result.allocation_seconds
+            await _expand_parent(
+                node,
+                depth=item.depth,
+                allocated_branch_factor=allocated,
+                default_branch_factor=item.default_branch_factor,
+            )
+            if "reward" not in node:
+                raise RuntimeError(f"VDRA queued node {node_key} returned without reward")
+            if item.completion_future is not None and not item.completion_future.done():
+                item.completion_future.set_result(node)
+        except Exception as exc:
+            if item.completion_future is not None and not item.completion_future.done():
+                # The waiter re-raises; swallowing here avoids a duplicate
+                # "exception never retrieved" from the background task.
+                item.completion_future.set_exception(exc)
+            else:
+                raise
+
     async def _handle_flush(result) -> None:
+        # Never expand inline: the flush caller may be the timeout worker, and
+        # blocking it on a whole-subtree expansion would serialize the tree
+        # (and deadlock nodes the subtree enqueues). Expansion runs as tasks.
         queue_flush_records.append(result.to_record())
         for item in result.items:
-            node = item.node
-            try:
-                node_key = str(node.get("gear_segment_id"))
-                allocated = int(result.summary.allocations.get(node_key, node.get("vdra_allocated_k", 0)))
-                node["vdra_allocation_seconds"] = result.allocation_seconds
-                await _expand_parent(
-                    node,
-                    depth=item.depth,
-                    allocated_branch_factor=allocated,
-                    default_branch_factor=item.default_branch_factor,
-                )
-                if "reward" not in node:
-                    raise RuntimeError(f"VDRA queued node {node_key} returned without reward")
-                if item.completion_future is not None and not item.completion_future.done():
-                    item.completion_future.set_result(node)
-            except Exception as exc:
-                if item.completion_future is not None and not item.completion_future.done():
-                    item.completion_future.set_exception(exc)
-                raise
+            task = asyncio.create_task(_expand_flushed_item(result, item))
+            expansion_tasks.add(task)
+            task.add_done_callback(expansion_tasks.discard)
 
     async def _flush_ready() -> None:
         _raise_worker_error()
@@ -523,6 +653,15 @@ async def async_build_tree_online_alloc(
             node["reward"] = float(grade_fn(node["full_text"], node["text"], data_instance))
             node["leaf"] = True
             return
+        if token_budget is not None and token_budget["used"] >= token_budget["cap"]:
+            # fixed_total_generated: the shared cap is exhausted — grade the
+            # truncated node instead of spending more pilot/main tokens.
+            token_budget["cap_hit_count"] = int(token_budget["cap_hit_count"]) + 1
+            node["vdra_token_cap_hit"] = True
+            node["vdra_expansion_skipped_token_cap"] = True
+            node["reward"] = float(grade_fn(node["full_text"], node["text"], data_instance))
+            node["leaf"] = True
+            return
         default_bf = _default_bf(depth)
         near_leaf = bool(getattr(gear_gate, "skip_near_leaf_expand", False) and depth == max_depth - 1)
         if near_leaf or (depth == 0 and not getattr(gear_gate, "root_allocation", False)):
@@ -542,12 +681,23 @@ async def async_build_tree_online_alloc(
                 depth=depth,
                 default_bf=default_bf,
                 node_expander=gear_node_expander,
+                proxy_rollout_fn=proxy_rollout_fn,
             )
         except Exception as exc:
             gear_gate.allocation_error_count += 1
             raise RuntimeError(
                 f"VDRA pilot/scoring failed at depth {depth}; no fallback is allowed"
             ) from exc
+
+        if token_budget is not None:
+            token_budget["used"] = (
+                int(token_budget["used"])
+                + sum(
+                    len(candidate.get("response_token_ids") or [])
+                    for candidate in node.get("vdra_all_pilot_children") or []
+                )
+                + int(node.get("vdra_pilot_support_generated_tokens", 0) or 0)
+            )
 
         saved_k = int(node.get("vdra_saved_k", 0) or 0)
         if saved_k and getattr(gear_gate, "use_residual_budget", False):
@@ -575,12 +725,10 @@ async def async_build_tree_online_alloc(
                 completion_future=future,
             )
         )
+        # Flush immediately when this enqueue filled a queue to capacity;
+        # otherwise the background worker fires the timeout flush while
+        # sibling coroutines keep filling the queue concurrently.
         await _flush_ready()
-        if not future.done():
-            # If this coroutine itself is inside a flush handler, the background
-            # worker cannot make progress until we yield past the timeout.
-            await asyncio.sleep(float(manager.timeout_seconds) + poll_interval)
-            await _flush_ready()
         await future
         if "reward" not in node:
             raise RuntimeError(f"VDRA queued node {node.get('gear_segment_id')} returned without reward")
@@ -605,14 +753,18 @@ async def async_build_tree_online_alloc(
             node["leaf"] = True
             return
         samples = await _expand_reusing_pilots(
-            node, allocated_branch_factor, _max_tokens(depth), segment_fn
+            node, allocated_branch_factor, _max_tokens(depth), segment_fn,
+            token_budget=token_budget,
         )
+        # _expand_reusing_pilots enforces the branch budget; shortcut pilots
+        # may exceed it (vdra_shortcut_overage) and must not be dropped here.
         children = [
             _sample_child(node, depth, idx, sample)
-            for idx, sample in enumerate(samples[:allocated_branch_factor])
+            for idx, sample in enumerate(samples)
         ]
         children = await _filter_children_any(gear_gate, node, depth, default_branch_factor, children)
         node["children"] = children
+        expandable: List[Dict[str, Any]] = []
         for child in children:
             child_depth = depth + 1
             if child["finish_reason"] != "length" or child_depth >= max_depth:
@@ -621,18 +773,30 @@ async def async_build_tree_online_alloc(
                 child["leaf"] = True
             else:
                 child["leaf"] = False
-                await _process_expandable(child, child_depth)
+                expandable.append(child)
+        if expandable:
+            # Siblings expand concurrently so they can co-occupy allocation
+            # queues — the batchwise sqrt(C_s) solve needs more than one node
+            # per flush to have any effect.
+            await asyncio.gather(
+                *(_process_expandable(child, depth + 1) for child in expandable)
+            )
         child_rewards = [child["reward"] for child in children]
         node["reward"] = float(np.mean(child_rewards)) if child_rewards else 0.0
         node["reward_std"] = float(np.std(child_rewards)) if child_rewards else 0.0
 
     try:
         await _process_expandable(tree, 0)
+        # Drain while the worker is still alive: a drained subtree may enqueue
+        # deeper nodes that then need timeout flushes of their own.
+        await _drain_final()
+        while expansion_tasks:
+            await asyncio.gather(*list(expansion_tasks))
+            await _drain_final()
     finally:
         stop_timeout_worker.set()
         await timeout_worker
 
-    await _drain_final()
     if any(not future.done() for future in pending_futures):
         raise RuntimeError("VDRA final drain left pending queue futures")
 
@@ -657,10 +821,15 @@ async def async_build_tree_online_alloc(
             validate_node_accounting(node, k_min=getattr(gear_gate, "n_min", 1))
             generated = int(node.get("vdra_pilot_children_generated", 0) or 0)
             reused = int(node.get("vdra_pilot_children_reused", 0) or 0)
+            shortcut = int(node.get("vdra_pilot_children_shortcut", 0) or 0)
             discarded = int(node.get("vdra_pilot_children_discarded", 0) or 0)
-            if reused > generated or discarded != generated - reused:
+            if reused > generated or shortcut > reused or discarded != generated - reused:
                 raise RuntimeError("VDRA pilot accounting invariant failed")
-            if int(node.get("vdra_total_generated_tokens", 0) or 0) != int(node.get("vdra_pilot_generated_tokens", 0) or 0) + int(node.get("vdra_main_expansion_generated_tokens", 0) or 0):
+            if int(node.get("vdra_total_generated_tokens", 0) or 0) != (
+                int(node.get("vdra_pilot_generated_tokens", 0) or 0)
+                + int(node.get("vdra_pilot_support_generated_tokens", 0) or 0)
+                + int(node.get("vdra_main_expansion_generated_tokens", 0) or 0)
+            ):
                 raise RuntimeError("VDRA generated-token accounting invariant failed")
             if int(node.get("vdra_total_scored_tokens", 0) or 0) != int(node.get("vdra_likelihood_scored_prompt_tokens", 0) or 0) + int(node.get("vdra_likelihood_scored_continuation_tokens", 0) or 0):
                 raise RuntimeError("VDRA scored-token accounting invariant failed")
@@ -677,6 +846,12 @@ async def async_build_tree_online_alloc(
     tree["gear_reserve_remaining"] = int(manager.reserve_pool.value)
     tree["vdra_queue_flush_records"] = queue_flush_records
     tree["vdra_allocation_scope"] = "one_tree"
+    tree["vdra_budget_mode"] = budget_mode
+    tree["vdra_allocation_proxy"] = allocation_proxy
+    if token_budget is not None:
+        tree["vdra_token_cap"] = int(token_budget["cap"])
+        tree["vdra_generated_tokens_under_cap"] = int(token_budget["used"])
+        tree["vdra_token_cap_hit_count"] = int(token_budget["cap_hit_count"])
     tree["tree_construction_seconds"] = time.time() - t0
 
     artifact_dir = getattr(gear_gate, "artifact_dir", None) or data_instance.get("vdra_artifact_dir")
@@ -690,7 +865,16 @@ async def async_build_tree_online_alloc(
             run_manifest={
                 "algorithm_requested": "VDRA",
                 "algorithm_executed": "VDRA-online-timeout",
-                "run_valid_for_main_results": True,
+                # Oracle-proxy runs consume graded oracle rollouts and are
+                # evaluation-only; they must never be reported as main results.
+                "run_valid_for_main_results": allocation_proxy != "oracle",
+                "allocation_proxy": allocation_proxy,
+                "oracle_rollouts_per_node": (
+                    getattr(gear_gate, "oracle_rollouts_per_node", None)
+                    if allocation_proxy == "oracle"
+                    else None
+                ),
+                "token_cap": tree.get("vdra_token_cap"),
                 "strict_vdra": bool(getattr(gear_gate, "strict_vdra", True)),
                 "tree_shape": list(tree_shape),
                 "segment_length": M,
@@ -709,10 +893,11 @@ async def async_build_tree_online_alloc(
                 "tv_estimator": getattr(gear_gate, "tv_estimator", None),
                 "bound_form": getattr(getattr(gear_gate, "cfg", None), "bound_form", None),
                 "eps_tail": getattr(getattr(gear_gate, "cfg", None), "eps_tail", None),
-                "eps_tail_calibration_path": None,
-                "eps_tail_calibration_metadata": None,
-                "budget_claim": "fixed main expansion budget; pilot and scoring overhead reported separately",
-                "compute_proxy_definition": "pilot decode tokens + main-expansion decode tokens + scored prompt tokens + scored continuation tokens",
+                "eps_tail_calibration_path": getattr(gear_gate, "eps_tail_calibration_path", None),
+                "eps_tail_calibration_metadata": getattr(gear_gate, "eps_tail_calibration_metadata", None),
+                "budget_mode": tree["vdra_budget_mode"],
+                "budget_claim": budget_claim_for_mode(tree["vdra_budget_mode"]),
+                "compute_proxy_definition": COMPUTE_PROXY_DEFINITION,
             },
         )
     return tree

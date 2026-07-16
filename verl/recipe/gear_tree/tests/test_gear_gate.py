@@ -189,6 +189,133 @@ def test_allocate_batch_async_scoring_failure_is_explicit():
 
 
 
+class _MixedFinishPilotExpander:
+    """Phase 1: one terminal + N-1 continuable pilots; phase 2: stop blocks."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def expand(self, *, current_node, prefix, depth, max_tokens, branch_factor):
+        self.calls.append((prefix, branch_factor))
+        if len(self.calls) == 1:
+            return [
+                {
+                    "text": f" p{i}",
+                    "full_text": f"{prefix} p{i}",
+                    "sum_logprobs": -0.1 * (i + 1),
+                    "num_tokens": 2,
+                    "response_token_ids": [10 + i, 20 + i],
+                    "finish_reason": "stop" if i == 0 else "length",
+                }
+                for i in range(int(branch_factor))
+            ]
+        return [
+            {
+                "text": f" z{len(self.calls)}_{i}",
+                "full_text": f"{prefix} z{len(self.calls)}_{i}",
+                "sum_logprobs": -0.2,
+                "num_tokens": 3,
+                "response_token_ids": [30, 31, 32],
+                "finish_reason": "stop",
+            }
+            for i in range(int(branch_factor))
+        ]
+
+
+def test_estimate_node_async_records_shortcut_and_support_accounting():
+    gate = GearGate(
+        k_algorithm="budget_allocation",
+        scorer=_DispersionScorer(),
+        n_min=1,
+        pilot_branch_factor=3,
+        likelihood_samples_per_distribution=1,
+    )
+    node = {"full_text": "hot", "gear_segment_id": "n0"}
+    asyncio.run(
+        gate.estimate_node_async(
+            node, depth=1, default_bf=2, node_expander=_MixedFinishPilotExpander()
+        )
+    )
+
+    assert node["vdra_pilot_children_generated"] == 3
+    assert node["vdra_pilot_children_shortcut"] == 1
+    assert len(node["vdra_shortcut_children"]) == 1
+    assert node["vdra_shortcut_children"][0]["finish_reason"] == "stop"
+    # Reused = post-pruning continuable survivors + shortcut leaves.
+    assert node["vdra_pilot_children_reused"] == (
+        len(node["vdra_reusable_pilot_children"]) + 1
+    )
+    assert node["vdra_pilot_children_discarded"] == (
+        3 - node["vdra_pilot_children_reused"]
+    )
+    # predicted_k counts the shortcut leaf as satisfied demand.
+    assert node["vdra_predicted_k"] == 1 + len(node["vdra_reusable_pilot_children"])
+    # Second-phase support generation is charged to pilot overhead (2
+    # continuable pilots x r=1 blocks x 3 tokens each).
+    assert node["vdra_pilot_support_children_generated"] == 2
+    assert node["vdra_pilot_support_generated_tokens"] == 6
+    assert node["vdra_generation_request_count"] == 3 + 2
+
+
+def test_prepare_proxy_fields_computes_empirical_variance_from_rollouts():
+    gate = GearGate(
+        k_algorithm="budget_allocation",
+        scorer=_DispersionScorer(),
+        allocation_proxy="empirical_variance",
+        pilot_branch_factor=4,
+    )
+    node = {"gear_segment_id": "n"}
+    seen = []
+
+    async def rollout_fn(n, count):
+        seen.append(count)
+        return [0.0, 1.0, 0.0, 1.0][:count]
+
+    asyncio.run(gate._prepare_proxy_fields(node, default_bf=2, proxy_rollout_fn=rollout_fn))
+    assert seen == [4]  # k0 rollouts for the empirical baseline
+    assert node["vdra_empirical_reward_variance"] == pytest.approx(0.25)
+
+
+def test_prepare_proxy_fields_oracle_uses_configured_rollout_count():
+    gate = GearGate(
+        k_algorithm="budget_allocation",
+        scorer=_DispersionScorer(),
+        allocation_proxy="oracle",
+        oracle_rollouts_per_node=6,
+    )
+    node = {"gear_segment_id": "n"}
+
+    async def rollout_fn(n, count):
+        return [1.0] * count
+
+    asyncio.run(gate._prepare_proxy_fields(node, default_bf=2, proxy_rollout_fn=rollout_fn))
+    assert node["vdra_oracle_value_dispersion"] == 0.0
+
+
+def test_rollout_proxies_error_without_online_runtime_support():
+    gate = GearGate(
+        k_algorithm="budget_allocation",
+        scorer=_DispersionScorer(),
+        allocation_proxy="empirical_variance",
+    )
+    with pytest.raises(ValueError, match="online allocation runtime"):
+        asyncio.run(gate._prepare_proxy_fields({}, default_bf=2, proxy_rollout_fn=None))
+
+
+def test_external_score_proxy_requires_configured_callable():
+    gate = GearGate(
+        k_algorithm="budget_allocation",
+        scorer=_DispersionScorer(),
+        allocation_proxy="external_score",
+    )
+    with pytest.raises(ValueError, match="external_score_module"):
+        asyncio.run(gate._prepare_proxy_fields({}, default_bf=2, proxy_rollout_fn=None))
+    gate.external_score_fn = lambda node: 0.5
+    node = {}
+    asyncio.run(gate._prepare_proxy_fields(node, default_bf=2, proxy_rollout_fn=None))
+    assert node["vdra_external_dispersion_C"] == 0.5
+
+
 def test_strict_main_config_rejects_insufficient_pilot_branch_factor():
     gate = GearGate(
         k_algorithm="budget_allocation",

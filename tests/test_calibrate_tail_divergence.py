@@ -26,6 +26,7 @@ def _args(**overrides):
         r_max=1.0,
         default_bf=4,
         n_min=1,
+        stabilize_eta=0.02,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -97,3 +98,20 @@ def test_summarize_rq4_and_allocation_regret():
     assert dd["J_oracle"] <= dd["J_vdra"] + 1e-9
     assert dd["J_vdra"] <= dd["J_uniform"] + 1e-9
     assert dd["regret_vdra"] >= 0.0
+
+
+def test_direction_b_adaptive_lookahead_report():
+    records = [
+        # |D_16 - D_8| = 0.0 <= eta -> stabilizes at m=8.
+        _record(0, 0.30, 0.30, 0.35),
+        # |D_16 - D_8| = 0.30 > eta -> falls through to the last horizon (16).
+        _record(0, 0.10, 0.40, 0.50),
+    ]
+    summary = cal.summarize(records, _args(grade=False, stabilize_eta=0.05))
+    db = summary["direction_b"]
+    assert db["num_pairs"] == 2
+    assert db["stabilized_fraction"] == pytest.approx(0.5)
+    assert db["adaptive_horizon_histogram"] == {"8": 1, "16": 1}
+    # Residuals at the chosen horizons: 0.35-0.30 and 0.50-0.40.
+    assert db["residual_dl_minus_dm_mean"] == pytest.approx((0.05 + 0.10) / 2)
+    assert "approximation/ablation" in db["note"]

@@ -56,6 +56,14 @@ for abl in ${ABLATIONS}; do
     queue8)        # #11: queue size/timeout sweep
       run "vdra-queue-8" "${GEAR_ROOT}/configs/ablations/abl_queue_8.jsonnet"
       ;;
+    qtimeout)      # #11: queue timeout sweep (0.25s / 2.0s vs default 1.0s)
+      run "vdra-queue-timeout-025" "${GEAR_ROOT}/configs/ablations/abl_queue_timeout_025.jsonnet"
+      run "vdra-queue-timeout-2" "${GEAR_ROOT}/configs/ablations/abl_queue_timeout_2.jsonnet"
+      ;;
+    rounding)      # #10: integer rounding strategy sweep
+      run "vdra-rounding-nearest" "${GEAR_ROOT}/configs/ablations/abl_rounding_nearest.jsonnet"
+      run "vdra-rounding-stochastic" "${GEAR_ROOT}/configs/ablations/abl_rounding_stochastic.jsonnet"
+      ;;
     m30)           # #14: short-continuation length sweep
       run "vdra-m-30" "${GEAR_ROOT}/configs/ablations/abl_m_30.jsonnet"
       ;;
@@ -68,6 +76,9 @@ for abl in ${ABLATIONS}; do
       ;;
     uniform)
       run "vdra-uniform" "${GEAR_ROOT}/configs/ablations/abl_uniform_allocation.jsonnet"
+      ;;
+    random)        # RQ1 baseline: random non-uniform allocation
+      run "vdra-random" "${GEAR_ROOT}/configs/ablations/abl_random_allocation.jsonnet"
       ;;
     empirical)
       run "vdra-empirical-variance" "${GEAR_ROOT}/configs/ablations/abl_empirical_variance_allocation.jsonnet"
@@ -92,7 +103,13 @@ for abl in ${ABLATIONS}; do
   esac
 done
 
-# Offline validation (RQ2/RQ3/RQ4 + Direction D — oracle sigma^2, tail
-# quantiles, allocation regret incl. the empirical/oracle-variance baselines):
+# Offline validation (RQ2/RQ3/RQ4 + Direction B/D — oracle sigma^2, tail
+# quantiles, adaptive lookahead, allocation regret):
 #   python scripts/calibrate_tail_divergence.py --api-base ... --model ... \
 #     --prompts-file ... --grade --out results/tail_calibration.json
+# RQ5 (value-estimation MSE per allocation method, needs vLLM server):
+#   python scripts/eval_value_mse.py --api-base ... --model ... \
+#     --prompts-file ... --out results/value_mse.json
+# RQ6 (gradient cos/L2/variance vs high-budget reference, offline HF model):
+#   python scripts/eval_gradient_quality.py --hf-model <small-model> \
+#     --prompts-file ... --out results/gradient_quality.json

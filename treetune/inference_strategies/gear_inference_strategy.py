@@ -32,7 +32,7 @@ from treetune.gear.online_budget import (
     RootQueueManager,
     SharedReservePool,
 )
-from treetune.gear.tv_estimators import ConditionalTVEstimator
+from treetune.gear.tv_estimators import ConditionalTVEstimator, select_reuse_candidates
 from treetune.gear.triggers import Action
 from treetune.gear.vllm_scorer import VLLMLogprobClient, make_lp_scorer
 from vdra_core.logging_schema import validate_node_accounting, write_node_accounting
@@ -83,6 +83,8 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
         gear_invalid_support_policy: str = "error",
         gear_budget_mode: str = "fixed_main",
         gear_allocation_proxy: str = "vdra",
+        gear_rounding_strategy: str = "largest_remainder",
+        gear_rounding_seed: int = 0,
         gear_n_min: int = 1,
         gear_budget_overhead_mode: str = "flexible",
         gear_budget_queue_count: int = 4,
@@ -162,13 +164,25 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
         self.gear_invalid_support_policy = str(gear_invalid_support_policy)
         if gear_budget_mode not in {"fixed_main", "fixed_total_generated"}:
             raise ValueError(f"Unsupported gear_budget_mode: {gear_budget_mode}")
+        if gear_budget_mode == "fixed_total_generated":
+            # The shared generated-token cap is enforced only by the verl
+            # online builder (async_build_tree_online_alloc); accepting the
+            # mode here would silently run fixed_main under a false label.
+            raise NotImplementedError(
+                "gear_budget_mode='fixed_total_generated' is implemented on "
+                "the verl online runtime only (recipe.gear_tree)."
+            )
         self.gear_budget_mode = gear_budget_mode
         if gear_allocation_proxy not in {
-            "vdra", "uniform", "direct_tv", "empirical_variance",
+            "vdra", "uniform", "random", "direct_tv", "empirical_variance",
             "external_score", "oracle",
         }:
             raise ValueError(f"Unsupported gear_allocation_proxy: {gear_allocation_proxy}")
         self.gear_allocation_proxy = gear_allocation_proxy
+        if gear_rounding_strategy not in {"largest_remainder", "nearest_repair", "stochastic"}:
+            raise ValueError(f"Unsupported gear_rounding_strategy: {gear_rounding_strategy}")
+        self.gear_rounding_strategy = gear_rounding_strategy
+        self.gear_rounding_seed = int(gear_rounding_seed)
         self.gear_budget_queue_timeout_seconds = float(
             gear_budget_queue_timeout_seconds
         )
@@ -378,21 +392,16 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
         per_root_allocation_seconds = allocation_seconds / max(len(root_nodes), 1)
         for instance_idx, node, result in zip(root_ids, root_nodes, estimate_results):
             node_id = str(instance_idx)
-            unique_candidates: List[Node] = []
-            seen_candidate_prefixes = set()
-            for candidate in result.candidates:
-                prefix_text = candidate.get("full_text", "")
-                if prefix_text in seen_candidate_prefixes:
-                    continue
-                seen_candidate_prefixes.add(prefix_text)
-                unique_candidates.append(candidate)
             root_allocations[instance_idx] = {
                 "allocated_branch_factor": int(allocations.get(node_id, 0)),
                 "budget_weight": float(weights.get(node_id, 0.0)),
                 "dispersion_C": float(result.dispersion_C),
                 "tv_pair_count": len(result.pair_tvs),
                 "tv_support_size": len(result.samples),
-                "budget_candidates": unique_candidates,
+                # Post-pruning survivors only; reuse selection among them is a
+                # seeded uniform draw at expansion time.
+                "budget_candidates": list(result.unique_candidates),
+                "shortcut_candidates": list(getattr(result, "shortcut_candidates", [])),
                 "tv_logp_matrix": result.logp_matrix,
                 "variance_seconds": per_root_variance_seconds,
                 "allocation_seconds": per_root_allocation_seconds,
@@ -473,6 +482,8 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
             use_residual_budget=self.gear_use_residual_budget,
             policy_snapshot_id=problem_id,
             strict_vdra=getattr(self, "gear_strict_vdra", True),
+            rounding_strategy=getattr(self, "gear_rounding_strategy", "largest_remainder"),
+            rounding_seed=getattr(self, "gear_rounding_seed", 0),
         )
 
         tree: Node = {
@@ -667,33 +678,45 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
             depth: int,
             branch_factor: int,
             candidates: Optional[Sequence[Node]] = None,
+            shortcut: Optional[Sequence[Node]] = None,
         ) -> List[Node]:
             branch_factor = max(int(branch_factor), 0)
-            if branch_factor <= 0:
+            shortcut_candidates = list(shortcut or [])
+            if branch_factor <= 0 and not shortcut_candidates:
                 return []
-            ordered_candidates = sorted(
-                list(candidates or []),
-                key=lambda cand: float(cand.get("sum_logprobs", 0.0) or 0.0),
-                reverse=True,
+            # Terminal phase-1 pilots are complete answers: keep every one of
+            # them (dropping generated full trajectories wastes compute) and
+            # count them against the branch budget.
+            parent["vdra_shortcut_overage"] = max(
+                len(shortcut_candidates) - branch_factor, 0
             )
-            selected_candidates = ordered_candidates[:branch_factor]
+            target = max(branch_factor, len(shortcut_candidates))
+            reuse_budget = max(branch_factor - len(shortcut_candidates), 0)
+            # Reuse selection is a seeded uniform draw over the post-pruning
+            # survivors — never likelihood-ranked (that would bias the child
+            # sample the node value is estimated from).
+            selected_candidates = select_reuse_candidates(
+                list(candidates or []),
+                reuse_budget,
+                seed=f"vdra-reuse:{_node_id(parent, 'root')}",
+            )
             tasks = [
                 asyncio.create_task(_complete_candidate(parent, cand, depth, idx))
-                for idx, cand in enumerate(selected_candidates)
+                for idx, cand in enumerate(shortcut_candidates + selected_candidates)
             ]
             completed_candidates = await asyncio.gather(*tasks) if tasks else []
             children = list(completed_candidates)
-            if len(children) < branch_factor:
+            if len(children) < target:
                 children.extend(
                     await _expand_raw(
                         current_node=parent,
                         prefix=parent.get("full_text", ""),
                         depth=depth,
                         max_tokens=_max_tokens_for_expansion(depth),
-                        branch_factor=branch_factor - len(children),
+                        branch_factor=target - len(children),
                     )
                 )
-            return children[:branch_factor]
+            return children[:target]
 
         def _set_reward_summary(node: Node) -> None:
             rewards = []
@@ -740,7 +763,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
                 node["gear_predicted_k"] = k
                 node["gear_perplexity"] = float(ppl)
                 node["gear_allocation_weight_override"] = float(k)
-                return {"k": k, "candidates": [], "weight_key": "gear_allocation_weight_override"}
+                return {"k": k, "candidates": [], "shortcut": [], "weight_key": "gear_allocation_weight_override"}
 
             entropy_anchor_text = ""
             estimator_parent = node
@@ -763,7 +786,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
                 estimator_parent["text"] = node.get("text", "") + entropy_anchor_text
                 estimator_parent["full_text"] = node.get("full_text", "") + entropy_anchor_text
 
-            mode = "hierarchical" if self.gear_k_algorithm in {"hierarchical", "entropy_guided"} else "perplexity"
+            mode = self._tv_mode_for_k_algorithm()
             estimator = tv_estimator
             if estimator.mode != mode:
                 estimator = ConditionalTVEstimator(
@@ -821,8 +844,15 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
             node["gear_tv_support_size"] = len(result.samples)
             node["gear_duplicate_prefix_pairs"] = len(result.duplicate_pairs)
             node["gear_budget_candidates"] = list(result.unique_candidates)
+            node["gear_shortcut_candidates"] = list(getattr(result, "shortcut_candidates", []))
+            node["vdra_pilot_children_shortcut"] = len(node["gear_shortcut_candidates"])
             node["gear_tv_logp_matrix"] = result.logp_matrix
-            return {"k": k, "candidates": result.unique_candidates, "weight_key": None}
+            return {
+                "k": k,
+                "candidates": result.unique_candidates,
+                "shortcut": node["gear_shortcut_candidates"],
+                "weight_key": None,
+            }
 
         async def _handle_queue_flush(result) -> None:
             nonlocal allocation_seconds_by_depth
@@ -852,6 +882,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
                     allocated_branch_factor=allocated,
                     default_branch_factor=item.default_branch_factor,
                     candidates=node.get("gear_budget_candidates") or [],
+                    shortcut=node.get("gear_shortcut_candidates") or [],
                 )
 
         async def _flush_ready_queues() -> None:
@@ -920,6 +951,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
                     allocated_branch_factor=min(max(k, 0), default_n),
                     default_branch_factor=default_n,
                     candidates=prediction.get("candidates") or [],
+                    shortcut=prediction.get("shortcut") or [],
                 )
             elif k < default_n:
                 reserve_delta = default_n - max(k, 0)
@@ -932,6 +964,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
                     allocated_branch_factor=max(k, 0),
                     default_branch_factor=default_n,
                     candidates=prediction.get("candidates") or [],
+                    shortcut=prediction.get("shortcut") or [],
                 )
             else:
                 queued_node_count += 1
@@ -952,11 +985,12 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
             allocated_branch_factor: int,
             default_branch_factor: int,
             candidates: Optional[Sequence[Node]] = None,
+            shortcut: Optional[Sequence[Node]] = None,
         ) -> None:
             branch_factor_by_depth[depth] = default_branch_factor
             requested_by_depth[depth] = requested_by_depth.get(depth, 0) + max(default_branch_factor, 0)
             allocated_by_depth[depth] = allocated_by_depth.get(depth, 0) + max(allocated_branch_factor, 0)
-            if allocated_branch_factor <= 0:
+            if allocated_branch_factor <= 0 and not (shortcut or []):
                 underallocated_by_depth[depth] = underallocated_by_depth.get(depth, 0) + max(default_branch_factor, 0)
                 _finalize_empty_expansion_node(
                     node,
@@ -974,6 +1008,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
                 depth=depth,
                 branch_factor=allocated_branch_factor,
                 candidates=candidates,
+                shortcut=shortcut,
             )
             expansion_seconds_by_depth[depth] = expansion_seconds_by_depth.get(depth, 0.0) + (time.time() - t_expand)
             built_by_depth[depth] = built_by_depth.get(depth, 0) + len(children)
@@ -1006,6 +1041,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
                     allocated_branch_factor=min(max(root_k, 0), root_default),
                     default_branch_factor=root_default,
                     candidates=prediction.get("candidates") or [],
+                    shortcut=prediction.get("shortcut") or [],
                 )
             elif root_k < root_default:
                 reserve_delta = root_default - max(root_k, 0)
@@ -1018,6 +1054,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
                     allocated_branch_factor=max(root_k, 0),
                     default_branch_factor=root_default,
                     candidates=prediction.get("candidates") or [],
+                    shortcut=prediction.get("shortcut") or [],
                 )
             else:
                 queued_node_count += 1
@@ -1033,12 +1070,14 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
             root_allocated = int(root_allocation_info.get("allocated_branch_factor", root_default))
             tree["vdra_dispersion_C"] = float(root_allocation_info.get("dispersion_C", 0.0))
             tree["gear_budget_candidates"] = list(root_allocation_info.get("budget_candidates", []))
+            tree["gear_shortcut_candidates"] = list(root_allocation_info.get("shortcut_candidates", []))
             await _expand_parent(
                 tree,
                 depth=0,
                 allocated_branch_factor=root_allocated,
                 default_branch_factor=root_default,
                 candidates=tree.get("gear_budget_candidates") or [],
+                shortcut=tree.get("gear_shortcut_candidates") or [],
             )
         else:
             root_allocated = root_default
@@ -1048,8 +1087,20 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
                 allocated_branch_factor=root_allocated,
                 default_branch_factor=root_default,
                 candidates=tree.get("gear_budget_candidates") or [],
+                shortcut=tree.get("gear_shortcut_candidates") or [],
             )
         await _drain_queues()
+
+        # Queued children get their rewards only at flush time, after their
+        # parent's inline reward summary already ran — recompute every internal
+        # node bottom-up so ancestor values (advantage baselines) are correct.
+        def _backprop_rewards(node: Node) -> None:
+            for child in node.get("children", []) or []:
+                _backprop_rewards(child)
+            if node.get("children"):
+                _set_reward_summary(node)
+
+        _backprop_rewards(tree)
 
         tree["gear_max_depth"] = int(max_depth)
         tree["gear_branch_factor_by_depth"] = dict(branch_factor_by_depth)

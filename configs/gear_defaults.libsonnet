@@ -28,9 +28,15 @@
     budget_queue_count: 4,
     budget_queue_capacity: 8,
     budget_queue_timeout_seconds: 1.0,
+    // Integer rounding for the capped continuous allocation (ablation #10):
+    // 'largest_remainder' | 'nearest_repair' | 'stochastic'.
+    rounding_strategy: 'largest_remainder',
+    rounding_seed: 0,
     // VDRA (Summary.md §7-§9): tail-corrected value bound + tanh TV estimator.
-    // eps_tail is calibrated offline via scripts/calibrate_tail_divergence.py.
-    eps_tail: 0.1,
+    // strict_vdra requires eps_tail_calibration_path (from
+    // scripts/calibrate_tail_divergence.py); the raw eps_tail below is used
+    // only when strict_vdra is false.
+    eps_tail: 0.0,
     eps_tail_calibration_path: null,
     strict_vdra: true,
     invalid_support_policy: 'error',

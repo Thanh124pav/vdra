@@ -387,7 +387,20 @@ $$
 
 ## 8. From Divergence to Pairwise Value Difference
 
-Let $f$ denote a value-difference bound obtained from the simulation lemma or an equivalent total-variation argument.
+Let $f$ denote a value-difference bound obtained from a total-variation argument.
+
+The main form used by VDRA is the linear bound
+
+$$
+f(D) = R_{\max} D,
+$$
+
+which is exact for a bounded terminal reward $V\in[0,R_{\max}]$:
+$|\mathbb E_P[V]-\mathbb E_Q[V]|\le R_{\max}\,D_{\mathrm{TV}}(P,Q)$.
+A discounted simulation-lemma form
+$f(D)=R_{\max}\,\gamma D/\big((1-\gamma)(1-\gamma+D)\big)$ is retained only as
+an ablation (`bound_form: simulation_lemma`); it is not part of the main
+method.
 
 Then
 
@@ -752,21 +765,50 @@ This dual variable is not a public hyperparameter and is unrelated to the
 historical threshold called `budget_lambda`. The VDRA allocation priority is
 always $\sqrt{C_s}$; no term of the form $\sqrt{C_s-\lambda}$ is used.
 
-Integer allocations use capped largest-remainder rounding. Every node records
+Integer allocations use capped rounding (largest-remainder by default;
+nearest-with-repair and stochastic rounding are ablations). Every node records
 `default_k`, `predicted_k`, `base_k`, `saved_k`, `unmet_demand`,
-`dispersion_C`, `additional_k`, and `allocated_k`. Pilot children are retained:
-allocation reuses the selected pilots and generates only missing branches.
+`dispersion_C`, `additional_k`, and `allocated_k`.
+
+**Pilot handling.** Pilots are processed in three groups:
+
+1. *Shortcut pilots.* A pilot that terminates (EOS) inside the short first
+   phase is a complete trajectory. It is excluded from TV estimation, attached
+   directly as a graded leaf child, and counted against the node's branch
+   budget. If a node has more terminal pilots than allocated branches, all of
+   them are kept (`shortcut_overage`); discarding finished trajectories would
+   waste generation.
+2. *Duplicate pruning.* Among continuable pilots, a pair with short-horizon TV
+   below the duplicate threshold is treated as redundant. VDRA repeatedly
+   prunes the pilot with the most duplicate partners until no duplicate pair
+   remains. `predicted_k` is the number of shortcut pilots plus surviving
+   continuable pilots.
+3. *Uniform random reuse.* When the node expands, the reused pilots are drawn
+   uniformly at random (seeded, reproducible) from the post-pruning survivors —
+   never ranked by likelihood. Missing branches are generated fresh.
+
+Two caveats follow. First, residual redistribution requires
+$k_0 > \max_s n_s^{\mathrm{default}}$, otherwise no node can report unmet
+demand. Second, pruning and reuse mean the final child set is not an exactly
+i.i.d. sample from $\pi_\theta(\cdot\mid s)$: duplicates are removed by
+construction. VDRA treats this as a controlled limitation — the selection rule
+carries no likelihood bias, but $\operatorname{Var}(\widehat V) = \sigma_s^2/k_s$
+holds exactly only for the freshly generated branches.
 
 ### 10.2 Budget Reporting Modes
 
 The default `fixed_main` mode holds the main-expansion branch budget fixed and
-reports pilot generation and likelihood scoring as additional compute. It must
-not be described as a fixed-total-compute comparison.
+reports pilot generation (first phase and second-phase support blocks) and
+likelihood scoring as additional compute. It must not be described as a
+fixed-total-compute comparison.
 
-The optional `fixed_total_generated` mode places pilot and main-expansion
-generation under one generated-token cap. Likelihood-scoring tokens and the
+The `fixed_total_generated` mode places pilot, support, and main-expansion
+generation under one generated-token cap, set to the expected token count of
+the uniform SPO tree with the same shape. When the cap is exhausted, remaining
+nodes are graded as truncated leaves. Likelihood-scoring tokens and the
 token-level forward-pass proxy are still reported separately. Experimental
-claims must name the selected mode.
+claims must name the selected mode; the runtime records the mode, the cap, and
+cap-hit counts in the run manifest.
 
 
 ## 11. Online Queue-Based Tree Expansion
@@ -776,14 +818,23 @@ During one rollout-generation phase, the policy parameters are frozen at $\theta
 For each eligible node $s$:
 
 1. Generate $k_0$ pilot children.
-2. Generate short continuations of length $m$.
-3. Compute pairwise likelihood-based TV estimates.
-4. Compute the value-dispersion upper bound $C_s$.
-5. Insert node $s$ into an allocation queue.
-6. Trigger allocation when the queue is full or when its timeout is reached.
-7. Allocate the remaining rollout budget using the VDRA allocation rule.
-8. Expand the nodes according to their resulting integer branch factors.
-9. Perform the policy update after rollout generation is completed.
+2. Route pilots that terminated (EOS) within the first phase directly into the
+   training set as graded leaf children, counted against the branch budget; no
+   TV is computed for them.
+3. Generate short continuations of length $m$ for the continuable pilots.
+4. Compute pairwise likelihood-based TV estimates.
+5. Prune duplicate pilots by duplicate degree; compute the value-dispersion
+   upper bound $C_s$.
+6. Insert node $s$ into an allocation queue.
+7. Trigger allocation when the queue is full or when its timeout is reached.
+8. Allocate the remaining rollout budget using the VDRA allocation rule.
+9. Expand the nodes: reuse a uniform random subset of surviving pilots, then
+   generate only the missing branches.
+10. Perform the policy update after rollout generation is completed.
+
+Sibling frontier nodes are expanded concurrently, so nodes genuinely co-occupy
+allocation queues; a serial builder would degenerate every queue flush to a
+single node and disable the batchwise $\sqrt{C_s}$ rule.
 
 The generation pipeline is
 
@@ -932,6 +983,10 @@ Its queue-based implementation:
 4. VDRA provides a globally optimal allocation over the complete future tree.
 5. A low-divergence node can never branch into different reasoning modes later.
 6. Pilot estimation has zero computational cost.
+7. The final child set is an exactly i.i.d. sample from $\pi_\theta(\cdot\mid s)$
+   (duplicate pruning and pilot reuse remove redundant samples by construction;
+   $\operatorname{Var}(\widehat V)=\sigma_s^2/k_s$ is exact only for freshly
+   generated branches).
 
 ---
 
@@ -1177,19 +1232,30 @@ This experiment validates the claim that reducing value-estimation variance impr
 
 ## RQ7: Does pilot cost amortize over later tree expansion?
 
-Let the pilot cost be approximately
+The pilot cost has three components:
 
 $$
 C_{\mathrm{pilot}}
 =
-k_0rm,
+\underbrace{k_0 L_1}_{\text{first-phase generation}}
++
+\underbrace{k_0 r m}_{\text{support-block generation}}
++
+\underbrace{k_0^2 r\,(L_{\mathrm{ctx}} + m)}_{\text{likelihood scoring (prefill)}},
 $$
 
 where:
 
 - $k_0$ is the number of pilot children;
+- $L_1$ is the first-phase pilot length;
 - $r$ is the number of samples per continuation distribution;
-- $m$ is the short-continuation length.
+- $m$ is the short-continuation length;
+- $L_{\mathrm{ctx}}$ is the scored prefix length (every support block is
+  scored under every pilot prefix).
+
+First-phase generation is partially recovered because surviving pilots and
+terminal (shortcut) pilots are reused as tree children. Scoring is prefill
+compute and is reported separately from decode tokens.
 
 If VDRA avoids $\Delta k$ unnecessary full continuations with expected remaining length $L_{\mathrm{rem}}$, then the immediate saved cost is approximately
 

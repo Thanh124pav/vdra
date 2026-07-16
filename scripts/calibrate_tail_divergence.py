@@ -293,7 +293,58 @@ def summarize(records: List[Dict[str, Any]], args: argparse.Namespace) -> Dict[s
             ),
         }
         summary["direction_d"] = _allocation_regret(graded, args)
+    summary["direction_b"] = _adaptive_lookahead(records, horizons, args)
     return summary
+
+
+def _adaptive_lookahead(
+    records: List[Dict[str, Any]], horizons: List[int], args: argparse.Namespace
+) -> Dict[str, Any]:
+    """Direction B: pick the first horizon where |D_next - D_m| <= eta.
+
+    Reported as an approximation/ablation only (Summary.md Direction B) — a
+    stabilized short-horizon estimate cannot exclude very late divergence, so
+    the residual D_L - D_m at the adaptive horizon is reported alongside.
+    """
+
+    eta = float(args.stabilize_eta)
+    adaptive_ms: List[float] = []
+    residuals: List[float] = []
+    histogram: Dict[str, int] = {}
+    stabilized = 0
+    total = 0
+    for rec in records:
+        for pr in rec["pairs"]:
+            total += 1
+            chosen = None
+            for m, m_next in zip(horizons, horizons[1:]):
+                if abs(pr["d_m"][m_next] - pr["d_m"][m]) <= eta:
+                    chosen = m
+                    stabilized += 1
+                    break
+            horizon = chosen if chosen is not None else horizons[-1]
+            adaptive_ms.append(float(horizon))
+            histogram[str(horizon)] = histogram.get(str(horizon), 0) + 1
+            residuals.append(max(pr["d_l"] - pr["d_m"][horizon], 0.0))
+    return {
+        "eta": eta,
+        "num_pairs": total,
+        "stabilized_fraction": stabilized / total if total else None,
+        "adaptive_horizon_mean": (
+            sum(adaptive_ms) / len(adaptive_ms) if adaptive_ms else None
+        ),
+        "adaptive_horizon_histogram": histogram,
+        "residual_dl_minus_dm_mean": (
+            sum(residuals) / len(residuals) if residuals else None
+        ),
+        "residual_dl_minus_dm_quantiles": {
+            str(q): quantile(residuals, q) for q in args.quantiles
+        },
+        "note": (
+            "approximation/ablation only: stabilization across horizons cannot "
+            "exclude very late divergence (Summary.md Direction B)"
+        ),
+    }
 
 
 def _coverage(
@@ -399,6 +450,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--quantiles", default="0.9,0.95,0.99")
     ap.add_argument("--delta", type=float, default=1e-6)
+    ap.add_argument(
+        "--stabilize-eta", type=float, default=0.02,
+        help="Direction B: |D_next - D_m| threshold for the adaptive lookahead report",
+    )
     ap.add_argument("--grade", action="store_true", help="run RQ4/Direction D (needs answers)")
     ap.add_argument("--assumed-eps-tail", type=float, default=0.0, help="eps_tail used when building C_s for RQ4")
     ap.add_argument("--r-max", type=float, default=1.0)

@@ -78,6 +78,12 @@ class GearGate:
         allocation_proxy: str = "vdra",
         allocation_runtime: str = "online_timeout",
         artifact_dir: Optional[str] = None,
+        eps_tail_calibration_path: Optional[str] = None,
+        eps_tail_calibration_metadata: Optional[Mapping[str, Any]] = None,
+        oracle_rollouts_per_node: int = 16,
+        external_score_fn: Optional[Any] = None,
+        rounding_strategy: str = "largest_remainder",
+        rounding_seed: int = 0,
     ) -> None:
         self.cfg = ThresholdConfig(
             epsilon=epsilon,
@@ -120,11 +126,21 @@ class GearGate:
             raise ValueError(f"Unsupported VDRA budget_mode: {budget_mode}")
         self.budget_mode = budget_mode
         if allocation_proxy not in {
-            "vdra", "uniform", "direct_tv", "empirical_variance",
+            "vdra", "uniform", "random", "direct_tv", "empirical_variance",
             "external_score", "oracle",
         }:
             raise ValueError(f"Unsupported allocation_proxy: {allocation_proxy}")
         self.allocation_proxy = allocation_proxy
+        self.oracle_rollouts_per_node = max(int(oracle_rollouts_per_node), 2)
+        self.external_score_fn = external_score_fn
+        if rounding_strategy not in {"largest_remainder", "nearest_repair", "stochastic"}:
+            raise ValueError(f"Unsupported VDRA rounding_strategy: {rounding_strategy}")
+        self.rounding_strategy = rounding_strategy
+        self.rounding_seed = int(rounding_seed)
+        self.eps_tail_calibration_path = eps_tail_calibration_path
+        self.eps_tail_calibration_metadata = (
+            dict(eps_tail_calibration_metadata) if eps_tail_calibration_metadata else None
+        )
         if self.k_algorithm == "budget_allocation" and self.scorer is None:
             raise ValueError("VDRA budget_allocation requires a likelihood scorer")
         self.share_error_count = 0
@@ -216,7 +232,127 @@ class GearGate:
             use_residual_budget=self.use_residual_budget,
             policy_snapshot_id=policy_snapshot_id,
             strict_vdra=self.strict_vdra,
+            rounding_strategy=self.rounding_strategy,
+            rounding_seed=self.rounding_seed,
         )
+
+    def _record_estimate(
+        self,
+        node: Dict[str, Any],
+        result: Any,
+        estimator: Any,
+        score_keys_before: set,
+    ) -> None:
+        """Write one TV-estimate result onto ``node`` (shared by both paths).
+
+        Terminal (EOS-in-phase-1) pilots become ``vdra_shortcut_children``:
+        complete trajectories the expansion step attaches as graded leaves
+        counted against the branch budget. Reuse candidates are the
+        post-pruning survivors only — selection among them is a seeded uniform
+        draw at expansion time, never likelihood-ranked.
+        """
+
+        from vdra_core.proxies import select_dispersion_proxy
+
+        node["vdra_dispersion_C"] = select_dispersion_proxy(
+            self.allocation_proxy,
+            vdra_dispersion_C=result.dispersion_C,
+            pair_tvs=result.pair_tvs,
+            pilot_count=len(result.candidates),
+            node=node,
+        )
+        all_pilots = list(result.candidates)
+        shortcut_pilots = list(result.shortcut_candidates)
+        reusable_pilots = list(result.unique_candidates)
+        support_nodes = list(result.support_nodes)
+        node["vdra_all_pilot_children"] = all_pilots
+        node["vdra_shortcut_children"] = shortcut_pilots
+        node["vdra_reusable_pilot_children"] = reusable_pilots
+        node["vdra_pilot_children"] = reusable_pilots  # legacy compatibility alias
+        node["vdra_pilot_children_generated"] = len(all_pilots)
+        node["vdra_pilot_children_shortcut"] = len(shortcut_pilots)
+        node["vdra_pilot_children_reused"] = len(reusable_pilots) + len(shortcut_pilots)
+        node["vdra_pilot_children_discarded"] = max(
+            len(all_pilots) - len(reusable_pilots) - len(shortcut_pilots), 0
+        )
+        node["vdra_pilot_support_children_generated"] = len(support_nodes)
+        node["vdra_pilot_support_generated_tokens"] = sum(
+            int(support.get("num_tokens") or len(support.get("response_token_ids") or []))
+            for support in support_nodes
+        )
+        node["vdra_generation_request_count"] = (
+            node.get("vdra_generation_request_count", 0)
+            + len(all_pilots)
+            + len(support_nodes)
+        )
+        node["gear_predicted_k"] = int(result.predicted_k)
+        node["vdra_predicted_k"] = int(result.predicted_k)
+        node["gear_pair_tvs"] = {
+            f"{i},{j}": float(tv) for (i, j), tv in result.pair_tvs.items()
+        }
+        node["gear_prob_matrix"] = result.prob_matrix
+        score_keys = list(set(estimator._score_cache) - score_keys_before)
+        node["vdra_likelihood_scoring_requests"] = len(score_keys)
+        tokenize = getattr(self.scorer, "tokenize_fn", None)
+        if tokenize is not None:
+            node["vdra_likelihood_scored_prompt_tokens"] = sum(
+                len(tokenize(prefix)) for prefix, _ in score_keys
+            )
+            node["vdra_likelihood_scored_continuation_tokens"] = sum(
+                len(tokenize(text)) for _, text in score_keys
+            )
+            node["vdra_total_scored_tokens"] = (
+                node.get("vdra_likelihood_scored_prompt_tokens", 0)
+                + node.get("vdra_likelihood_scored_continuation_tokens", 0)
+            )
+
+    async def _prepare_proxy_fields(
+        self,
+        node: Dict[str, Any],
+        *,
+        default_bf: int,
+        proxy_rollout_fn: Optional[Any],
+    ) -> None:
+        """Populate the node field a non-VDRA allocation proxy reads.
+
+        ``empirical_variance`` / ``oracle`` need graded full rollouts, which
+        only the online tree builder can provide (``proxy_rollout_fn``).
+        ``oracle`` runs are evaluation-only and flagged in the run manifest.
+        """
+
+        if self.allocation_proxy == "external_score":
+            if self.external_score_fn is None:
+                raise ValueError(
+                    "allocation_proxy='external_score' requires "
+                    "gear.external_score_module (import path of a "
+                    "callable(node) -> float)."
+                )
+            node["vdra_external_dispersion_C"] = max(float(self.external_score_fn(node)), 0.0)
+            return
+        if self.allocation_proxy not in {"empirical_variance", "oracle"}:
+            return
+        if proxy_rollout_fn is None:
+            raise ValueError(
+                f"allocation_proxy={self.allocation_proxy!r} needs graded full "
+                "rollouts; it is only supported by the online allocation runtime."
+            )
+        rollouts = (
+            self.oracle_rollouts_per_node
+            if self.allocation_proxy == "oracle"
+            else self.pilot_branch_factor_for(default_bf)
+        )
+        rewards = [float(r) for r in await proxy_rollout_fn(node, rollouts)]
+        if rewards:
+            mean = sum(rewards) / len(rewards)
+            variance = sum((r - mean) ** 2 for r in rewards) / len(rewards)
+        else:
+            variance = 0.0
+        field = (
+            "vdra_oracle_value_dispersion"
+            if self.allocation_proxy == "oracle"
+            else "vdra_empirical_reward_variance"
+        )
+        node[field] = variance
 
     async def estimate_node_async(
         self,
@@ -225,11 +361,11 @@ class GearGate:
         depth: int,
         default_bf: int,
         node_expander: Any,
+        proxy_rollout_fn: Optional[Any] = None,
     ) -> Dict[str, Any]:
         from recipe.gear_tree.gear_core.gear.tv_estimators import (
             ConditionalTVEstimator,
         )
-        from vdra_core.proxies import select_dispersion_proxy
 
         estimator = ConditionalTVEstimator(
             scorer=self.scorer,
@@ -251,42 +387,10 @@ class GearGate:
         result = await estimator.estimate_k_for_parent(
             node, depth=depth, duplicate_tv_threshold=self.cfg.epsilon
         )
-        node["vdra_dispersion_C"] = select_dispersion_proxy(
-            self.allocation_proxy,
-            vdra_dispersion_C=result.dispersion_C,
-            pair_tvs=result.pair_tvs,
-            pilot_count=len(result.candidates),
-            node=node,
+        await self._prepare_proxy_fields(
+            node, default_bf=default_bf, proxy_rollout_fn=proxy_rollout_fn
         )
-        all_pilots = list(result.candidates)
-        reusable_pilots = list(result.unique_candidates or result.candidates)
-        node["vdra_all_pilot_children"] = all_pilots
-        node["vdra_reusable_pilot_children"] = reusable_pilots
-        node["vdra_pilot_children"] = reusable_pilots  # legacy compatibility alias
-        node["vdra_pilot_children_generated"] = len(all_pilots)
-        node["vdra_pilot_children_reused"] = len(reusable_pilots)
-        node["vdra_pilot_children_discarded"] = max(len(all_pilots) - len(reusable_pilots), 0)
-        node["vdra_generation_request_count"] = node.get("vdra_generation_request_count", 0) + len(all_pilots)
-        node["gear_predicted_k"] = int(result.predicted_k)
-        node["vdra_predicted_k"] = int(result.predicted_k)
-        node["gear_pair_tvs"] = {
-            f"{i},{j}": float(tv) for (i, j), tv in result.pair_tvs.items()
-        }
-        node["gear_prob_matrix"] = result.prob_matrix
-        score_keys = list(set(estimator._score_cache) - score_keys_before)
-        node["vdra_likelihood_scoring_requests"] = len(score_keys)
-        tokenize = getattr(self.scorer, "tokenize_fn", None)
-        if tokenize is not None:
-            node["vdra_likelihood_scored_prompt_tokens"] = sum(
-                len(tokenize(prefix)) for prefix, _ in score_keys
-            )
-            node["vdra_likelihood_scored_continuation_tokens"] = sum(
-                len(tokenize(text)) for _, text in score_keys
-            )
-            node["vdra_total_scored_tokens"] = (
-                node.get("vdra_likelihood_scored_prompt_tokens", 0)
-                + node.get("vdra_likelihood_scored_continuation_tokens", 0)
-            )
+        self._record_estimate(node, result, estimator, score_keys_before)
         predicted_k = max(int(result.predicted_k), self.n_min)
         write_node_accounting(
             node,
@@ -298,7 +402,8 @@ class GearGate:
         )
         return {
             "predicted_k": predicted_k,
-            "candidates": reusable_pilots,
+            "candidates": list(result.unique_candidates),
+            "shortcut": list(result.shortcut_candidates),
             "weight_key": None,
         }
 
@@ -339,67 +444,40 @@ class GearGate:
                 )
             return
 
-        estimator = ConditionalTVEstimator(
-            scorer=self.scorer,
-            node_expander=node_expander,
-            gamma=self.cfg.gamma,
-            mode="subnode",
-            pilot_branch_factor=self.pilot_branch_factor_for(default_bf),
-            likelihood_samples_per_distribution=self.likelihood_samples_per_distribution,
-            invalid_support_policy=self.invalid_support_policy,
-            strict_vdra=self.strict_vdra,
-            first_phase_tokens=self.tv_first_phase_tokens,
-            second_phase_tokens=self.tv_second_phase_tokens,
-            tv_estimator=self.tv_estimator,
-            r_max=self.cfg.r_max,
-            eps_tail=eps_tail_for_depth(self.cfg, depth),
-            bound_form=self.cfg.bound_form,
-        )
+        def _make_estimator() -> ConditionalTVEstimator:
+            # One estimator (and score cache) per node: sharing a cache across
+            # nodes silently attributes cache-hit scoring cost to the wrong
+            # node's token accounting.
+            return ConditionalTVEstimator(
+                scorer=self.scorer,
+                node_expander=node_expander,
+                gamma=self.cfg.gamma,
+                mode="subnode",
+                pilot_branch_factor=self.pilot_branch_factor_for(default_bf),
+                likelihood_samples_per_distribution=self.likelihood_samples_per_distribution,
+                invalid_support_policy=self.invalid_support_policy,
+                strict_vdra=self.strict_vdra,
+                first_phase_tokens=self.tv_first_phase_tokens,
+                second_phase_tokens=self.tv_second_phase_tokens,
+                tv_estimator=self.tv_estimator,
+                r_max=self.cfg.r_max,
+                eps_tail=eps_tail_for_depth(self.cfg, depth),
+                bound_form=self.cfg.bound_form,
+            )
 
         try:
             for idx, node in enumerate(nodes):
                 node.setdefault("gear_segment_id", f"batch/{depth}/{idx}")
-                score_keys_before = set(estimator._score_cache)
+                estimator = _make_estimator()
                 result = await estimator.estimate_k_for_parent(
                     node, depth=depth, duplicate_tv_threshold=self.cfg.epsilon
                 )
-                from vdra_core.proxies import select_dispersion_proxy
-                node["vdra_dispersion_C"] = select_dispersion_proxy(
-                    self.allocation_proxy,
-                    vdra_dispersion_C=result.dispersion_C,
-                    pair_tvs=result.pair_tvs,
-                    pilot_count=len(result.candidates),
-                    node=node,
+                # depth_batch has no graded-rollout hook: rollout-based
+                # proxies raise here with a pointer to the online runtime.
+                await self._prepare_proxy_fields(
+                    node, default_bf=default_bf, proxy_rollout_fn=None
                 )
-                all_pilots = list(result.candidates)
-                reusable_pilots = list(result.unique_candidates or result.candidates)
-                node["vdra_all_pilot_children"] = all_pilots
-                node["vdra_reusable_pilot_children"] = reusable_pilots
-                node["vdra_pilot_children"] = reusable_pilots  # legacy compatibility alias
-                node["vdra_pilot_children_generated"] = len(all_pilots)
-                node["vdra_pilot_children_reused"] = len(reusable_pilots)
-                node["vdra_pilot_children_discarded"] = max(len(all_pilots) - len(reusable_pilots), 0)
-                node["vdra_generation_request_count"] = node.get("vdra_generation_request_count", 0) + len(all_pilots)
-                node["gear_predicted_k"] = int(result.predicted_k)
-                node["vdra_predicted_k"] = int(result.predicted_k)
-                node["gear_pair_tvs"] = {
-                    f"{i},{j}": float(tv) for (i, j), tv in result.pair_tvs.items()
-                }
-                node["gear_prob_matrix"] = result.prob_matrix
-                score_keys = list(set(estimator._score_cache) - score_keys_before)
-                node["vdra_likelihood_scoring_requests"] = len(score_keys)
-                tokenize = getattr(self.scorer, "tokenize_fn", None)
-                if tokenize is not None:
-                    node["vdra_likelihood_scored_prompt_tokens"] = sum(
-                        len(tokenize(prefix)) for prefix, _ in score_keys
-                    )
-                    node["vdra_likelihood_scored_continuation_tokens"] = sum(
-                        len(tokenize(text)) for _, text in score_keys
-                    )
-                    node["vdra_total_scored_tokens"] = (
-                        node.get("vdra_likelihood_scored_prompt_tokens", 0)
-                        + node.get("vdra_likelihood_scored_continuation_tokens", 0)
-                    )
+                self._record_estimate(node, result, estimator, set())
         except Exception as exc:
             self.allocation_error_count += 1
             raise RuntimeError(
@@ -415,6 +493,8 @@ class GearGate:
             use_residual_budget=self.use_residual_budget,
             policy_snapshot_id=f"depth-{depth}",
             strict_vdra=self.strict_vdra,
+            rounding_strategy=self.rounding_strategy,
+            rounding_seed=self.rounding_seed,
         )
         for node in nodes:
             predicted_k = max(int(node["gear_predicted_k"]), self.n_min)

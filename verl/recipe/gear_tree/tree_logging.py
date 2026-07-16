@@ -25,7 +25,11 @@ import numpy as np
 
 from recipe.gear_tree.gear_core.gear import logging_helpers as lh
 from recipe.gear_tree.gear_core.gear import tree_policy_logging as tpl
-from vdra_core.logging_schema import persist_vdra_artifacts
+from vdra_core.logging_schema import (
+    COMPUTE_PROXY_DEFINITION,
+    budget_claim_for_mode,
+    persist_vdra_artifacts,
+)
 
 
 def basic_tree_stats(tree: Dict[str, Any]) -> Dict[str, Any]:
@@ -159,8 +163,9 @@ class TreeDemoLogger:
                     "algorithm_executed": tree.get("gear_algorithm_mode", "gear_tree"),
                     "run_valid_for_main_results": True,
                     "allocation_scope": tree.get("vdra_allocation_scope", "one_tree"),
-                    "budget_claim": "fixed main expansion budget; pilot and scoring overhead reported separately",
-                    "compute_proxy_definition": "pilot decode tokens + main-expansion decode tokens + scored prompt tokens + scored continuation tokens",
+                    "budget_mode": tree.get("vdra_budget_mode", "fixed_main"),
+                    "budget_claim": budget_claim_for_mode(tree.get("vdra_budget_mode", "fixed_main")),
+                    "compute_proxy_definition": COMPUTE_PROXY_DEFINITION,
                 },
             )
 

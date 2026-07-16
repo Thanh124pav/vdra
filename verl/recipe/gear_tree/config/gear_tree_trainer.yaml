@@ -103,8 +103,11 @@ gear_tree:
 
     # --- VDRA scoring / bound knobs ----------------------------------------
     # Tail-divergence correction (Summary.md §7): D_L <= D_m + (1-D_m)*eps_tail.
-    # Calibrate with scripts/calibrate_tail_divergence.py (RQ3).
-    eps_tail: 0.1
+    # strict_vdra: true REQUIRES eps_tail_calibration_path (produced by
+    # scripts/calibrate_tail_divergence.py, RQ3); the calibrated value then
+    # overrides eps_tail. The raw eps_tail below is used ONLY when
+    # strict_vdra: false.
+    eps_tail: 0.0
     eps_tail_calibration_path: null
 
     # Optional depth-indexed override, e.g. {0: 0.3, 2: 0.15}. null => global.
@@ -131,14 +134,32 @@ gear_tree:
 
     queue_timeout_seconds: 1.0
 
+    # Integer rounding of the capped continuous allocation (ablation #10):
+    # largest_remainder | nearest_repair | stochastic.
+    rounding_strategy: largest_remainder
+    rounding_seed: 0
+
     # Share unused floor budget across queues via the reserve pool.
     use_residual_budget: true
 
     # Main method fails instead of changing algorithms or supports silently.
     strict_vdra: true
     invalid_support_policy: error
+
+    # fixed_main: fixed main-expansion branch budget, pilot/scoring reported
+    # as overhead. fixed_total_generated: pilot + support + main generation
+    # under one token cap (the uniform-SPO expected token count).
     budget_mode: fixed_main
+
+    # vdra | uniform | random | direct_tv | empirical_variance |
+    # external_score | oracle (oracle = evaluation-only, flagged in manifest).
     allocation_proxy: vdra
+
+    # Full rollouts per node for allocation_proxy: oracle.
+    oracle_rollouts_per_node: 16
+
+    # Import path "module:callable" for allocation_proxy: external_score.
+    external_score_module: null
 
     # OpenAI-compatible vLLM endpoint used to score log pi(y|prefix) for the
     # VDRA likelihood scoring. Missing endpoint is a startup error in strict mode.

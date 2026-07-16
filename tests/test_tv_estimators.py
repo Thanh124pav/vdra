@@ -7,6 +7,7 @@ from treetune.gear.tv_estimators import (
     ConditionalTVEstimator,
     TVSample,
     pairwise_tv_tanh,
+    select_reuse_candidates,
 )
 
 
@@ -433,6 +434,123 @@ def test_k0_r_semantics_and_conflicting_legacy_n_tv_estimates():
             likelihood_samples_per_distribution=2,
             n_tv_estimates=8,
         )
+
+
+class ShortcutMixExpander:
+    """Phase 1 returns terminal + continuable pilots; phase 2 continues each."""
+
+    def __init__(self, finish_reasons):
+        self.finish_reasons = list(finish_reasons)
+        self.calls = []
+
+    async def expand(self, *args, **kwargs):
+        self.calls.append(kwargs)
+        prefix = kwargs["prefix"]
+        depth = kwargs["depth"]
+        branch_factor = kwargs["branch_factor"]
+        if len(self.calls) == 1:
+            return [
+                {
+                    "text": f" f{idx}",
+                    "full_text": f"{prefix} f{idx}",
+                    "sum_logprobs": -0.1 * (idx + 1),
+                    "num_tokens": 1,
+                    "finish_reason": self.finish_reasons[idx % len(self.finish_reasons)],
+                    "depth": depth + 1,
+                }
+                for idx in range(branch_factor)
+            ]
+        return [
+            {
+                "text": f" z{len(self.calls)}_{idx}",
+                "full_text": f"{prefix} z{len(self.calls)}_{idx}",
+                "sum_logprobs": -0.1,
+                "num_tokens": 1,
+                "finish_reason": "stop",
+                "depth": depth + 1,
+            }
+            for idx in range(branch_factor)
+        ]
+
+
+def test_estimate_k_shortcuts_terminal_pilots():
+    expander = ShortcutMixExpander(["stop", "length", "length"])
+    estimator = ConditionalTVEstimator(
+        scorer=FakeScorer(),
+        node_expander=expander,
+        gamma=0.5,
+        pilot_branch_factor=3,
+        likelihood_samples_per_distribution=1,
+    )
+
+    result = asyncio.run(
+        estimator.estimate_k_for_parent(
+            {"full_text": "root"}, depth=0, duplicate_tv_threshold=0.0
+        )
+    )
+
+    # The terminal pilot is a complete trajectory: no TV support requested
+    # from it, and it is surfaced separately for budget-counted leaf reuse.
+    assert [c["finish_reason"] for c in result.shortcut_candidates] == ["stop"]
+    assert all(c["finish_reason"] == "length" for c in result.unique_candidates)
+    # Pair indices refer to the continuable pilot list (2 pilots -> 1 pair).
+    assert set(result.pair_tvs) == {(0, 1)}
+    assert result.predicted_k == 1 + len(result.unique_candidates)
+    assert len(result.support_nodes) == 2
+
+
+def test_estimate_k_all_terminal_pilots_does_not_crash_strict_mode():
+    expander = ShortcutMixExpander(["stop"])
+    estimator = ConditionalTVEstimator(
+        scorer=FakeScorer(),
+        node_expander=expander,
+        gamma=0.5,
+        pilot_branch_factor=3,
+        likelihood_samples_per_distribution=2,
+        strict_vdra=True,
+        invalid_support_policy="error",
+    )
+
+    result = asyncio.run(
+        estimator.estimate_k_for_parent(
+            {"full_text": "root"}, depth=0, duplicate_tv_threshold=0.02
+        )
+    )
+
+    assert len(result.shortcut_candidates) == 3
+    assert result.unique_candidates == []
+    assert result.pair_tvs == {}
+    assert result.dispersion_C == 0.0
+    assert result.predicted_k == 3
+
+
+def test_degree_pruning_prunes_most_duplicated_prefix_first():
+    nodes = [{"sum_logprobs": -float(i)} for i in range(4)]
+    # Star: node 0 duplicates 1 and 2; nodes 1 and 2 differ from each other.
+    pair_tvs = {(0, 1): 0.001, (0, 2): 0.001, (1, 2): 0.5, (0, 3): 0.9}
+    survivors = ConditionalTVEstimator._unique_prefix_indices(nodes, pair_tvs, 0.01)
+    assert survivors == [1, 2, 3]
+    # Symmetric duplicate pair: prune the larger index, keep the earlier pilot.
+    survivors = ConditionalTVEstimator._unique_prefix_indices(
+        nodes[:2], {(0, 1): 0.001}, 0.01
+    )
+    assert survivors == [0]
+
+
+def test_select_reuse_candidates_is_seeded_and_uniform_over_pool():
+    pool = [{"id": i} for i in range(6)]
+    first = select_reuse_candidates(pool, 3, seed="vdra-reuse:n1")
+    again = select_reuse_candidates(pool, 3, seed="vdra-reuse:n1")
+    other = select_reuse_candidates(pool, 3, seed="vdra-reuse:n2")
+    assert first == again  # deterministic per seed
+    assert len(first) == 3
+    assert select_reuse_candidates(pool, 99, seed="s") == pool
+    assert select_reuse_candidates(pool, 0, seed="s") == []
+    # Different seeds must be able to pick different subsets (uniform draw,
+    # not a fixed likelihood-ranked prefix of the pool).
+    seeds = [f"seed{i}" for i in range(50)]
+    picks = {tuple(c["id"] for c in select_reuse_candidates(pool, 3, seed=s)) for s in seeds}
+    assert len(picks) > 1
 
 
 def test_strict_tanh_tv_rejects_no_valid_likelihood_samples():

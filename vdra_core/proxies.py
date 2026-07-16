@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import random
 from typing import Any, Mapping, Tuple
+
+from .logging_schema import node_id
 
 PairKey = Tuple[int, int]
 
@@ -19,6 +22,12 @@ def select_dispersion_proxy(
         return max(float(vdra_dispersion_C), 0.0)
     if method == "uniform":
         return 1.0
+    if method == "random":
+        # RQ1 baseline "random non-uniform allocation": a seeded uniform draw
+        # in (0, 1] per node, so allocation is non-uniform but carries no
+        # dispersion signal. Deterministic per node id for reproducibility.
+        rng = random.Random(f"vdra-random-proxy:{node_id(node)}")
+        return 1.0 - rng.random()
     if method == "direct_tv":
         n = max(int(pilot_count), 1)
         return sum(float(tv) ** 2 for tv in pair_tvs.values()) / float(n * n)
