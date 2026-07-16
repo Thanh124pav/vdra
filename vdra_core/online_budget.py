@@ -52,6 +52,7 @@ class OnlineQueueItem:
     depth: int
     weight_key: Optional[str] = None
     policy_snapshot_id: Optional[str] = None
+    completion_future: Optional[asyncio.Future] = None
 
 
 @dataclass

@@ -357,6 +357,28 @@ def _allocation_regret(graded: List[Dict[str, Any]], args: argparse.Namespace) -
 # --------------------------------------------------------------------------- #
 # Entry point.
 # --------------------------------------------------------------------------- #
+def build_metadata(args: argparse.Namespace, selected_runtime_horizon: int) -> Dict[str, Any]:
+    return {
+        "model": args.model,
+        "checkpoint": args.checkpoint,
+        "dataset": args.dataset,
+        "pilot_branch_factor": args.k0,
+        "likelihood_samples_per_distribution": args.r,
+        "first_phase_tokens": args.first_phase_tokens,
+        "short_horizon": selected_runtime_horizon,
+        "full_horizon": args.full_tokens,
+        "quantile": args.quantile,
+        "seed": args.seed,
+    }
+
+
+def selected_runtime_horizon(args: argparse.Namespace) -> int:
+    short_horizon = int(args.short_horizon if args.short_horizon is not None else args.first_phase_tokens)
+    if short_horizon not in args.horizons:
+        args.horizons = sorted(set(list(args.horizons) + [short_horizon]))
+    return short_horizon
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--api-base", required=True)
@@ -368,9 +390,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--num-prompts", type=int, default=16)
     ap.add_argument("--k0", type=int, default=4, help="pilot children per node")
     ap.add_argument("--r", type=int, default=2, help="continuations per pilot child")
-    ap.add_argument("--horizons", default="8,16,32,64")
+    ap.add_argument("--horizons", default="8,16,32,60")
     ap.add_argument("--full-tokens", type=int, default=512, help="full-continuation length for D_L")
-    ap.add_argument("--first-phase-tokens", type=int, default=120)
+    ap.add_argument("--first-phase-tokens", type=int, default=60)
+    ap.add_argument("--short-horizon", type=int, default=None, help="runtime TV second-phase horizon to validate/load")
     ap.add_argument("--segment-tokens", type=int, default=100, help="segment length when walking depths")
     ap.add_argument("--depths", default="0", help="comma list of node depths to calibrate")
     ap.add_argument("--temperature", type=float, default=0.7)
@@ -390,6 +413,7 @@ def parse_args() -> argparse.Namespace:
     args.horizons = [int(x) for x in str(args.horizons).split(",") if x]
     args.depths = [int(x) for x in str(args.depths).split(",") if x != ""]
     args.quantiles = [float(x) for x in str(args.quantiles).split(",") if x]
+    selected_runtime_horizon(args)
     return args
 
 
@@ -434,7 +458,13 @@ async def amain(args: argparse.Namespace) -> None:
         await client.aclose()
 
     summary = summarize(records, args)
-    out = {"args": {k: v for k, v in vars(args).items()}, "summary": summary, "records": records}
+    runtime_horizon = selected_runtime_horizon(args)
+    out = {
+        "metadata": build_metadata(args, runtime_horizon),
+        "args": {k: v for k, v in vars(args).items()},
+        "summary": summary,
+        "records": records,
+    }
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)

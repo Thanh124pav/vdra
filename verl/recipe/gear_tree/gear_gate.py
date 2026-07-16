@@ -56,7 +56,7 @@ class GearGate:
         n_min: int = 1,
         pilot_branch_factor: Optional[int] = None,
         likelihood_samples_per_distribution: int = 2,
-        root_allocation: bool = True,
+        root_allocation: bool = False,
         skip_near_leaf_expand: bool = True,
         max_depth: Optional[int] = None,
         enable_share: bool = False,
@@ -66,7 +66,7 @@ class GearGate:
         eps_tail_by_depth: Optional[Mapping[int, float]] = None,
         bound_form: str = "linear",
         tv_estimator: str = "tanh",
-        tv_first_phase_tokens: int = 120,
+        tv_first_phase_tokens: int = 60,
         tv_second_phase_tokens: int = 60,
         queue_count: int = 4,
         queue_capacity: int = 8,
@@ -77,6 +77,7 @@ class GearGate:
         budget_mode: str = "fixed_main",
         allocation_proxy: str = "vdra",
         allocation_runtime: str = "online_timeout",
+        artifact_dir: Optional[str] = None,
     ) -> None:
         self.cfg = ThresholdConfig(
             epsilon=epsilon,
@@ -95,6 +96,7 @@ class GearGate:
         if allocation_runtime not in {"online_timeout", "depth_batch"}:
             raise ValueError(f"Unsupported VDRA allocation_runtime: {allocation_runtime}")
         self.allocation_runtime = allocation_runtime
+        self.artifact_dir = artifact_dir
         self.n_min = max(int(n_min), 0)
         self.pilot_branch_factor = pilot_branch_factor
         self.likelihood_samples_per_distribution = max(
@@ -147,6 +149,8 @@ class GearGate:
                 "VDRA pilot length cannot exceed the main segment length "
                 "when pilots are reused as tree children."
             )
+        if self.use_online_allocation and self.queue_timeout_seconds <= 0.0:
+            raise ValueError("VDRA online_timeout requires queue_timeout_seconds > 0 in strict mode")
         if (
             self.k_algorithm == "budget_allocation"
             and self.use_residual_budget
@@ -254,11 +258,15 @@ class GearGate:
             pilot_count=len(result.candidates),
             node=node,
         )
-        pilots = list(result.unique_candidates or result.candidates)
-        node["vdra_pilot_children"] = pilots
-        node["vdra_pilot_children_generated"] = len(result.candidates)
-        node["vdra_pilot_children_reused"] = len(pilots)
-        node["vdra_pilot_children_discarded"] = max(len(result.candidates) - len(pilots), 0)
+        all_pilots = list(result.candidates)
+        reusable_pilots = list(result.unique_candidates or result.candidates)
+        node["vdra_all_pilot_children"] = all_pilots
+        node["vdra_reusable_pilot_children"] = reusable_pilots
+        node["vdra_pilot_children"] = reusable_pilots  # legacy compatibility alias
+        node["vdra_pilot_children_generated"] = len(all_pilots)
+        node["vdra_pilot_children_reused"] = len(reusable_pilots)
+        node["vdra_pilot_children_discarded"] = max(len(all_pilots) - len(reusable_pilots), 0)
+        node["vdra_generation_request_count"] = node.get("vdra_generation_request_count", 0) + len(all_pilots)
         node["gear_predicted_k"] = int(result.predicted_k)
         node["vdra_predicted_k"] = int(result.predicted_k)
         node["gear_pair_tvs"] = {
@@ -290,7 +298,7 @@ class GearGate:
         )
         return {
             "predicted_k": predicted_k,
-            "candidates": pilots,
+            "candidates": reusable_pilots,
             "weight_key": None,
         }
 
@@ -363,11 +371,15 @@ class GearGate:
                     pilot_count=len(result.candidates),
                     node=node,
                 )
-                pilots = list(result.unique_candidates or result.candidates)
-                node["vdra_pilot_children"] = pilots
-                node["vdra_pilot_children_generated"] = len(result.candidates)
-                node["vdra_pilot_children_reused"] = len(pilots)
-                node["vdra_pilot_children_discarded"] = max(len(result.candidates) - len(pilots), 0)
+                all_pilots = list(result.candidates)
+                reusable_pilots = list(result.unique_candidates or result.candidates)
+                node["vdra_all_pilot_children"] = all_pilots
+                node["vdra_reusable_pilot_children"] = reusable_pilots
+                node["vdra_pilot_children"] = reusable_pilots  # legacy compatibility alias
+                node["vdra_pilot_children_generated"] = len(all_pilots)
+                node["vdra_pilot_children_reused"] = len(reusable_pilots)
+                node["vdra_pilot_children_discarded"] = max(len(all_pilots) - len(reusable_pilots), 0)
+                node["vdra_generation_request_count"] = node.get("vdra_generation_request_count", 0) + len(all_pilots)
                 node["gear_predicted_k"] = int(result.predicted_k)
                 node["vdra_predicted_k"] = int(result.predicted_k)
                 node["gear_pair_tvs"] = {

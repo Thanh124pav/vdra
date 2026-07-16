@@ -35,6 +35,7 @@ from treetune.gear.online_budget import (
 from treetune.gear.tv_estimators import ConditionalTVEstimator
 from treetune.gear.triggers import Action
 from treetune.gear.vllm_scorer import VLLMLogprobClient, make_lp_scorer
+from vdra_core.logging_schema import validate_node_accounting, write_node_accounting
 
 logger = get_logger(__name__)
 
@@ -74,7 +75,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
         gear_generation_mode: str = "single_request",
         gear_pilot_branch_factor: int = 8,
         gear_likelihood_samples_per_distribution: int = 2,
-        gear_tv_subnode_max_tokens: int = 120,
+        gear_tv_subnode_max_tokens: int = 60,
         gear_tv_second_phase_tokens: int = 60,
         gear_tv_includes_half_factor: bool = True,
         gear_budget_queue_capacity: int = 8,
@@ -516,6 +517,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
         underallocated_by_depth: Dict[int, int] = {}
         variance_seconds_by_depth: Dict[int, float] = {}
         allocation_seconds_by_depth: Dict[int, float] = {}
+        queue_flush_records: List[Dict[str, Any]] = []
         expansion_seconds_by_depth: Dict[int, float] = {}
         branch_factor_by_depth: Dict[int, int] = {}
         generation_request_count = 0
@@ -824,23 +826,26 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
 
         async def _handle_queue_flush(result) -> None:
             nonlocal allocation_seconds_by_depth
-            t_alloc = time.time()
-            allocation_seconds_by_depth[-1] = allocation_seconds_by_depth.get(-1, 0.0) + (time.time() - t_alloc)
+            queue_flush_records.append(result.to_record())
+            allocation_seconds_by_depth[-1] = allocation_seconds_by_depth.get(-1, 0.0) + result.allocation_seconds
             for item in result.items:
                 node = item.node
                 node_id = _node_id(node, "unknown")
                 allocated = int(result.summary.allocations.get(node_id, 0))
-                node["gear_allocated_branch_factor"] = allocated
-                node["vdra_base_k"] = result.summary.base_allocations[node_id]
-                node["vdra_cap_k"] = result.summary.cap_allocations[node_id]
-                node["vdra_saved_k"] = result.summary.saved_allocations[node_id]
-                node["vdra_unmet_demand"] = result.summary.unmet_demands[node_id]
-                node["vdra_additional_k"] = result.summary.additional_allocations[node_id]
-                node["vdra_allocated_k"] = allocated
+                write_node_accounting(
+                    node,
+                    default_k=item.default_branch_factor,
+                    predicted_k=int(node["vdra_predicted_k"]),
+                    allocated_k=allocated,
+                    k_min=self.gear_n_min,
+                    dispersion_C=float(node.get("vdra_dispersion_C", 0.0) or 0.0),
+                    allocation_weight=result.summary.weights[node_id],
+                )
+                if self.gear_strict_vdra:
+                    validate_node_accounting(node, k_min=self.gear_n_min)
                 node["gear_queue_base_budget"] = item.default_branch_factor
                 node["gear_queue_total_budget"] = result.total_budget
                 node["gear_queue_reserve_draw"] = result.reserve_draw
-                node["gear_budget_weight"] = float(result.summary.weights.get(node_id, 0.0))
                 await _expand_parent(
                     node,
                     depth=item.depth,
@@ -1054,6 +1059,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
         tree["gear_underallocated_rollouts_by_depth"] = dict(underallocated_by_depth)
         tree["gear_variance_seconds_by_depth"] = dict(variance_seconds_by_depth)
         tree["gear_allocation_seconds_by_depth"] = dict(allocation_seconds_by_depth)
+        tree["vdra_queue_flush_records"] = queue_flush_records
         tree["gear_expansion_seconds_by_depth"] = dict(expansion_seconds_by_depth)
         tree["gear_budget_overhead_mode"] = self.gear_budget_overhead_mode
         tree["gear_allocation_mode"] = self.gear_allocation_mode

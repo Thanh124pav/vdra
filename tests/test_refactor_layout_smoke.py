@@ -89,10 +89,11 @@ def test_gear_defaults_expose_only_online_gear_knobs():
     overlay = (CONFIGS / "gear_overlay.libsonnet").read_text()
 
     assert "skip_near_leaf_expand: true" in defaults
-    assert "n_min: 0" in defaults
+    assert "n_min: 1" in defaults
     assert "score_retry_attempts: 5" in defaults
     assert "budget_queue_count: 4" in defaults
     assert "budget_queue_timeout_seconds: 1.0" in defaults
+    assert "tv_subnode_max_tokens: 60" in defaults
     assert "root_allocation: true" in defaults
     assert "score_retry_backoff_seconds: 0.5" in defaults
     assert "gear_k_algorithm: $.gear.k_algorithm" in overlay

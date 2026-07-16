@@ -180,3 +180,124 @@ def test_retained_pilot_is_completed_to_main_segment_length():
     assert samples[0].num_tokens == 3
     assert calls == [([1, 2, 3], 1, 2)]
     assert node["vdra_pilot_completion_generated_tokens"] == 2
+
+
+
+def test_online_timeout_queue_flushes_before_final_drain():
+    from recipe.gear_tree.tree_rollout import async_build_tree
+
+    class DistinctPilotExpander:
+        async def expand(self, *, current_node, prefix, depth, max_tokens, branch_factor):
+            if prefix == "PROMPT":
+                return [
+                    {
+                        "text": f" p{i}",
+                        "full_text": f"{prefix} p{i}",
+                        "finish_reason": "length",
+                        "sum_logprobs": -0.1 * (i + 1),
+                        "num_tokens": 1,
+                        "response_token_ids": [10 + i],
+                        "actor_shifted_log_probs": [-0.1],
+                        "full_token_ids": [7, 10 + i],
+                    }
+                    for i in range(int(branch_factor))
+                ]
+            suffix = "s0" if prefix.endswith("p0") else "s1"
+            return [
+                {
+                    "text": f" {suffix}_{i}",
+                    "full_text": f"{prefix} {suffix}_{i}",
+                    "finish_reason": "stop",
+                    "sum_logprobs": -0.2,
+                    "num_tokens": 1,
+                    "response_token_ids": [20 + i],
+                    "actor_shifted_log_probs": [-0.2],
+                    "full_token_ids": list(current_node.get("full_token_ids", [])) + [20 + i],
+                }
+                for i in range(int(branch_factor))
+            ]
+
+    class DistinctScorer:
+        async def score_one(self, prefix, y):
+            own = (prefix.endswith("p0") and "s0" in y) or (prefix.endswith("p1") and "s1" in y)
+            return -0.1 if own else -20.0
+
+    async def segment_fn(prompt_ids, branch_factor, max_tokens):
+        return [
+            types.SimpleNamespace(
+                token_ids=[30 + i],
+                text=f" c{i}",
+                finish_reason="stop",
+                logprobs=[-0.3],
+                sum_logprobs=-0.3,
+                num_tokens=1,
+            )
+            for i in range(int(branch_factor))
+        ]
+
+    gate = GearGate(
+        k_algorithm="budget_allocation",
+        scorer=DistinctScorer(),
+        pilot_branch_factor=2,
+        likelihood_samples_per_distribution=1,
+        queue_capacity=8,
+        queue_timeout_seconds=0.001,
+        tv_first_phase_tokens=1,
+        tv_second_phase_tokens=1,
+        skip_near_leaf_expand=False,
+        root_allocation=True,
+        max_depth=1,
+    )
+    tree = asyncio.run(
+        async_build_tree(
+            "PROMPT",
+            [7],
+            {"_treetune__idx": "timeout"},
+            tree_shape=[1],
+            M=3,
+            segment_fn=segment_fn,
+            grade_fn=lambda query, response, inst: 1.0,
+            gear_gate=gate,
+            gear_node_expander=DistinctPilotExpander(),
+        )
+    )
+
+    assert tree["vdra_predicted_k"] == 2
+    assert tree["vdra_unmet_demand"] == 1
+    assert tree["vdra_flush_reason"] == "timeout"
+    assert tree["gear_queue_timeout_flush_count"] == 1
+    assert tree["vdra_queue_final_drain_count"] == 0
+    assert "reward" in tree
+    assert all("reward" in child for child in tree.get("children", []))
+
+
+
+def test_duplicate_pilots_count_all_generated_for_compute_accounting():
+    from recipe.gear_tree.tree_rollout import _expand_reusing_pilots
+
+    async def segment_fn(prompt_ids, branch_factor, max_tokens):
+        return []
+
+    all_pilots = [
+        {
+            "text": f" p{i}",
+            "finish_reason": "length",
+            "response_token_ids": [10 + i],
+            "actor_shifted_log_probs": [-0.1],
+            "sum_logprobs": -0.1,
+            "num_tokens": 1,
+        }
+        for i in range(8)
+    ]
+    node = {
+        "full_token_ids": [1, 2],
+        "vdra_all_pilot_children": all_pilots,
+        "vdra_reusable_pilot_children": all_pilots[:3],
+    }
+    samples = asyncio.run(_expand_reusing_pilots(node, 2, None, segment_fn))
+    assert len(samples) == 2
+    assert node["vdra_pilot_children_generated"] == 8
+    assert node["vdra_pilot_children_reused"] == 2
+    assert node["vdra_pilot_children_discarded"] == 6
+    assert node["vdra_pilot_reuse_rate"] == 0.25
+    assert node["vdra_pilot_generated_tokens"] == 8

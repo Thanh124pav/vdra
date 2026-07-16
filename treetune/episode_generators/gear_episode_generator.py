@@ -45,6 +45,8 @@ from treetune.gear.logging_helpers import (
     render_md_section,
     to_jsonl_record,
 )
+from vdra_core.logging_schema import persist_vdra_artifacts
+
 from treetune.gear.tree_policy_logging import (
     build_run_manifest,
     branch_factors_from_shape,
@@ -477,6 +479,23 @@ class GEAREpisodeGenerator(HybridEpisodeGenerator):
     def _dump_full_tree_to_disk(self, tree, tree_idx: int, question_id) -> None:
         manifest = self._build_run_manifest_from_tree(tree)
         self._write_run_manifest_once(manifest)
+        base = self._resolve_demos_dir()
+        if base is not False:
+            try:
+                persist_vdra_artifacts(
+                    base,
+                    tree,
+                    run_id=str(tree.get("run_id", "treetune")),
+                    tree_id=str(question_id),
+                    queue_flushes=tree.get("vdra_queue_flush_records") or [],
+                    run_manifest={
+                        **manifest,
+                        "budget_claim": "fixed main expansion budget; pilot and scoring overhead reported separately",
+                        "compute_proxy_definition": "pilot decode tokens + main-expansion decode tokens + scored prompt tokens + scored continuation tokens",
+                    },
+                )
+            except Exception as exc:
+                logger.warning(f"GEAR: failed to write canonical VDRA artifacts: {exc}")
         if not should_log_full_tree(
             tree_idx,
             every_n_trees=self.gear_full_tree_demo_every_n_trees,

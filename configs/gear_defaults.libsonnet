@@ -18,7 +18,7 @@
     generation_mode: 'single_request',
     pilot_branch_factor: 8,
     likelihood_samples_per_distribution: 2,
-    tv_subnode_max_tokens: 120,
+    tv_subnode_max_tokens: 60,
     tv_second_phase_tokens: 60,
     tv_includes_half_factor: true,
     n_min: 1,

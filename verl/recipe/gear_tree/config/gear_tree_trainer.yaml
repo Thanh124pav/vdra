@@ -92,9 +92,10 @@ gear_tree:
     pilot_branch_factor: 8
     likelihood_samples_per_distribution: 2
 
-    # Estimate root dispersion bounds and allocate depth-0 budget across the
-    # minibatch's roots before building each tree.
-    root_allocation: true
+    # Current verl runtime owns one queue manager per tree; do not claim
+    # cross-root minibatch allocation until that shared context is implemented.
+    root_allocation: false
+    allocation_scope: one_tree
 
     skip_near_leaf_expand: true
 
@@ -117,7 +118,7 @@ gear_tree:
     tv_estimator: tanh
 
     # Short-continuation lengths: first phase = pilot segment, second = scored block (m).
-    tv_first_phase_tokens: 120
+    tv_first_phase_tokens: 60
 
     tv_second_phase_tokens: 60
 

@@ -8,6 +8,8 @@ import pytest
 
 from treetune.gear import budget_allocation as treetune_alloc
 from vdra_core import allocate_branch_factors, node_allocated_k, summarize_vdra_tree, validate_node_accounting
+from vdra_core.calibration import load_tail_calibration
+from vdra_core.logging_schema import persist_vdra_artifacts
 from vdra_core.online_budget import (
     OnlineQueueItem,
     RootQueueManager,
@@ -224,6 +226,70 @@ def test_allocation_timing_wraps_allocator_call(monkeypatch):
     assert flushed[0].to_record()["allocation_seconds"] >= 0.02
 
 
+def test_default_verl_config_passes_strict_startup_invariants():
+    import yaml
+
+    cfg_path = Path(__file__).resolve().parents[1] / "verl" / "recipe" / "gear_tree" / "config" / "gear_tree_trainer.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    gear_tree = cfg["gear_tree"]
+    gear = gear_tree["gear"]
+    tree_shape = gear_tree["tree_shape"]
+    assert gear["tv_first_phase_tokens"] <= gear_tree["segment_length"]
+    assert gear["pilot_branch_factor"] > max(tree_shape)
+    assert gear["queue_timeout_seconds"] > 0
+    assert gear["root_allocation"] is False
+    assert gear["allocation_scope"] == "one_tree"
+
+
+def test_calibration_artifact_round_trips_through_strict_loader(tmp_path):
+    from argparse import Namespace
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "calibrate_tail_divergence.py"
+    spec = importlib.util.spec_from_file_location("vdra_calibration_roundtrip", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    args = Namespace(
+        model="m", checkpoint="ckpt", dataset="math", k0=8, r=2,
+        first_phase_tokens=60, short_horizon=60, full_tokens=512,
+        quantile=0.99, seed=0, horizons=[60],
+    )
+    metadata = module.build_metadata(args, module.selected_runtime_horizon(args))
+    artifact = {
+        "metadata": metadata,
+        "args": vars(args),
+        "summary": {
+            "per_horizon": {
+                "60": {
+                    "eps_tail_quantiles": {"0.99": 0.12},
+                    "eps_tail_by_depth": {"0": {"0.99": 0.1}},
+                }
+            }
+        },
+        "records": [],
+    }
+    path = tmp_path / "calibration.json"
+    path.write_text(json.dumps(artifact), encoding="utf-8")
+    loaded = load_tail_calibration(
+        str(path), model="m", checkpoint="ckpt", dataset="math",
+        pilot_branch_factor=8, likelihood_samples_per_distribution=2,
+        short_horizon=60, quantile=0.99, strict_metadata=True,
+    )
+    assert loaded["eps_tail"] == pytest.approx(0.12)
+    for kwargs in [
+        {"pilot_branch_factor": 7},
+        {"likelihood_samples_per_distribution": 3},
+        {"short_horizon": 32},
+    ]:
+        base = dict(
+            model="m", checkpoint="ckpt", dataset="math",
+            pilot_branch_factor=8, likelihood_samples_per_distribution=2,
+            short_horizon=60, quantile=0.99, strict_metadata=True,
+        )
+        base.update(kwargs)
+        with pytest.raises(ValueError):
+            load_tail_calibration(str(path), **base)
+
+
 def test_compute_accounting_consistency_summary():
     tree = {
         "gear_algorithm_mode": "budget_allocation",
@@ -232,15 +298,46 @@ def test_compute_accounting_consistency_summary():
         "vdra_allocated_k": 4,
         "vdra_pilot_generated_tokens": 3,
         "vdra_main_expansion_generated_tokens": 7,
+        "vdra_generation_request_count": 2,
         "vdra_likelihood_scored_prompt_tokens": 5,
         "vdra_likelihood_scored_continuation_tokens": 2,
         "children": [],
     }
     summary = summarize_vdra_tree(tree)
     assert summary["vdra_total_generated_tokens"] == 10
-    assert summary["vdra_total_model_forward_calls"] == (
-        summary["vdra_generation_forward_calls"] + summary["vdra_scoring_forward_calls"]
+    assert summary["vdra_generation_decode_tokens"] == 10
+    assert summary["vdra_total_scored_tokens"] == 7
+    assert summary["vdra_generation_request_count"] == 2
+    assert summary["vdra_token_equivalent_compute_proxy"] == 17
+    assert "vdra_generation_forward_calls" not in summary
+    assert "vdra_total_model_forward_calls" not in summary
+
+
+def test_persist_vdra_artifacts_writes_canonical_files(tmp_path):
+    node = _node("root", 6, 8, 1.0)
+    allocate_branch_factors([node], total_budget=6, n_min=1)
+    node.update({
+        "depth": 0,
+        "vdra_pilot_children_generated": 8,
+        "vdra_pilot_children_reused": 2,
+        "vdra_pilot_children_discarded": 6,
+        "vdra_pilot_generated_tokens": 24,
+        "vdra_main_expansion_generated_tokens": 4,
+        "vdra_total_generated_tokens": 28,
+        "vdra_likelihood_scored_prompt_tokens": 3,
+        "vdra_likelihood_scored_continuation_tokens": 5,
+        "vdra_total_scored_tokens": 8,
+        "children": [{} for _ in range(node["vdra_allocated_k"])],
+    })
+    persist_vdra_artifacts(
+        tmp_path, node, run_id="r", tree_id="t",
+        queue_flushes=[{"queue_id": 0, "flush_reason": "timeout"}],
+        run_manifest={"algorithm_executed": "test"},
     )
+    assert (tmp_path / "nodes.jsonl").read_text(encoding="utf-8").strip()
+    assert json.loads((tmp_path / "queue_flushes.jsonl").read_text(encoding="utf-8"))["flush_reason"] == "timeout"
+    assert json.loads((tmp_path / "compute_summary.json").read_text(encoding="utf-8"))["token_equivalent_compute_proxy"] == 36
+    assert json.loads((tmp_path / "run_manifest.json").read_text(encoding="utf-8"))["algorithm_executed"] == "test"
 
 
 

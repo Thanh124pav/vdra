@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
-from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional
+from pathlib import Path
+from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence
 
 
 ALLOCATED_K_ALIASES = (
@@ -146,6 +148,7 @@ def summarize_vdra_tree(tree: Mapping[str, Any]) -> Dict[str, float]:
         "vdra_additional_children_generated": 0.0,
         "vdra_pilot_generated_tokens": 0.0,
         "vdra_main_expansion_generated_tokens": 0.0,
+        "vdra_generation_request_count": 0.0,
         "vdra_scoring_request_count": 0.0,
         "vdra_scoring_prefill_tokens": 0.0,
         "vdra_scoring_continuation_tokens": 0.0,
@@ -166,6 +169,7 @@ def summarize_vdra_tree(tree: Mapping[str, Any]) -> Dict[str, float]:
         totals["vdra_additional_children_generated"] += float(node.get("vdra_additional_children_generated", 0) or 0)
         totals["vdra_pilot_generated_tokens"] += float(node.get("vdra_pilot_generated_tokens", 0) or 0)
         totals["vdra_main_expansion_generated_tokens"] += float(node.get("vdra_main_expansion_generated_tokens", 0) or 0)
+        totals["vdra_generation_request_count"] += float(node.get("vdra_generation_request_count", 0) or 0)
         totals["vdra_scoring_request_count"] += float(node.get("vdra_likelihood_scoring_requests", 0) or 0)
         totals["vdra_scoring_prefill_tokens"] += float(node.get("vdra_likelihood_scored_prompt_tokens", 0) or 0)
         totals["vdra_scoring_continuation_tokens"] += float(node.get("vdra_likelihood_scored_continuation_tokens", 0) or 0)
@@ -180,13 +184,149 @@ def summarize_vdra_tree(tree: Mapping[str, Any]) -> Dict[str, float]:
     totals["vdra_total_scored_tokens"] = (
         totals["vdra_scoring_prefill_tokens"] + totals["vdra_scoring_continuation_tokens"]
     )
-    totals["vdra_generation_forward_calls"] = totals["vdra_total_generated_tokens"]
-    totals["vdra_scoring_forward_calls"] = totals["vdra_scoring_request_count"]
-    totals["vdra_total_model_forward_calls"] = (
-        totals["vdra_generation_forward_calls"] + totals["vdra_scoring_forward_calls"]
+    totals["vdra_generation_decode_tokens"] = totals["vdra_total_generated_tokens"]
+    totals["vdra_token_equivalent_compute_proxy"] = (
+        totals["vdra_generation_decode_tokens"] + totals["vdra_total_scored_tokens"]
     )
-    # Compute proxy: decode token count plus scored prefill/continuation tokens.
-    totals["vdra_total_forward_pass_cost"] = totals["vdra_total_generated_tokens"] + totals["vdra_total_scored_tokens"]
+    # Back-compat alias with explicit units; not a forward-call count.
+    totals["vdra_total_forward_pass_cost"] = totals["vdra_token_equivalent_compute_proxy"]
     generated = totals["vdra_pilot_children_generated"]
     totals["vdra_pilot_reuse_rate"] = totals["vdra_pilot_children_reused"] / generated if generated else 0.0
     return totals
+
+
+NODE_RECORD_FIELDS = (
+    "run_id",
+    "tree_id",
+    "node_id",
+    "parent_id",
+    "depth",
+    "default_k",
+    "predicted_k",
+    "cap_k",
+    "base_k",
+    "saved_k",
+    "unmet_demand",
+    "dispersion_C",
+    "allocation_weight",
+    "additional_k",
+    "allocated_k",
+    "reserve_contribution",
+    "reserve_received",
+    "pilot_children_generated",
+    "pilot_children_reused",
+    "pilot_children_discarded",
+    "additional_children_generated",
+    "pilot_generated_tokens",
+    "main_expansion_generated_tokens",
+    "scored_tokens",
+    "queue_id",
+    "queue_wait_seconds",
+    "flush_reason",
+)
+
+
+def node_record(
+    node: Mapping[str, Any],
+    *,
+    run_id: Optional[str] = None,
+    tree_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return one canonical JSONL node record for allocation-eligible parents."""
+
+    return {
+        "run_id": run_id,
+        "tree_id": tree_id,
+        "node_id": node_id(node),
+        "parent_id": node.get("gear_parent_segment_id") or node.get("parent_id"),
+        "depth": int(node.get("depth", node.get("gear_depth", 0)) or 0),
+        "default_k": int(node.get("vdra_default_k", 0) or 0),
+        "predicted_k": int(node.get("vdra_predicted_k", 0) or 0),
+        "cap_k": int(node.get("vdra_cap_k", 0) or 0),
+        "base_k": int(node.get("vdra_base_k", 0) or 0),
+        "saved_k": int(node.get("vdra_saved_k", 0) or 0),
+        "unmet_demand": int(node.get("vdra_unmet_demand", 0) or 0),
+        "dispersion_C": float(node.get("vdra_dispersion_C", 0.0) or 0.0),
+        "allocation_weight": float(node.get("vdra_allocation_weight", node.get("gear_budget_weight", 0.0)) or 0.0),
+        "additional_k": int(node.get("vdra_additional_k", 0) or 0),
+        "allocated_k": int(node.get("vdra_allocated_k", node_allocated_k(node) or 0) or 0),
+        "reserve_contribution": int(node.get("vdra_reserve_contribution", 0) or 0),
+        "reserve_received": int(node.get("vdra_reserve_received", 0) or 0),
+        "pilot_children_generated": int(node.get("vdra_pilot_children_generated", 0) or 0),
+        "pilot_children_reused": int(node.get("vdra_pilot_children_reused", 0) or 0),
+        "pilot_children_discarded": int(node.get("vdra_pilot_children_discarded", 0) or 0),
+        "additional_children_generated": int(node.get("vdra_additional_children_generated", 0) or 0),
+        "pilot_generated_tokens": int(node.get("vdra_pilot_generated_tokens", 0) or 0),
+        "main_expansion_generated_tokens": int(node.get("vdra_main_expansion_generated_tokens", 0) or 0),
+        "scored_tokens": int(node.get("vdra_total_scored_tokens", 0) or 0),
+        "queue_id": node.get("vdra_queue_id"),
+        "queue_wait_seconds": float(node.get("vdra_queue_wait_seconds", 0.0) or 0.0),
+        "flush_reason": node.get("vdra_flush_reason"),
+    }
+
+
+def queue_flush_record(
+    flush_record: Mapping[str, Any],
+    *,
+    run_id: Optional[str] = None,
+    tree_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    out = {"run_id": run_id, "tree_id": tree_id}
+    out.update(dict(flush_record))
+    return out
+
+
+def write_json(path: str | Path, payload: Mapping[str, Any]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+
+
+def append_jsonl(path: str | Path, records: Iterable[Mapping[str, Any]]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(dict(record), sort_keys=True, default=str) + "\n")
+
+
+def allocation_node_records(
+    tree: Mapping[str, Any],
+    *,
+    run_id: Optional[str] = None,
+    tree_id: Optional[str] = None,
+) -> Sequence[Dict[str, Any]]:
+    return [
+        node_record(node, run_id=run_id, tree_id=tree_id)
+        for node in iter_tree_nodes(tree)
+        if "vdra_default_k" in node
+    ]
+
+
+def build_compute_summary(tree: Mapping[str, Any]) -> Dict[str, Any]:
+    raw = summarize_vdra_tree(tree)
+    return {
+        key.removeprefix("vdra_"): value
+        for key, value in raw.items()
+    }
+
+
+def persist_vdra_artifacts(
+    output_dir: str | Path,
+    tree: Mapping[str, Any],
+    *,
+    run_id: Optional[str] = None,
+    tree_id: Optional[str] = None,
+    queue_flushes: Optional[Iterable[Mapping[str, Any]]] = None,
+    run_manifest: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Persist the canonical VDRA runtime records for one tree/run."""
+
+    out = Path(output_dir)
+    append_jsonl(out / "nodes.jsonl", allocation_node_records(tree, run_id=run_id, tree_id=tree_id))
+    append_jsonl(
+        out / "queue_flushes.jsonl",
+        [queue_flush_record(r, run_id=run_id, tree_id=tree_id) for r in (queue_flushes or [])],
+    )
+    write_json(out / "compute_summary.json", build_compute_summary(tree))
+    write_json(out / "run_manifest.json", dict(run_manifest or {}))

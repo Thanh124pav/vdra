@@ -704,11 +704,11 @@ The solution is optimal for the continuous relaxation of the current allocation 
 ### 10.1 Pruning, Demand Caps, and Residual Reallocation
 
 VDRA uses two distinct node signals. The predicted useful branch demand
-\(\widehat k_s^{\mathrm{need}}\) controls pruning and provides an upper demand
-cap. The dispersion bound \(C_s\) controls how saved branches are prioritized.
+$\widehat k_s^{\mathrm{need}}$ controls pruning and provides an upper demand
+cap. The dispersion bound $C_s$ controls how saved branches are prioritized.
 They must not be merged.
 
-For default branch factor \(n_s^{\mathrm{default}}\) and \(k_{\min}=1\), define
+For default branch factor $n_s^{\mathrm{default}}$ and $k_{\min}=1$, define
 
 $$
 k_s^{\mathrm{cap}}=\max(k_{\min},\widehat k_s^{\mathrm{need}}),\qquad
@@ -722,7 +722,7 @@ r_s=n_s^{\mathrm{default}}-k_s^{\mathrm{base}},\qquad
 d_s=\max(k_s^{\mathrm{cap}}-k_s^{\mathrm{base}},0).
 $$
 
-Saved branches enter a shared residual pool. For a queue \(\mathcal Q\), VDRA
+Saved branches enter a shared residual pool. For a queue $\mathcal Q$, VDRA
 solves the bounded problem
 
 $$
@@ -740,7 +740,7 @@ k_s^\star=\operatorname{clip}
 k_s^{\mathrm{base}},k_s^{\mathrm{cap}}\right),
 $$
 
-where the internal dual variable \(\lambda_{\mathrm{dual}}>0\) is chosen so
+where the internal dual variable $\lambda_{\mathrm{dual}}>0$ is chosen so
 that
 
 $$
@@ -750,7 +750,7 @@ $$
 
 This dual variable is not a public hyperparameter and is unrelated to the
 historical threshold called `budget_lambda`. The VDRA allocation priority is
-always \(\sqrt{C_s}\); no term of the form \(\sqrt{C_s-\lambda}\) is used.
+always $\sqrt{C_s}$; no term of the form $\sqrt{C_s-\lambda}$ is used.
 
 Integer allocations use capped largest-remainder rounding. Every node records
 `default_k`, `predicted_k`, `base_k`, `saved_k`, `unmet_demand`,

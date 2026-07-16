@@ -291,7 +291,7 @@ async def async_build_tree(
 
 def _retained_pilot_samples(node: Dict[str, Any], allocated_k: int) -> List[SegmentSample]:
     samples: List[SegmentSample] = []
-    for candidate in list(node.get("vdra_pilot_children") or [])[:allocated_k]:
+    for candidate in list(node.get("vdra_reusable_pilot_children") or node.get("vdra_pilot_children") or [])[:allocated_k]:
         token_ids = candidate.get("response_token_ids")
         if token_ids is None:
             parent_ids = list(node.get("full_token_ids") or [])
@@ -359,16 +359,18 @@ async def _expand_reusing_pilots(
         if missing
         else []
     )
-    generated = len(node.get("vdra_pilot_children") or [])
+    all_pilots = list(node.get("vdra_all_pilot_children") or node.get("vdra_pilot_children") or [])
+    generated = len(all_pilots)
     node["vdra_pilot_children_generated"] = generated
     node["vdra_pilot_generated_tokens"] = sum(
         len(candidate.get("response_token_ids") or [])
-        for candidate in node.get("vdra_pilot_children") or []
+        for candidate in all_pilots
     )
     node["vdra_pilot_completion_generated_tokens"] = completion_tokens
     node["vdra_pilot_children_reused"] = len(completed)
     node["vdra_pilot_children_discarded"] = max(generated - len(completed), 0)
     node["vdra_additional_children_generated"] = len(additional)
+    node["vdra_generation_request_count"] = node.get("vdra_generation_request_count", 0) + int(bool(completion_tokens)) + len(additional)
     node["vdra_main_expansion_generated_tokens"] = completion_tokens + sum(
         len(sample.token_ids) for sample in additional
     )
@@ -395,6 +397,13 @@ async def async_build_tree_online_alloc(
     """Online VDRA tree builder using one long-lived queue manager per tree."""
 
     from recipe.gear_tree.gear_core.gear.online_budget import OnlineQueueItem
+    from vdra_core.logging_schema import (
+        allocation_node_records,
+        persist_vdra_artifacts,
+        summarize_vdra_tree,
+        validate_node_accounting,
+        write_node_accounting,
+    )
 
     t0 = time.time()
     if max_depth is None:
@@ -404,7 +413,14 @@ async def async_build_tree_online_alloc(
         segment_length=M,
     )
     policy_snapshot_id = str(data_instance.get("_treetune__idx", "tree"))
+    run_id = str(data_instance.get("run_id", policy_snapshot_id))
+    tree_id = str(data_instance.get("tree_id", policy_snapshot_id))
     manager = gear_gate.make_queue_manager(policy_snapshot_id=policy_snapshot_id)
+    poll_interval = max(min(float(manager.timeout_seconds) / 4.0, 0.1), 0.01)
+    stop_timeout_worker = asyncio.Event()
+    pending_futures: List[asyncio.Future] = []
+    queue_flush_records: List[Dict[str, Any]] = []
+    worker_error: Optional[BaseException] = None
 
     tree: Dict[str, Any] = {
         "text": root_prompt_text,
@@ -442,22 +458,55 @@ async def async_build_tree_online_alloc(
             child["num_tokens"] = int(sample.num_tokens)
         return child
 
+    def _raise_worker_error() -> None:
+        if worker_error is not None:
+            raise RuntimeError("VDRA queue timeout worker failed") from worker_error
+
     async def _handle_flush(result) -> None:
+        queue_flush_records.append(result.to_record())
         for item in result.items:
             node = item.node
-            node_key = str(node.get("gear_segment_id"))
-            allocated = int(result.summary.allocations.get(node_key, node.get("vdra_allocated_k", 0)))
-            node["vdra_allocation_seconds"] = result.allocation_seconds
-            await _expand_parent(
-                node,
-                depth=item.depth,
-                allocated_branch_factor=allocated,
-                default_branch_factor=item.default_branch_factor,
-            )
+            try:
+                node_key = str(node.get("gear_segment_id"))
+                allocated = int(result.summary.allocations.get(node_key, node.get("vdra_allocated_k", 0)))
+                node["vdra_allocation_seconds"] = result.allocation_seconds
+                await _expand_parent(
+                    node,
+                    depth=item.depth,
+                    allocated_branch_factor=allocated,
+                    default_branch_factor=item.default_branch_factor,
+                )
+                if "reward" not in node:
+                    raise RuntimeError(f"VDRA queued node {node_key} returned without reward")
+                if item.completion_future is not None and not item.completion_future.done():
+                    item.completion_future.set_result(node)
+            except Exception as exc:
+                if item.completion_future is not None and not item.completion_future.done():
+                    item.completion_future.set_exception(exc)
+                raise
 
     async def _flush_ready() -> None:
+        _raise_worker_error()
         for result in await manager.flush_ready():
             await _handle_flush(result)
+        _raise_worker_error()
+
+    async def _queue_timeout_worker() -> None:
+        nonlocal worker_error
+        try:
+            while not stop_timeout_worker.is_set():
+                await asyncio.sleep(poll_interval)
+                for result in await manager.flush_ready():
+                    await _handle_flush(result)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # propagate to all waiters and main task
+            worker_error = exc
+            for future in pending_futures:
+                if not future.done():
+                    future.set_exception(exc)
+
+    timeout_worker = asyncio.create_task(_queue_timeout_worker())
 
     async def _drain_final() -> None:
         while True:
@@ -468,7 +517,9 @@ async def async_build_tree_online_alloc(
                 await _handle_flush(result)
 
     async def _process_expandable(node: Dict[str, Any], depth: int) -> None:
+        _raise_worker_error()
         if depth >= max_depth:
+            node["vdra_expansion_skipped_terminal"] = True
             node["reward"] = float(grade_fn(node["full_text"], node["text"], data_instance))
             node["leaf"] = True
             return
@@ -481,6 +532,8 @@ async def async_build_tree_online_alloc(
                 allocated_branch_factor=default_bf,
                 default_branch_factor=default_bf,
             )
+            if "reward" not in node:
+                raise RuntimeError(f"VDRA direct node {node.get('gear_segment_id')} returned without reward")
             return
 
         try:
@@ -506,21 +559,47 @@ async def async_build_tree_online_alloc(
                 allocated_branch_factor=int(node.get("vdra_base_k", default_bf)),
                 default_branch_factor=default_bf,
             )
+            if "reward" not in node:
+                raise RuntimeError(f"VDRA direct node {node.get('gear_segment_id')} returned without reward")
             return
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        pending_futures.append(future)
         manager.enqueue(
             OnlineQueueItem(
                 node=node,
                 default_branch_factor=default_bf,
                 depth=depth,
                 policy_snapshot_id=policy_snapshot_id,
+                completion_future=future,
             )
         )
         await _flush_ready()
+        if not future.done():
+            # If this coroutine itself is inside a flush handler, the background
+            # worker cannot make progress until we yield past the timeout.
+            await asyncio.sleep(float(manager.timeout_seconds) + poll_interval)
+            await _flush_ready()
+        await future
+        if "reward" not in node:
+            raise RuntimeError(f"VDRA queued node {node.get('gear_segment_id')} returned without reward")
 
     async def _expand_parent(
         node: Dict[str, Any], *, depth: int, allocated_branch_factor: int, default_branch_factor: int
     ) -> None:
         allocated_branch_factor = max(int(allocated_branch_factor), 0)
+        if "vdra_default_k" not in node:
+            write_node_accounting(
+                node,
+                default_k=default_branch_factor,
+                predicted_k=default_branch_factor,
+                allocated_k=allocated_branch_factor,
+                k_min=getattr(gear_gate, "n_min", 1),
+                dispersion_C=0.0,
+            )
+        validate_node_accounting(node, k_min=getattr(gear_gate, "n_min", 1))
+        node["vdra_generation_request_count"] = node.get("vdra_generation_request_count", 0)
         if allocated_branch_factor <= 0:
             node["reward"] = float(grade_fn(node["full_text"], node["text"], data_instance))
             node["leaf"] = True
@@ -537,6 +616,7 @@ async def async_build_tree_online_alloc(
         for child in children:
             child_depth = depth + 1
             if child["finish_reason"] != "length" or child_depth >= max_depth:
+                child["vdra_expansion_skipped_terminal"] = True
                 child["reward"] = float(grade_fn(node["full_text"], child["full_text"], data_instance))
                 child["leaf"] = True
             else:
@@ -546,8 +626,15 @@ async def async_build_tree_online_alloc(
         node["reward"] = float(np.mean(child_rewards)) if child_rewards else 0.0
         node["reward_std"] = float(np.std(child_rewards)) if child_rewards else 0.0
 
-    await _process_expandable(tree, 0)
+    try:
+        await _process_expandable(tree, 0)
+    finally:
+        stop_timeout_worker.set()
+        await timeout_worker
+
     await _drain_final()
+    if any(not future.done() for future in pending_futures):
+        raise RuntimeError("VDRA final drain left pending queue futures")
 
     def backprop(node: Dict[str, Any]) -> None:
         children = node.get("children") or []
@@ -559,6 +646,28 @@ async def async_build_tree_online_alloc(
             node["reward_std"] = float(np.std(child_rewards))
 
     backprop(tree)
+
+    if getattr(gear_gate, "strict_vdra", True):
+        if manager.reserve_pool.contributed != manager.reserve_pool.consumed + manager.reserve_pool.value:
+            raise RuntimeError("VDRA reserve invariant failed")
+        if any(queue.items for queue in manager.queues):
+            raise RuntimeError("VDRA queue invariant failed: queues are not empty")
+        for record in allocation_node_records(tree, run_id=run_id, tree_id=tree_id):
+            node = next(n for n in _iter_dict_nodes(tree) if str(n.get("gear_segment_id", n.get("vdra_node_id", ""))) == record["node_id"] or str(n.get("vdra_node_id", "")) == record["node_id"])
+            validate_node_accounting(node, k_min=getattr(gear_gate, "n_min", 1))
+            generated = int(node.get("vdra_pilot_children_generated", 0) or 0)
+            reused = int(node.get("vdra_pilot_children_reused", 0) or 0)
+            discarded = int(node.get("vdra_pilot_children_discarded", 0) or 0)
+            if reused > generated or discarded != generated - reused:
+                raise RuntimeError("VDRA pilot accounting invariant failed")
+            if int(node.get("vdra_total_generated_tokens", 0) or 0) != int(node.get("vdra_pilot_generated_tokens", 0) or 0) + int(node.get("vdra_main_expansion_generated_tokens", 0) or 0):
+                raise RuntimeError("VDRA generated-token accounting invariant failed")
+            if int(node.get("vdra_total_scored_tokens", 0) or 0) != int(node.get("vdra_likelihood_scored_prompt_tokens", 0) or 0) + int(node.get("vdra_likelihood_scored_continuation_tokens", 0) or 0):
+                raise RuntimeError("VDRA scored-token accounting invariant failed")
+        totals = summarize_vdra_tree(tree)
+        if int(totals["vdra_total_redistributed_branches"]) != int(manager.reserve_pool.consumed):
+            raise RuntimeError("VDRA redistribution accounting invariant failed")
+
     tree["gear_queue_flush_count"] = int(manager.flush_count)
     tree["gear_queue_timeout_flush_count"] = int(manager.timeout_flush_count)
     tree["vdra_queue_capacity_flush_count"] = int(manager.capacity_flush_count)
@@ -566,8 +675,55 @@ async def async_build_tree_online_alloc(
     tree["gear_reserve_contributed"] = int(manager.reserve_pool.contributed)
     tree["gear_reserve_consumed"] = int(manager.reserve_pool.consumed)
     tree["gear_reserve_remaining"] = int(manager.reserve_pool.value)
+    tree["vdra_queue_flush_records"] = queue_flush_records
+    tree["vdra_allocation_scope"] = "one_tree"
     tree["tree_construction_seconds"] = time.time() - t0
+
+    artifact_dir = getattr(gear_gate, "artifact_dir", None) or data_instance.get("vdra_artifact_dir")
+    if artifact_dir:
+        persist_vdra_artifacts(
+            artifact_dir,
+            tree,
+            run_id=run_id,
+            tree_id=tree_id,
+            queue_flushes=queue_flush_records,
+            run_manifest={
+                "algorithm_requested": "VDRA",
+                "algorithm_executed": "VDRA-online-timeout",
+                "run_valid_for_main_results": True,
+                "strict_vdra": bool(getattr(gear_gate, "strict_vdra", True)),
+                "tree_shape": list(tree_shape),
+                "segment_length": M,
+                "pilot_branch_factor": getattr(gear_gate, "pilot_branch_factor", None),
+                "likelihood_samples_per_distribution": getattr(gear_gate, "likelihood_samples_per_distribution", None),
+                "first_phase_tokens": getattr(gear_gate, "tv_first_phase_tokens", None),
+                "second_phase_tokens": getattr(gear_gate, "tv_second_phase_tokens", None),
+                "allocation_runtime": getattr(gear_gate, "allocation_runtime", None),
+                "allocation_scope": "one_tree",
+                "queue_count": getattr(gear_gate, "queue_count", None),
+                "queue_capacity": getattr(gear_gate, "queue_capacity", None),
+                "queue_timeout_seconds": getattr(gear_gate, "queue_timeout_seconds", None),
+                "root_allocation": bool(getattr(gear_gate, "root_allocation", False)),
+                "use_residual_budget": bool(getattr(gear_gate, "use_residual_budget", True)),
+                "n_min": getattr(gear_gate, "n_min", None),
+                "tv_estimator": getattr(gear_gate, "tv_estimator", None),
+                "bound_form": getattr(getattr(gear_gate, "cfg", None), "bound_form", None),
+                "eps_tail": getattr(getattr(gear_gate, "cfg", None), "eps_tail", None),
+                "eps_tail_calibration_path": None,
+                "eps_tail_calibration_metadata": None,
+                "budget_claim": "fixed main expansion budget; pilot and scoring overhead reported separately",
+                "compute_proxy_definition": "pilot decode tokens + main-expansion decode tokens + scored prompt tokens + scored continuation tokens",
+            },
+        )
     return tree
+
+
+def _iter_dict_nodes(tree: Dict[str, Any]):
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(reversed(node.get("children") or []))
 
 async def async_build_tree_batch_alloc(
     root_prompt_text: str,
