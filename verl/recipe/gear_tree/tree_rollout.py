@@ -876,10 +876,57 @@ async def async_build_tree_online_alloc(
                 token_budget=token_budget,
             )
         elif pilot_mode == "weighted_reuse":
-            samples = await _expand_reusing_pilots(
-                node, allocated_branch_factor, _max_tokens(depth), segment_fn,
-                token_budget=token_budget,
+            # P0.6: weighted_reuse's parent value estimator sums over every
+            # cluster's representative weight; if allocated_k drops even one
+            # required cluster the remaining weights cannot recover the
+            # missing probability mass. Detect the coverage shortfall and
+            # execute the configured fallback here rather than trusting the
+            # config field to have effect.
+            required_clusters = int(
+                node.get("vdra_required_cluster_count")
+                or len(node.get("vdra_reusable_pilot_children") or node.get("vdra_pilot_children") or [])
             )
+            node["vdra_required_cluster_count"] = required_clusters
+            node["vdra_allocated_k"] = allocated_branch_factor
+            if allocated_branch_factor >= required_clusters or required_clusters == 0:
+                samples = await _expand_reusing_pilots(
+                    node, allocated_branch_factor, _max_tokens(depth), segment_fn,
+                    token_budget=token_budget,
+                )
+                node["vdra_weighted_reuse_fallback_triggered"] = False
+                node["vdra_weighted_reuse_fallback_reason"] = ""
+            else:
+                fallback = str(getattr(gear_gate, "weighted_reuse_fallback", "fresh_iid"))
+                reason = (
+                    f"allocated_k={allocated_branch_factor} < "
+                    f"required_cluster_count={required_clusters}"
+                )
+                if fallback == "error":
+                    raise RuntimeError(
+                        "weighted_reuse coverage impossible and "
+                        f"weighted_reuse_fallback='error': {reason}"
+                    )
+                if fallback != "fresh_iid":
+                    raise ValueError(
+                        f"Unsupported weighted_reuse_fallback: {fallback!r}"
+                    )
+                samples = await _expand_fresh_iid(
+                    node, allocated_branch_factor, _max_tokens(depth), segment_fn,
+                    token_budget=token_budget,
+                )
+                node["vdra_weighted_reuse_fallback_triggered"] = True
+                node["vdra_weighted_reuse_fallback_reason"] = reason
+                # fresh_iid children must not carry representative weights, so
+                # strip any cluster metadata the caller may have pre-populated.
+                for sample in samples:
+                    metadata = _sample_metadata(sample)
+                    for key in (
+                        "vdra_cluster_id",
+                        "vdra_cluster_multiplicity",
+                        "vdra_representative_weight",
+                        "vdra_original_pilot_indices",
+                    ):
+                        metadata.pop(key, None)
         else:
             raise ValueError(f"Unsupported pilot_execution_mode: {pilot_mode!r}")
         children = [
@@ -977,7 +1024,9 @@ async def async_build_tree_online_alloc(
     tree["gear_reserve_consumed"] = int(manager.reserve_consumed)
     tree["gear_reserve_remaining"] = 0
     tree["vdra_queue_flush_records"] = queue_flush_records
-    tree["vdra_allocation_scope"] = "one_tree"
+    # P1.1: runtime allocation is solved separately per queue flush, not for
+    # the whole tree or the whole depth frontier.
+    tree["vdra_allocation_scope"] = "per_queue_flush_within_tree"
     tree["vdra_budget_mode"] = budget_mode
     tree["vdra_allocation_proxy"] = allocation_proxy
     tree["vdra_pilot_execution_mode"] = str(getattr(gear_gate, "pilot_execution_mode", "fresh_iid"))

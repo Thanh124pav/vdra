@@ -121,6 +121,7 @@ class ConditionalTVEstimator:
         likelihood_samples_per_distribution: int = 1,
         invalid_support_policy: str = "error",
         strict_vdra: bool = True,
+        terminal_reward_fn: Optional[Any] = None,
     ):
         if mode == "hierachical":
             mode = "hierarchical"
@@ -170,6 +171,11 @@ class ConditionalTVEstimator:
         self._score_cache: Dict[Tuple[Any, ...], float] = {}
         self.invalid_support_policy = invalid_support_policy
         self.strict_vdra = bool(strict_vdra)
+        # P0.8: optional grader used to stamp terminal pilots with an observed
+        # reward before dispersion is computed. When present, it is called on
+        # each shortcut pilot node dict as terminal_reward_fn(node) -> float;
+        # if it returns a number the node's "reward" field is set.
+        self.terminal_reward_fn = terminal_reward_fn
 
     def _reward_variance(self, pair_tvs: Mapping[PairKey, float], n: int) -> float:
         return reward_variance_from_pair_tvs(
@@ -200,13 +206,33 @@ class ConditionalTVEstimator:
 
         Terminal phase-one pilots are complete distribution atoms. Without
         reward access in the scorer, terminal-vs-continuation support is a
-        conservative disjoint atom (TV=1); terminal-terminal pairs contribute
-        zero unless a future value-aware scorer supplies a sharper distance.
+        conservative disjoint atom (TV=1). P0.8: when terminal pilots have
+        been graded (a numeric ``reward`` field is present on the shortcut
+        node), the terminal-terminal contribution to the dispersion is
+        ``(R_i - R_j)^2`` per pair rather than zero, matching:
+
+            C_s = (1/n^2) * (Σ_cc B_ij² + Σ_tc B_ij² + Σ_tt (R_i-R_j)²).
+
+        If no reward is available we keep terminal-terminal at 0 as a
+        documented conservative bound.
         """
 
         n_total = len(first_nodes)
         if n_total < 2:
             return {}, 0.0, 0.0, 0.0, 0.0
+        # P0.8: grade terminal pilots (no-op when no grader configured or
+        # when a reward is already present).
+        grader = getattr(self, "terminal_reward_fn", None)
+        if grader is not None:
+            for node in shortcut_nodes:
+                if node.get("reward") is not None:
+                    continue
+                try:
+                    reward = grader(node)
+                except Exception:
+                    reward = None
+                if reward is not None:
+                    node["reward"] = float(reward)
         global_pairs: Dict[PairKey, float] = {}
         local_to_global = {local: int(global_idx) for local, (global_idx, _) in enumerate(continuable_pairs)}
         for (i, j), tv in local_pair_tvs.items():
@@ -220,9 +246,9 @@ class ConditionalTVEstimator:
             if len(continuable_pairs) >= 2 and local_pair_tvs
             else 0.0
         )
-        shortcut_indices = {
+        shortcut_indices = [
             idx for idx, node in enumerate(first_nodes) if node in shortcut_nodes
-        }
+        ]
         continuable_indices = {idx for idx, _ in continuable_pairs}
         cross_pairs: Dict[PairKey, float] = {}
         for ti in shortcut_indices:
@@ -230,9 +256,38 @@ class ConditionalTVEstimator:
                 pair = (min(ti, ci), max(ti, ci))
                 cross_pairs[pair] = 1.0
                 global_pairs[pair] = 1.0
-        terminal_C = 0.0
+        # P0.8: terminal-terminal contribution from observed rewards. Only
+        # pairs where BOTH nodes have a numeric reward contribute; the rest
+        # stay at 0 as documented above. We compute this Σ_tt (R_i-R_j)²/n²
+        # directly rather than routing through _reward_variance because that
+        # helper applies value_gap_bound() (a TV→value-gap transform) that is
+        # correct for TV pairs but not for raw reward differences.
+        terminal_pair_squared: Dict[PairKey, float] = {}
+        for pos_i in range(len(shortcut_indices)):
+            for pos_j in range(pos_i + 1, len(shortcut_indices)):
+                gi = shortcut_indices[pos_i]
+                gj = shortcut_indices[pos_j]
+                ri = first_nodes[gi].get("reward")
+                rj = first_nodes[gj].get("reward")
+                if ri is None or rj is None:
+                    continue
+                try:
+                    diff = float(ri) - float(rj)
+                except (TypeError, ValueError):
+                    continue
+                terminal_pair_squared[(min(gi, gj), max(gi, gj))] = diff * diff
+        terminal_C = (
+            sum(terminal_pair_squared.values()) / float(n_total * n_total)
+            if terminal_pair_squared
+            else 0.0
+        )
         cross_C = self._reward_variance(cross_pairs, n_total) if cross_pairs else 0.0
+        # total_C = continuable_C + cross_C + terminal_C. continuable_C already
+        # matches _reward_variance(local_pair_tvs, len(continuable_pairs));
+        # cross_C uses TV=1 atoms; terminal_C is the observed reward variance
+        # component computed above.
         total_C = self._reward_variance(global_pairs, n_total) if global_pairs else 0.0
+        total_C = float(total_C) + float(terminal_C)
         return global_pairs, total_C, continuable_C, terminal_C, cross_C
 
     async def estimate_k_for_parent(
@@ -561,44 +616,48 @@ class ConditionalTVEstimator:
         pair_tvs: Mapping[PairKey, float],
         duplicate_tv_threshold: float,
     ) -> Tuple[List[int], Dict[int, int], Dict[int, int], Dict[int, List[int]]]:
-        """Cluster duplicate pilots deterministically without reward access."""
+        """Cluster duplicate pilots deterministically without reward access.
+
+        P0.7: uses star clustering around a deterministic representative so
+        every cluster satisfies max_{x in G_r} TV(x, r) <= eps by
+        construction. Connected components (used previously) only enforce
+        pairwise-near paths and admit clusters where two members can be
+        arbitrarily far apart via an intermediate.
+        """
 
         n = len(first_nodes)
-        adjacency: Dict[int, set] = {idx: set() for idx in range(n)}
-        for (i, j), tv in pair_tvs.items():
-            if i != j and tv < float(duplicate_tv_threshold):
-                adjacency[i].add(j)
-                adjacency[j].add(i)
 
-        seen = set()
-        components: List[List[int]] = []
-        for start in range(n):
-            if start in seen:
-                continue
-            stack = [start]
-            seen.add(start)
-            component: List[int] = []
-            while stack:
-                idx = stack.pop()
-                component.append(idx)
-                for nxt in sorted(adjacency[idx]):
-                    if nxt not in seen:
-                        seen.add(nxt)
-                        stack.append(nxt)
-            components.append(sorted(component))
+        def _tv(i: int, j: int) -> float:
+            if i == j:
+                return 0.0
+            key = (i, j) if i < j else (j, i)
+            return float(pair_tvs.get(key, float("inf")))
 
-        components.sort(key=lambda comp: comp[0])
-        cluster_id_per_pilot = [-1] * n
+        threshold = float(duplicate_tv_threshold)
+        cluster_id_per_pilot: List[int] = [-1] * n
         representative_index_per_cluster: Dict[int, int] = {}
-        cluster_size: Dict[int, int] = {}
         cluster_members: Dict[int, List[int]] = {}
-        for cluster_id, component in enumerate(components):
-            representative = min(component)
-            representative_index_per_cluster[cluster_id] = representative
-            cluster_size[cluster_id] = len(component)
-            cluster_members[cluster_id] = list(component)
-            for idx in component:
-                cluster_id_per_pilot[idx] = cluster_id
+        # Deterministic order = original pilot index. Every pilot either starts
+        # a new cluster (becoming its representative) or joins the lowest-id
+        # existing cluster whose representative is within eps.
+        for idx in range(n):
+            best_cluster: Optional[int] = None
+            for cluster_id, rep in representative_index_per_cluster.items():
+                if _tv(idx, rep) < threshold:
+                    if best_cluster is None or cluster_id < best_cluster:
+                        best_cluster = cluster_id
+            if best_cluster is None:
+                new_id = len(representative_index_per_cluster)
+                representative_index_per_cluster[new_id] = idx
+                cluster_members[new_id] = [idx]
+                cluster_id_per_pilot[idx] = new_id
+            else:
+                cluster_members[best_cluster].append(idx)
+                cluster_id_per_pilot[idx] = best_cluster
+
+        cluster_size: Dict[int, int] = {
+            cid: len(members) for cid, members in cluster_members.items()
+        }
         return cluster_id_per_pilot, representative_index_per_cluster, cluster_size, cluster_members
 
     @staticmethod

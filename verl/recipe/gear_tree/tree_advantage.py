@@ -48,7 +48,17 @@ def extract_edges_from_tree(
     edges: list[dict[str, Any]] = []
     tree_copy = copy.deepcopy(tree)
     data_instance = tree_copy.get("_request_object", {})
+    # P1.6: require a globally stable question id. `_treetune__idx` /
+    # `uid` come from the dataset row; falling back to a per-batch index
+    # would let the per-question replay cap combine different questions
+    # that happen to share a batch-local index across steps.
     question_id = data_instance.get("_treetune__idx", data_instance.get("uid"))
+    if question_id is None:
+        raise ValueError(
+            "Data instance has no stable question id (_treetune__idx / uid). "
+            "Add a dataset UID (or a hash of the normalized problem) — a "
+            "per-batch index is not acceptable (PLAN.md P1.6)."
+        )
     root_reward = _node_reward(tree_copy)
     policy_snapshot_id = (
         tree_copy.get("policy_snapshot_id")
@@ -97,6 +107,18 @@ def extract_edges_from_tree(
                 "leaf": bool(node.get("leaf", not node.get("children"))),
                 "reward": child_reward,
                 "pruned": is_pruned,
+                # P0.5: representative-weight fields must survive tree → edge
+                # → DataProto → actor. tree_rollout writes edge_weight and the
+                # vdra_cluster_* metadata on final children under
+                # weighted_reuse; token_fields_for_edges broadcasts
+                # edge_weight into batch["edge_weights"] and the weighted PPO
+                # loss reads that tensor.
+                "edge_weight": node.get(
+                    "edge_weight", node.get("vdra_representative_weight")
+                ),
+                "vdra_cluster_id": node.get("vdra_cluster_id"),
+                "vdra_cluster_multiplicity": node.get("vdra_cluster_multiplicity"),
+                "vdra_original_pilot_indices": node.get("vdra_original_pilot_indices"),
                 **update_values,
             }
             edge["advantage"] = advantage

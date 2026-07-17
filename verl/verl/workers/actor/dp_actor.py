@@ -389,7 +389,18 @@ class DataParallelPPOActor(BasePPOActor):
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
-        on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
+        # P0.4: replay/tree edges carry stored generation-time old_log_probs
+        # that must be preserved as the PPO denominator, even in the
+        # single-minibatch/single-epoch shape that would otherwise look
+        # "on-policy". Trainers set force_stored_old_log_probs=True to opt in.
+        force_stored_old_log_probs = bool(
+            data.meta_info.get("force_stored_old_log_probs", False)
+        )
+        on_policy = (
+            len(mini_batches) == 1
+            and self.config.ppo_epochs == 1
+            and not force_stored_old_log_probs
+        )
 
         metrics = {}
         for _ in range(self.config.ppo_epochs):

@@ -12,6 +12,17 @@ def resolve_gear_calibration(gear: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("gear_tree.gear.tail_mode must be one of: none, calibrated, fixed")
     resolved["tail_mode"] = tail_mode
 
+    # P1.9: `simulation_lemma` bound_form under `tail_mode=none` cannot claim a
+    # certified full-horizon value bound. Quarantine the combination so it
+    # can't accidentally be used as the main run.
+    bound_form = str(resolved.get("bound_form", "linear"))
+    if bound_form == "simulation_lemma" and tail_mode == "none":
+        raise ValueError(
+            "bound_form='simulation_lemma' with tail_mode='none' is a legacy "
+            "ablation and is not supported for main experiments (PLAN.md "
+            "P1.9). Use bound_form='linear' or a calibrated tail mode."
+        )
+
     if tail_mode == "none":
         resolved["eps_tail"] = 0.0
         resolved["eps_tail_by_depth"] = None

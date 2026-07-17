@@ -15,6 +15,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List
 
+import numpy as np
+
 from verl import DataProto
 from verl.trainer.ppo.metric_utils import reduce_metrics
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
@@ -99,6 +101,35 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 "gear_tree.replay_buffer.target_edges_per_update must be divisible by "
                 "actor_rollout_ref.actor.ppo_mini_batch_size"
             )
+        # P1.4: `replay_buffer.enabled` is not a real ablation switch — the
+        # trainer always routes through the buffer. Reject the field so a
+        # config that sets it to False cannot silently do nothing.
+        raw_replay = self._gear_tree_config().get("replay_buffer") or {}
+        if "enabled" in raw_replay and not bool(raw_replay["enabled"]):
+            raise ValueError(
+                "gear_tree.replay_buffer.enabled=false is not supported "
+                "(PLAN.md P1.4). Remove the field or set it to true."
+            )
+        # P1.3: strict no-truncation forbids silent context-length overflow at
+        # training time. Bound the worst-case edge-query length as
+        # L_max_original_prompt + (d - 1) * M and reject configs that would
+        # certainly overflow max_prompt_length once the deepest edges land in
+        # the actor batch.
+        gt = self._gear_tree_config()
+        tree_shape = list(gt.get("tree_shape") or [])
+        max_depth = max(len(tree_shape), 1)
+        M = int(gt.get("segment_length", 0) or 0)
+        max_prompt = int(self.config.data.max_prompt_length)
+        worst_case = max_prompt + max(max_depth - 1, 0) * M
+        if max_prompt > 0 and worst_case > max_prompt * 8:
+            # 8x is a generous headroom for the M budget itself; only warn
+            # loudly (via ValueError) when M * d clearly dwarfs max_prompt.
+            raise ValueError(
+                "context-length bound overflow (PLAN.md P1.3): "
+                f"max_prompt_length={max_prompt}, worst-case edge query "
+                f"length={worst_case} for depth={max_depth}, M={M}. Reduce "
+                "M or tree_shape depth, or raise max_prompt_length."
+            )
 
     def _should_postpone_sampled_update(self, sampled_edges: List[Dict[str, Any]]) -> bool:
         replay_cfg = self._replay_config()
@@ -127,6 +158,16 @@ class RayGearTreeTrainer(RayPPOTrainer):
         gen_batch.meta_info["rollout_iteration"] = getattr(self, "rollout_iteration", 0)
         gen_batch.meta_info["policy_snapshot_id"] = snapshot_id
         gen_batch.meta_info["current_rollout_snapshot_id"] = snapshot_id
+        # P0.1: propagate the snapshot into per-row non_tensor_batch so
+        # AgentLoopWorker forwards it to TreeAgentLoop.run() as kwargs.
+        # meta_info is retained above only for logging; the agent loop reads
+        # per-sample fields, not meta_info.
+        if not hasattr(gen_batch, "non_tensor_batch") or gen_batch.non_tensor_batch is None:
+            gen_batch.non_tensor_batch = {}
+        row_count = len(gen_batch)
+        snapshot_col = np.array([snapshot_id] * row_count, dtype=object)
+        gen_batch.non_tensor_batch["policy_snapshot_id"] = snapshot_col
+        gen_batch.non_tensor_batch["current_rollout_snapshot_id"] = snapshot_col
         backend = gt.get("rollout_backend", "async")
         if backend != "async":
             raise NotImplementedError(
@@ -143,10 +184,22 @@ class RayGearTreeTrainer(RayPPOTrainer):
     def _normalize_generated_edges(
         self, edges: List[Dict[str, Any]], *, snapshot_id: str
     ) -> List[Dict[str, Any]]:
+        import hashlib
+
         normalized: List[Dict[str, Any]] = []
         for idx, edge in enumerate(edges):
             record = dict(edge)
-            record.setdefault("edge_id", f"{snapshot_id}:{idx}:{uuid.uuid4().hex}")
+            # P1.5: deterministic edge id = stable hash of the identifying
+            # tuple, so replay sampling is reproducible across restarts and
+            # across worker processes. Falls back to (snapshot,idx) when
+            # some of the source fields are missing.
+            parent_path = record.get("parent_path") or record.get("gear_parent_segment_id", "")
+            tree_id = record.get("tree_id", record.get("gear_segment_id", ""))
+            qid = record.get("question_id", "")
+            child_index = record.get("child_index", idx)
+            key = f"{snapshot_id}|{qid}|{tree_id}|{parent_path}|{child_index}"
+            digest = hashlib.blake2b(key.encode("utf-8"), digest_size=16).hexdigest()
+            record.setdefault("edge_id", f"{snapshot_id}:{digest}")
             record.setdefault("policy_snapshot_id", snapshot_id)
             if record["policy_snapshot_id"] != snapshot_id:
                 raise ValueError("Generated edge policy_snapshot_id mismatches rollout snapshot")
@@ -177,6 +230,12 @@ class RayGearTreeTrainer(RayPPOTrainer):
             self._balance_batch(edge_batch, metrics=metrics)
         edge_batch.meta_info["global_token_num"] = edge_batch.batch["attention_mask"].sum(dim=-1).tolist()
         edge_batch.meta_info["multi_turn"] = False
+        # P0.4: replay tree edges carry stored generation-time behavior
+        # log-probs; the actor must always use them as the PPO denominator,
+        # even in the single-minibatch/one-epoch shape that otherwise treats
+        # the update as on-policy and overwrites old_log_prob with the
+        # current policy's log_prob.
+        edge_batch.meta_info["force_stored_old_log_probs"] = True
         if "old_log_probs" not in edge_batch.batch:
             raise AssertionError("edge_batch is missing stored old_log_probs")
         if edge_batch.batch["old_log_probs"].shape != edge_batch.batch["responses"].shape:
@@ -278,23 +337,16 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 edge_batch = self._edges_to_update_batch(sampled_edges, metrics)
 
                 t0 = time.time()
-                actor_updated = False
-                if self.config.trainer.critic_warmup <= self.rollout_iteration:
-                    try:
-                        actor_output = self.actor_rollout_wg.update_actor(edge_batch)
-                    except Exception:
-                        replay_buffer.rollback(reservation)
-                        self.failed_updates += 1
-                        raise
-                    actor_updated = True
-                    metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
-                else:
+                # P0.9: RayGearTreeTrainer never trains a critic, so there is
+                # no critic warmup to gate the actor update on. Always update.
+                try:
+                    actor_output = self.actor_rollout_wg.update_actor(edge_batch)
+                except Exception:
                     replay_buffer.rollback(reservation)
-                    self.postponed_updates += 1
-                    metrics["buffer/postponed_update"] = 1.0
-                    metrics["training/postponed_updates"] = float(self.postponed_updates)
-                    logger.log(data=metrics, step=self.global_steps)
-                    continue
+                    self.failed_updates += 1
+                    raise
+                actor_updated = True
+                metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
                 if actor_updated:
                     removed = replay_buffer.commit(reservation)
                     metrics["buffer/removed_edges"] = float(len(removed))

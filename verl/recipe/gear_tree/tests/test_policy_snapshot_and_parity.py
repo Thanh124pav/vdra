@@ -31,7 +31,7 @@ def test_generated_edges_carry_policy_snapshot_id():
         build_tree_edges_async(
             "PROMPT",
             [7],
-            {"problem": "p", "answer": "4", "reward_model": {"ground_truth": "4"}},
+            {"problem": "p", "answer": "4", "reward_model": {"ground_truth": "4"}, "_treetune__idx": "q0"},
             segment_generator=gen,
             reward_fn=MathRewardFunction(),
             tree_shape=[1],

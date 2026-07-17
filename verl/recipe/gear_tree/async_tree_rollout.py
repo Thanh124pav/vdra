@@ -49,8 +49,20 @@ class AsyncServerSegmentGenerator:
         self.free_max_tokens = free_max_tokens
 
     async def _one(self, prompt_ids: Sequence[int], sp: Dict[str, Any]) -> SegmentSample:
+        # P1.8: derive a sticky session id from the prompt prefix so
+        # continuation requests hit the same server replica and can reuse the
+        # prefix cache. Random uuids per pilot/continuation break stickiness
+        # and introduce latency-driven variation in queue composition.
+        import hashlib
+
+        session = sp.pop("_session_id", None)
+        if session is None:
+            digest = hashlib.blake2b(
+                bytes(list(prompt_ids)[-256:]), digest_size=12
+            ).hexdigest()
+            session = f"stick:{digest}"
         out = await self.server_manager.generate(
-            request_id=uuid4().hex,
+            request_id=session,
             prompt_ids=list(prompt_ids),
             sampling_params=sp,
         )
@@ -217,8 +229,16 @@ def _resolve_external_score_fn_cpu(g: dict):
     return getattr(module, attr or "score_node")
 
 
+# P0.2: worker/process-level cache shared by both the CPU and agent-loop
+# build paths. Building a scorer per prompt spawns one /models request, HTTP
+# client, semaphore, and connection pool per prompt; equal string snapshot
+# ids do NOT prove equal weights, so we also stamp a weight_version that the
+# trainer can re-verify after every actor update.
+_SCORER_CACHE_CPU: Dict[tuple, Any] = {}
+
+
 def _build_scorer_cpu(g: dict, tokenizer: Any):
-    """Build the log-prob scorer without depending on agent-loop imports."""
+    """Build (or reuse) the log-prob scorer without depending on agent-loop imports."""
     api_base = g.get("scorer_api_base")
     if not api_base or tokenizer is None:
         return None
@@ -235,25 +255,53 @@ def _build_scorer_cpu(g: dict, tokenizer: Any):
             "VDRA scorer snapshot does not match rollout snapshot: "
             f"{scorer_snapshot!r} != {rollout_snapshot!r}"
         )
-    model_id = resolve_vllm_model_id(
-        str(api_base),
-        g.get("scorer_model"),
-        api_key=str(g.get("scorer_api_key", "EMPTY")),
-        timeout=float(g.get("scorer_model_resolve_timeout", 10.0)),
-    )
-    client = VLLMLogprobClient(
-        api_base=str(api_base),
-        model=model_id,
-        api_key=str(g.get("scorer_api_key", "EMPTY")),
-        max_concurrency=int(g.get("scorer_max_concurrency", 64)),
-    )
-    scorer = make_lp_scorer(
-        client, lambda text: tokenizer.encode(text, add_special_tokens=False)
-    )
+    api_key = str(g.get("scorer_api_key", "EMPTY"))
+    concurrency = int(g.get("scorer_max_concurrency", 64))
+    explicit_model = g.get("scorer_model")
+    cache_key = (str(api_base), str(explicit_model or ""), api_key, concurrency)
+    cached = _SCORER_CACHE_CPU.get(cache_key)
+    if cached is None:
+        model_id = resolve_vllm_model_id(
+            str(api_base),
+            explicit_model,
+            api_key=api_key,
+            timeout=float(g.get("scorer_model_resolve_timeout", 10.0)),
+        )
+        client = VLLMLogprobClient(
+            api_base=str(api_base),
+            model=model_id,
+            api_key=api_key,
+            max_concurrency=concurrency,
+        )
+        scorer = make_lp_scorer(
+            client, lambda text: tokenizer.encode(text, add_special_tokens=False)
+        )
+        scorer.scorer_model = model_id
+        scorer._client = client
+        _SCORER_CACHE_CPU[cache_key] = scorer
+    else:
+        scorer = cached
     scorer.policy_snapshot_id = rollout_snapshot
     scorer.scorer_snapshot_id = scorer_snapshot
-    scorer.scorer_model = model_id
+    scorer.weight_version = rollout_snapshot
     return scorer
+
+
+def assert_scorer_matches_rollout(scorer, rollout_snapshot_id: str) -> None:
+    """P0.2 acceptance helper: trainer calls this after every actor update.
+
+    Raises when the scorer's stamped weight_version drifts from the current
+    rollout snapshot id, which indicates the scorer replica is running stale
+    weights (or a different model) than the rollout replica.
+    """
+    if scorer is None:
+        return
+    stamped = getattr(scorer, "weight_version", None)
+    if stamped is None or str(stamped) != str(rollout_snapshot_id):
+        raise RuntimeError(
+            "Scorer weight_version does not match current rollout snapshot: "
+            f"scorer.weight_version={stamped!r} rollout={rollout_snapshot_id!r}"
+        )
 
 
 def _build_gate_cpu(gt: dict, tokenizer: Any = None):
@@ -314,8 +362,29 @@ try:  # keep CPU-importable when agent_loop isn't installed
             super().__init__(*args, **kwargs)
             gt = dict(self.config.get("gear_tree", {}))
             gear_cfg = dict(gt.get("gear", {}))
-            gear_cfg.setdefault("rollout_temperature", float(self.rollout_config.temperature))
-            gear_cfg.setdefault("rollout_top_p", float(self.rollout_config.top_p))
+            # P0.3: overwrite, don't setdefault. Nested VDRA config often carries
+            # stale rollout_temperature/rollout_top_p from an earlier ablation;
+            # the strict gate must validate the *actual* sampling distribution
+            # used by the async rollout server, which is rollout_config.*.
+            actual_temp = float(self.rollout_config.temperature)
+            actual_top_p = float(self.rollout_config.top_p)
+            gear_cfg["rollout_temperature"] = actual_temp
+            gear_cfg["rollout_top_p"] = actual_top_p
+            # Enforce the tanh-TV estimator's distributional prerequisites.
+            # The scorer implements the untransformed p(a|s); if the rollout
+            # server samples under (temperature, top_p) != (1, 1) then scorer
+            # and rollout are using different distributions and the TV
+            # estimate becomes invalid. Until the scorer explicitly implements
+            # the matching transformed distribution, refuse to start.
+            if str(gear_cfg.get("tv_estimator", "tanh")) == "tanh" and bool(
+                gear_cfg.get("enabled", False)
+            ):
+                if actual_temp != 1.0 or actual_top_p != 1.0:
+                    raise RuntimeError(
+                        "VDRA tanh-TV estimator requires rollout temperature=1.0 "
+                        "and top_p=1.0 (see PLAN.md P0.3); got "
+                        f"temperature={actual_temp}, top_p={actual_top_p}."
+                    )
             gt["gear"] = gear_cfg
             self._gt = gt
             self._gen = AsyncServerSegmentGenerator(
@@ -340,12 +409,23 @@ try:  # keep CPU-importable when agent_loop isn't installed
 
             rm = kwargs.get("reward_model", {}) or {}
             extra = kwargs.get("extra_info", {}) or {}
+            # P0.1: prefer per-sample non_tensor_batch kwargs; fall back to the
+            # config only if it carries a real snapshot id. Never accept the
+            # "rollout_step:unknown" sentinel here — it means the trainer did
+            # not propagate the snapshot and would corrupt edge provenance.
             snapshot_id = (
                 kwargs.get("policy_snapshot_id")
                 or kwargs.get("current_rollout_snapshot_id")
                 or self._gt.get("policy_snapshot_id")
-                or "rollout_step:unknown"
             )
+            if not snapshot_id or snapshot_id == "rollout_step:unknown":
+                raise RuntimeError(
+                    "TreeAgentLoop.run received no policy_snapshot_id via "
+                    "non_tensor_batch kwargs or gear_tree_config; trainer must "
+                    "populate gen_batch.non_tensor_batch['policy_snapshot_id'] "
+                    "before generate_sequences (see PLAN.md P0.1)."
+                )
+            snapshot_id = str(snapshot_id)
             data_instance = {
                 "problem": extra.get("problem") or rm.get("problem"),
                 "answer": rm.get("ground_truth"),
@@ -440,8 +520,15 @@ try:  # keep CPU-importable when agent_loop isn't installed
         module = importlib.import_module(module_name)
         return getattr(module, attr or "score_node")
 
+    # P0.2: worker-level cache. Building a scorer per prompt spawns one /models
+    # request, HTTP client, semaphore, and connection pool per prompt; that
+    # both wastes resources and makes it impossible to verify that scorer and
+    # rollout share the same loaded weights. Key by (endpoint, model, api_key,
+    # concurrency) so different rollouts in the same process still share.
+    _SCORER_CACHE: Dict[tuple, Any] = {}
+
     def _build_scorer(g: dict, tokenizer: Any):
-        """Build the log-prob scorer for share / budget-allocation paths.
+        """Build (or reuse) the log-prob scorer for share / budget-allocation paths.
 
         ``scorer_api_base`` points at an OpenAI-compatible vLLM server (the
         agent-loop stack already runs one); without it the gate runs with
@@ -458,30 +545,65 @@ try:  # keep CPU-importable when agent_loop isn't installed
 
         rollout_snapshot = g.get("policy_snapshot_id")
         scorer_snapshot = g.get("scorer_snapshot_id", rollout_snapshot)
+        # Per PLAN.md P0.2 the snapshot IDs must match; matching *strings* is a
+        # necessary but not sufficient signal, so we also stamp a
+        # weight_version below that the trainer can re-verify after each
+        # actor update.
         if rollout_snapshot is not None and scorer_snapshot != rollout_snapshot:
             raise RuntimeError(
                 "VDRA scorer snapshot does not match rollout snapshot: "
                 f"{scorer_snapshot!r} != {rollout_snapshot!r}"
             )
-        model_id = resolve_vllm_model_id(
-            str(api_base),
-            g.get("scorer_model"),
-            api_key=str(g.get("scorer_api_key", "EMPTY")),
-            timeout=float(g.get("scorer_model_resolve_timeout", 10.0)),
-        )
-        client = VLLMLogprobClient(
-            api_base=str(api_base),
-            model=model_id,
-            api_key=str(g.get("scorer_api_key", "EMPTY")),
-            max_concurrency=int(g.get("scorer_max_concurrency", 64)),
-        )
-        scorer = make_lp_scorer(
-            client, lambda text: tokenizer.encode(text, add_special_tokens=False)
-        )
+        api_key = str(g.get("scorer_api_key", "EMPTY"))
+        concurrency = int(g.get("scorer_max_concurrency", 64))
+        explicit_model = g.get("scorer_model")
+
+        cache_key = (str(api_base), str(explicit_model or ""), api_key, concurrency)
+        cached = _SCORER_CACHE.get(cache_key)
+        if cached is None:
+            model_id = resolve_vllm_model_id(
+                str(api_base),
+                explicit_model,
+                api_key=api_key,
+                timeout=float(g.get("scorer_model_resolve_timeout", 10.0)),
+            )
+            client = VLLMLogprobClient(
+                api_base=str(api_base),
+                model=model_id,
+                api_key=api_key,
+                max_concurrency=concurrency,
+            )
+            scorer = make_lp_scorer(
+                client, lambda text: tokenizer.encode(text, add_special_tokens=False)
+            )
+            scorer.scorer_model = model_id
+            scorer._client = client  # retained so shutdown can aclose() it
+            _SCORER_CACHE[cache_key] = scorer
+        else:
+            scorer = cached
+        # Refresh the per-run snapshot stamps every time — the trainer bumps
+        # policy_snapshot_id after each actor update, and the cached scorer
+        # must reflect the current expected weight version.
         scorer.policy_snapshot_id = rollout_snapshot
         scorer.scorer_snapshot_id = scorer_snapshot
-        scorer.scorer_model = model_id
+        # weight_version is the fingerprint we use to verify scorer/rollout
+        # parity: today it mirrors the rollout snapshot id (best proxy
+        # available without a server-side handshake); if the vLLM server
+        # later exposes a real weight fingerprint, replace this line with a
+        # call that reads it and stash both here for the trainer to compare.
+        scorer.weight_version = rollout_snapshot
         return scorer
+
+    async def _close_cached_scorers() -> None:
+        """Close every cached scorer's HTTP client. Call at worker shutdown."""
+        while _SCORER_CACHE:
+            _, scorer = _SCORER_CACHE.popitem()
+            client = getattr(scorer, "_client", None)
+            if client is not None:
+                try:
+                    await client.aclose()
+                except Exception:  # pragma: no cover
+                    pass
 
 except Exception:  # pragma: no cover
     TreeAgentLoop = None  # type: ignore

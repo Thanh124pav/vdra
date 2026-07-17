@@ -61,7 +61,12 @@ class GearTreeTaskRunner(TaskRunner):
         OmegaConf.resolve(config)
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
-        self.add_critic_worker(config)
+        # P0.9: gear-tree trainer never trains a critic. Only add a critic
+        # worker when the config explicitly asks for one; otherwise the Ray
+        # placement group and FSDP shards would create a critic replica that
+        # never receives a training call.
+        if need_critic(config):
+            self.add_critic_worker(config)
         self.add_reward_model_worker(config)
         self.add_ref_policy_worker(config, actor_rollout_cls)
 

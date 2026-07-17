@@ -46,6 +46,17 @@ class GearMathRewardManager(AbstractRewardManager):
         self.reward_fn_key = reward_fn_key
 
     def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
+        # P1.7: the tree rollout already grades every leaf via MathRewardFunction
+        # and only returns a placeholder response to satisfy AgentLoopOutput.
+        # When the trainer signals gear_tree_placeholder_output=True the
+        # response tokens are not real training data, so re-grading them
+        # would waste compute and produce meaningless scores. Return zeros in
+        # that case; the actor uses the per-edge advantages instead.
+        if data.meta_info.get("gear_tree_placeholder_output"):
+            reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+            if return_dict:
+                return {"reward_tensor": reward_tensor, "reward_extra_info": {}}
+            return reward_tensor
         if "rm_scores" in data.batch.keys():
             if return_dict:
                 reward_extra_keys = data.meta_info.get("reward_extra_keys", [])

@@ -125,8 +125,10 @@ gear_tree:
     # Optional depth-indexed override for calibrated/fixed modes. null => global.
     eps_tail_by_depth: null
 
-    # 'linear' (|dV| <= r_max * TV, exact for terminal bounded reward) |
-    # 'simulation_lemma' (legacy discounted form, clamped to r_max).
+    # P1.9: main run is `linear` (|dV| <= r_max * TV, exact for terminal
+    # bounded reward). `simulation_lemma` is a legacy discounted formulation
+    # that is NOT paper-safe under `tail_mode: none` — treat it as a
+    # quarantined ablation, do not use it for main comparison runs.
     bound_form: linear
 
     # 'tanh' (Summary.md §9 likelihood-ratio estimator) | 'legacy_abs' (ablation).
@@ -199,9 +201,14 @@ gear_tree:
 # --- overrides on the verl base ---------------------------------------------
 algorithm:
 
-  # Advantage is computed in the tree rollout, so verl's estimator is bypassed
-  # by RayGearTreeTrainer. Kept as gae to satisfy config validation.
-  adv_estimator: gae
+  # Advantage is computed entirely inside the tree rollout, so verl's own
+  # estimator is bypassed by RayGearTreeTrainer. P0.9: this used to be `gae`
+  # which caused verl.trainer.ppo.utils.need_critic() to return True and
+  # spawn an unused critic worker; switch to `grpo` (a critic-free estimator)
+  # so no critic worker is created. The actual advantage numbers come from
+  # tree_advantage.extract_edges_from_tree and are not affected by this
+  # choice — this field only gates VERL's own advantage path and worker set.
+  adv_estimator: grpo
 
   # KL coefficient = 0 by default (no KL in reward).
   use_kl_in_reward: false
@@ -209,6 +216,13 @@ algorithm:
   kl_ctrl:
 
     kl_coef: 0.0
+
+critic:
+  # P0.9: RayGearTreeTrainer never trains a critic — advantages come from the
+  # tree rollout. Explicitly disable so verl.trainer.ppo.utils.need_critic()
+  # returns False regardless of adv_estimator, and no CriticWorker is created
+  # in the Ray placement group.
+  enable: false
 
 actor_rollout_ref:
 
