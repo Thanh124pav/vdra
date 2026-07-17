@@ -181,12 +181,19 @@ class GearGate:
         *,
         weight_version: Optional[str] = None,
         weight_version_verified: bool = False,
+        rollout_server_weight_version: Optional[str] = None,
     ) -> None:
         """Bind the gate/scorer to a specific rollout snapshot.
 
-        P0.2 / P0.3: TreeAgentLoop must call this before each tree build so
-        the gate rejects stale scorer state and the strict-mode invariants
-        can compare rollout vs scorer server versions.
+        P0.1 / P0.2 / P0.3: TreeAgentLoop must call this before each tree
+        build so the gate rejects stale scorer state and the strict-mode
+        invariants can compare rollout vs scorer server versions.
+
+        ``rollout_server_weight_version`` is the SERVER-side fingerprint the
+        trainer fetched from the rollout replica. In strict mode we require
+        it to equal the scorer replica's own server fingerprint; the caller
+        may only omit it when weight-version verification is intentionally
+        skipped and ``weight_version_verified`` is False.
         """
 
         snapshot_id = str(snapshot_id)
@@ -198,25 +205,59 @@ class GearGate:
         wv = str(weight_version) if weight_version is not None else snapshot_id
         # Refuse to reuse gate/scorer state stamped for a different snapshot
         # without an explicit re-bind — this catches the "gate built at init,
-        # actor stepped, snapshot advanced" bug per PLAN.md P0.2.
-        stamped_snap = getattr(self.scorer, "policy_snapshot_id", None) if self.scorer else None
-        if (
-            stamped_snap is not None
-            and str(stamped_snap) != snapshot_id
-            and self.strict_vdra
-        ):
-            # Only reject when we are moving *backwards* or diverging from
-            # an explicitly-set version; a fresh bind after an actor step is
-            # exactly what this API is for, so we always overwrite.
-            pass
+        # actor stepped, snapshot advanced" bug per PLAN.md P0.2. We always
+        # overwrite here; the strict comparison below is what enforces the
+        # weight-version invariant.
         self.current_snapshot_id = snapshot_id
         self.current_weight_version = wv
-        self.weight_version_verified = bool(weight_version_verified)
+        self.rollout_server_weight_version = rollout_server_weight_version
+        # P0.1: strict server-fingerprint match. The scorer keeps its own
+        # server_weight_version from _build_scorer/_build_scorer_cpu; we do
+        # NOT overwrite it with the rollout's version — that would defeat
+        # the check. In strict mode both fingerprints must be non-None and
+        # equal, otherwise refuse to proceed with pilot scoring.
+        scorer_server_version = (
+            getattr(self.scorer, "server_weight_version", None) if self.scorer else None
+        )
+        self.scorer_server_weight_version = scorer_server_version
+        verified_flag = bool(weight_version_verified)
+        if (
+            rollout_server_weight_version is not None
+            and scorer_server_version is not None
+        ):
+            server_match = str(scorer_server_version) == str(
+                rollout_server_weight_version
+            )
+            if not server_match and self.strict_vdra:
+                raise RuntimeError(
+                    "strict VDRA rollout/scorer weight-version handshake "
+                    "failed (PLAN.md P0.1): scorer="
+                    f"{scorer_server_version!r} rollout="
+                    f"{rollout_server_weight_version!r}"
+                )
+            verified_flag = server_match
+        elif self.strict_vdra and (
+            rollout_server_weight_version is None or scorer_server_version is None
+        ):
+            # Strict main-paper runs may not proceed without a server-verified
+            # fingerprint on BOTH replicas — a client-assigned label is not
+            # proof of loaded weights.
+            if verified_flag:
+                raise RuntimeError(
+                    "strict VDRA requires a server-reported weight fingerprint "
+                    "for both rollout and scorer (PLAN.md P0.1); got "
+                    f"rollout={rollout_server_weight_version!r} "
+                    f"scorer={scorer_server_version!r}. Refusing to proceed "
+                    "with claimed weight_version_verified=True."
+                )
+            verified_flag = False
+        self.weight_version_verified = verified_flag
         if self.scorer is not None:
             self.scorer.policy_snapshot_id = snapshot_id
             self.scorer.scorer_snapshot_id = snapshot_id
             self.scorer.weight_version = wv
-            self.scorer.weight_version_verified = bool(weight_version_verified)
+            self.scorer.weight_version_verified = verified_flag
+            self.scorer.rollout_server_weight_version = rollout_server_weight_version
 
     def set_terminal_reward_fn(self, fn: Optional[Any]) -> None:
         """P0.4: attach a grader used by the TV estimator for terminal pilots."""
@@ -247,6 +288,18 @@ class GearGate:
             )
         if self.use_online_allocation and self.queue_timeout_seconds <= 0.0:
             raise ValueError("VDRA online_timeout requires queue_timeout_seconds > 0 in strict mode")
+        # P1.7: the online integer allocator floors k_s at max(n_min, 1) — a
+        # config that requests n_min=0 is silently rewritten to n_min=1 by the
+        # solver. Reject that mismatch in strict mode so the paper number
+        # matches what the runtime executed.
+        if self.k_algorithm == "budget_allocation" and self.n_min <= 0:
+            raise ValueError(
+                "strict VDRA requires n_min >= 1: the bounded integer solver "
+                "floors every allocation at max(n_min, 1), so n_min=0 is a "
+                "silent redefinition. Set gear.n_min = 1 or define the k_s=0 "
+                "objective and node-value behavior consistently before "
+                "lowering this floor (PLAN.md P1.7)."
+            )
         if (
             self.k_algorithm == "budget_allocation"
             and (abs(self.rollout_temperature - 1.0) > 1e-12 or abs(self.rollout_top_p - 1.0) > 1e-12)

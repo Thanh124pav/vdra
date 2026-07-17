@@ -28,8 +28,54 @@ from recipe.gear_tree.gear_core.gear import tree_policy_logging as tpl
 from vdra_core.logging_schema import (
     COMPUTE_PROXY_DEFINITION,
     budget_claim_for_mode,
+    build_run_manifest,
     persist_vdra_artifacts,
 )
+
+
+def _evidence_from_tree(tree: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract runtime evidence a single tree can contribute to the manifest.
+
+    Any invariant not positively confirmed on the tree defaults to False so
+    ``build_run_manifest`` never claims a valid main-paper run without proof.
+    """
+
+    allocation_proxy = tree.get("vdra_allocation_proxy", "vdra")
+    return {
+        "policy_snapshot_id": tree.get("policy_snapshot_id")
+        or tree.get("vdra_policy_snapshot_id"),
+        "rollout_server_weight_version": tree.get("vdra_rollout_server_weight_version"),
+        "scorer_server_weight_version": tree.get("vdra_scorer_server_weight_version"),
+        "weight_version_verified": bool(tree.get("vdra_weight_version_verified", False)),
+        "allocation_scope": tree.get(
+            "vdra_allocation_scope", "per_queue_flush_within_tree"
+        ),
+        "allocation_proxy": allocation_proxy,
+        "flush_depths": list(tree.get("vdra_flush_depths") or []),
+        "pilot_execution_mode": tree.get("vdra_pilot_execution_mode"),
+        "weighted_reuse_fallback_count": int(
+            tree.get("vdra_weighted_reuse_fallback_count", 0) or 0
+        ),
+        "token_cap_hit_count": int(tree.get("vdra_token_cap_hit_count", 0) or 0),
+        "unexpected_fallback": bool(tree.get("vdra_unexpected_fallback", False)),
+        "unexpected_token_cap_hit": bool(
+            tree.get("vdra_unexpected_token_cap_hit", False)
+        ),
+        "all_node_accounting_invariants_passed": bool(
+            tree.get("vdra_all_node_accounting_invariants_passed", False)
+        ),
+        "all_snapshot_invariants_passed": bool(
+            tree.get("vdra_all_snapshot_invariants_passed", False)
+        ),
+        "context_contract_passed": bool(
+            tree.get("vdra_context_contract_passed", False)
+        ),
+        # Counters below only reach a run-level value when the trainer stamps
+        # them; per-tree they stay None so downstream aggregation can tell the
+        # difference between "unknown" and "zero".
+        "successful_actor_updates": tree.get("vdra_successful_actor_updates"),
+        "rollout_iterations": tree.get("vdra_rollout_iterations"),
+    }
 
 
 def basic_tree_stats(tree: Dict[str, Any]) -> Dict[str, Any]:
@@ -152,24 +198,30 @@ class TreeDemoLogger:
                 )
                 self._full_dumped += 1
 
+            # P1.3: build the manifest from runtime evidence attached to
+            # this tree, not from a hardcoded True. persist_vdra_artifacts
+            # will refuse to weaken a stronger prior manifest (once any tree
+            # sets run_valid_for_main_results=False the run stays invalid).
+            evidence = _evidence_from_tree(tree)
+            manifest = build_run_manifest(evidence)
+            manifest.update(
+                {
+                    "algorithm_requested": tree.get("gear_algorithm_mode", "gear_tree"),
+                    "algorithm_executed": tree.get("gear_algorithm_mode", "gear_tree"),
+                    "budget_mode": tree.get("vdra_budget_mode", "fixed_main"),
+                    "budget_claim": budget_claim_for_mode(
+                        tree.get("vdra_budget_mode", "fixed_main")
+                    ),
+                    "compute_proxy_definition": COMPUTE_PROXY_DEFINITION,
+                }
+            )
             persist_vdra_artifacts(
                 self.dir,
                 tree,
                 run_id=str(tree.get("run_id", "verl")),
                 tree_id=str(question_id),
                 queue_flushes=tree.get("vdra_queue_flush_records") or [],
-                run_manifest={
-                    "algorithm_requested": tree.get("gear_algorithm_mode", "gear_tree"),
-                    "algorithm_executed": tree.get("gear_algorithm_mode", "gear_tree"),
-                    "run_valid_for_main_results": True,
-                    # P1.3: canonical value if the tree did not stamp its own.
-                    "allocation_scope": tree.get(
-                        "vdra_allocation_scope", "per_queue_flush_within_tree"
-                    ),
-                    "budget_mode": tree.get("vdra_budget_mode", "fixed_main"),
-                    "budget_claim": budget_claim_for_mode(tree.get("vdra_budget_mode", "fixed_main")),
-                    "compute_proxy_definition": COMPUTE_PROXY_DEFINITION,
-                },
+                run_manifest=manifest,
             )
 
         return {"tree_idx": self._seen, **basic}

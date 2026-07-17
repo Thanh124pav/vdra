@@ -264,9 +264,15 @@ def test_default_verl_config_passes_strict_startup_invariants():
     assert gear["pilot_branch_factor"] > max(tree_shape)
     assert gear["queue_timeout_seconds"] > 0
     assert gear["root_allocation"] is False
-    assert gear["allocation_scope"] == "one_tree"
+    # PLAN.md §1.1: canonical runtime scope is per_queue_flush_within_tree.
+    # Mixed-depth flushes are intentional; the previous "one_tree" label is
+    # replaced by the queue-flush scope.
+    assert gear["allocation_scope"] == "per_queue_flush_within_tree"
     assert gear["pilot_execution_mode"] == "fresh_iid"
     assert gear["terminal_pilot_handling"] == "include_in_dispersion"
+    # P1.7: n_min=0 is silently floored at 1 by the integer allocator; the
+    # shipped strict config must not request it.
+    assert gear["n_min"] >= 1
 
 
 def test_calibration_artifact_round_trips_through_strict_loader(tmp_path):

@@ -1,0 +1,60 @@
+name: CPU CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# PLAN.md §6.3 requires a CPU CI workflow that runs the CPU-safe behavioral
+# tests (§6.1) on every push/PR. GPU smoke tests (§6.2) are recorded manually
+# — this workflow deliberately excludes any test that pulls in a GPU stack.
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install CPU-safe dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Minimal test toolchain — vdra_core and treetune.gear are dep-free
+          # Python. The gate/trainer tests importorskip when verl or transformers
+          # are missing, so we do NOT install the full verl stack here.
+          pip install pytest numpy sortedcontainers httpx pyyaml
+          # OmegaConf is used by RayGearTreeTrainer._gear_tree_config; installing
+          # it here lets the P0.2 trainer stub tests run when verl is available.
+          pip install omegaconf
+
+      - name: Install the local package
+        run: pip install -e .
+
+      - name: Run CPU behavioral tests
+        env:
+          # PLAN.md P0.2/P0.5: recipe.gear_tree sits under verl/ and is
+          # imported as `from recipe.gear_tree...`; add the verl root so
+          # importorskip can find it when verl itself isn't installed.
+          PYTHONPATH: ${{ github.workspace }}/verl
+        run: |
+          # Deliberately skip the vLLM-server / launch-script tests which
+          # need external processes, and the math-competition eval which
+          # downloads assets. Section 6.1 behavioral coverage is the CPU CI
+          # scope.
+          python -m pytest tests/ -q \
+            --ignore=tests/test_math_competition_evaluation.py \
+            --ignore=tests/test_vllm_launch_scripts.py \
+            --ignore=tests/test_vllm_scorer.py \
+            --ignore=tests/test_vllm_server.py \
+            --ignore=tests/test_gear_algorithm_variants.py \
+            --ignore=tests/test_gear_finalization.py

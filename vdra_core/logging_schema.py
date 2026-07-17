@@ -376,6 +376,65 @@ def build_compute_summary(tree: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+# --- Run manifest evidence (PLAN.md P1.3) ------------------------------------ #
+
+RUN_MANIFEST_REQUIRED_FIELDS: Sequence[str] = (
+    "policy_snapshot_id",
+    "rollout_server_weight_version",
+    "scorer_server_weight_version",
+    "weight_version_verified",
+    "allocation_scope",
+    "flush_depths",
+    "pilot_execution_mode",
+    "weighted_reuse_fallback_count",
+    "token_cap_hit_count",
+    "successful_actor_updates",
+    "rollout_iterations",
+)
+
+
+def compute_run_valid_for_main_results(evidence: Mapping[str, Any]) -> bool:
+    """Return ``run_valid_for_main_results`` from runtime evidence.
+
+    Per PLAN.md P1.3 a run is a valid main-paper result only when every
+    named invariant is confirmed by runtime evidence. Missing evidence is
+    treated as failure — the trainer must supply positive proof for each
+    condition, not rely on defaults.
+    """
+
+    allocation_proxy = evidence.get("allocation_proxy")
+    if allocation_proxy == "oracle":
+        return False
+    if not bool(evidence.get("weight_version_verified", False)):
+        return False
+    if bool(evidence.get("unexpected_fallback", False)):
+        return False
+    if bool(evidence.get("unexpected_token_cap_hit", False)):
+        return False
+    if not bool(evidence.get("all_node_accounting_invariants_passed", False)):
+        return False
+    if not bool(evidence.get("all_snapshot_invariants_passed", False)):
+        return False
+    if not bool(evidence.get("context_contract_passed", False)):
+        return False
+    return True
+
+
+def build_run_manifest(evidence: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return the canonical run manifest built from runtime evidence.
+
+    ``evidence`` MUST supply at minimum the fields in
+    :data:`RUN_MANIFEST_REQUIRED_FIELDS`; anything else is passed through as-is
+    for callers that want to persist extra descriptive metadata.
+    """
+
+    manifest: Dict[str, Any] = dict(evidence)
+    manifest["run_valid_for_main_results"] = compute_run_valid_for_main_results(evidence)
+    for field in RUN_MANIFEST_REQUIRED_FIELDS:
+        manifest.setdefault(field, None)
+    return manifest
+
+
 def persist_vdra_artifacts(
     output_dir: str | Path,
     tree: Mapping[str, Any],
@@ -385,7 +444,13 @@ def persist_vdra_artifacts(
     queue_flushes: Optional[Iterable[Mapping[str, Any]]] = None,
     run_manifest: Optional[Mapping[str, Any]] = None,
 ) -> None:
-    """Persist the canonical VDRA runtime records for one tree/run."""
+    """Persist the canonical VDRA runtime records for one tree/run.
+
+    ``run_manifest`` is written verbatim under ``run_manifest.json``. Callers
+    that want the aggregated PLAN.md P1.3 flags should compute them with
+    :func:`build_run_manifest` first — this helper deliberately never overwrites
+    a supplied manifest with weaker per-tree defaults.
+    """
 
     out = Path(output_dir)
     append_jsonl(out / "nodes.jsonl", allocation_node_records(tree, run_id=run_id, tree_id=tree_id))
@@ -394,4 +459,28 @@ def persist_vdra_artifacts(
         [queue_flush_record(r, run_id=run_id, tree_id=tree_id) for r in (queue_flushes or [])],
     )
     write_json(out / "compute_summary.json", build_compute_summary(tree))
-    write_json(out / "run_manifest.json", dict(run_manifest or {}))
+    manifest_path = out / "run_manifest.json"
+    # P1.3: never clobber a stronger run-level manifest with a weaker per-tree
+    # default. If the existing file has run_valid_for_main_results=False, keep
+    # it unless the new payload also says False (a run is invalid the moment
+    # any per-tree evidence fails).
+    if manifest_path.exists() and run_manifest is not None:
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+        if isinstance(existing, dict):
+            new_manifest = dict(run_manifest)
+            existing_valid = existing.get("run_valid_for_main_results")
+            new_valid = new_manifest.get("run_valid_for_main_results")
+            # False sticks: once any tree taints the run, the manifest stays
+            # invalid until the trainer explicitly rewrites it.
+            if existing_valid is False:
+                new_manifest["run_valid_for_main_results"] = False
+            elif new_valid is False:
+                pass  # honor the new False
+            elif existing_valid is True and new_valid is None:
+                new_manifest["run_valid_for_main_results"] = True
+            write_json(manifest_path, new_manifest)
+            return
+    write_json(manifest_path, dict(run_manifest or {}))

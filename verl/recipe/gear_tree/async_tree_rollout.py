@@ -551,14 +551,16 @@ try:  # keep CPU-importable when agent_loop isn't installed
             # has stepped, and strict-mode invariants would compare stale
             # state.
             if self._gate is not None:
-                server_weight_version = (
-                    kwargs.get("rollout_server_weight_version")
-                    or kwargs.get("scorer_server_weight_version")
-                )
+                # P0.1: pass the rollout server's own fingerprint separately so
+                # bind_snapshot can compare it against the scorer's fingerprint
+                # (fetched independently in _build_scorer). Setting them from
+                # the same value would silently paper over a mismatch.
+                rollout_server_version = kwargs.get("rollout_server_weight_version")
                 self._gate.bind_snapshot(
                     snapshot_id,
-                    weight_version=server_weight_version,
-                    weight_version_verified=server_weight_version is not None,
+                    weight_version=rollout_server_version,
+                    weight_version_verified=rollout_server_version is not None,
+                    rollout_server_weight_version=rollout_server_version,
                 )
                 # P0.4: wire the terminal grader so terminal pilots contribute
                 # observed reward differences to the dispersion estimate.

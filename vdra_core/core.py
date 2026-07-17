@@ -45,9 +45,13 @@ class AllocationSummary:
 
 
 def simulation_lemma_gap(tv: float, gamma: float) -> float:
+    # P1.6: with tv = epsilon_T/2 the tight discounted denominator is
+    # (1 - gamma) * (1 - gamma + gamma * tv); the earlier form
+    # (1 - gamma) * (1 - gamma + tv) drops the gamma inside the second
+    # factor and inflates the bound.
     gamma = min(max(float(gamma), 0.0), 1.0 - 1e-8)
     tv = max(float(tv), 0.0)
-    denom = (1.0 - gamma) * (1.0 - gamma + tv)
+    denom = (1.0 - gamma) * (1.0 - gamma + gamma * tv)
     if denom <= 0.0 or not math.isfinite(denom):
         return 0.0
     return gamma * tv / denom

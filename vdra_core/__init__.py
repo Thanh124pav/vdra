@@ -10,6 +10,9 @@ from .core import (
     value_gap_bound,
 )
 from .logging_schema import (
+    RUN_MANIFEST_REQUIRED_FIELDS,
+    build_run_manifest,
+    compute_run_valid_for_main_results,
     node_allocated_k,
     summarize_vdra_tree,
     validate_node_accounting,
@@ -18,8 +21,11 @@ from .logging_schema import (
 
 __all__ = [
     "AllocationSummary",
+    "RUN_MANIFEST_REQUIRED_FIELDS",
     "allocate_branch_factors",
     "apply_tail_correction",
+    "build_run_manifest",
+    "compute_run_valid_for_main_results",
     "dispersion_bound_from_pair_tvs",
     "largest_remainder_rounding",
     "simulation_lemma_gap",

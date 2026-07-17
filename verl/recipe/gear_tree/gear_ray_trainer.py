@@ -21,6 +21,11 @@ from verl import DataProto
 from verl.trainer.ppo.metric_utils import reduce_metrics
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
+from recipe.gear_tree.context_contract import (
+    resolve_max_edge_prompt_length,
+    resolve_max_original_prompt_length,
+    validate_context_contract,
+)
 from recipe.gear_tree.replay_buffer import GearTreeReplayBuffer
 
 
@@ -92,6 +97,17 @@ class RayGearTreeTrainer(RayPPOTrainer):
     def _current_policy_snapshot_id(self) -> str:
         return f"global_step:{int(self.global_steps)}"
 
+    def _resolved_max_edge_prompt_length(self) -> int:
+        """P0.2: delegate to :func:`resolve_max_edge_prompt_length` so startup
+        validation, edges_to_dataproto, and future tensorization sites share
+        one resolver.
+        """
+
+        return resolve_max_edge_prompt_length(self.config.data)
+
+    def _resolved_max_original_prompt_length(self) -> int:
+        return resolve_max_original_prompt_length(self.config.data)
+
     def _validate_replay_startup(self) -> None:
         replay_cfg = self._replay_config()
         target = int(replay_cfg["target_edges_per_update"])
@@ -121,28 +137,21 @@ class RayGearTreeTrainer(RayPPOTrainer):
         # accepted configs that then failed at training time when the deepest
         # edge query overflowed the actor limit.
         gt = self._gear_tree_config()
-        tree_shape = list(gt.get("tree_shape") or [])
-        max_depth = max(len(tree_shape), 1)
-        M = int(gt.get("segment_length", 0) or 0)
-        max_original = int(
-            self.config.data.get("max_original_prompt_length", 0)
-            or self.config.data.max_prompt_length
-        )
-        max_edge = int(
-            self.config.data.get("max_edge_prompt_length", 0)
-            or self.config.data.max_prompt_length
-        )
-        worst_case = max_original + max(max_depth - 1, 0) * M
-        if max_edge > 0 and worst_case > max_edge:
-            raise ValueError(
-                "context-length bound overflow (PLAN.md P0.5): "
-                f"max_original_prompt_length={max_original}, deepest edge "
-                f"depth={max_depth}, segment_length={M}, worst-case edge "
-                f"query length={worst_case} > max_edge_prompt_length={max_edge}. "
-                "Either reduce M or tree_shape depth, pre-filter prompts to "
-                "reserve segment headroom, or raise data.max_edge_prompt_length "
-                "(within the model context length)."
+        try:
+            model_context = int(
+                self.config.actor_rollout_ref.rollout.get("prompt_length", 0)
+                or self.config.actor_rollout_ref.rollout.get("max_model_len", 0)
+                or 0
             )
+        except Exception:
+            model_context = 0
+        # P0.2: single-source validation of the entire context contract.
+        validate_context_contract(
+            data_cfg=self.config.data,
+            tree_shape=list(gt.get("tree_shape") or []),
+            segment_length=int(gt.get("segment_length", 0) or 0),
+            model_context_length=model_context,
+        )
 
     def _should_postpone_sampled_update(self, sampled_edges: List[Dict[str, Any]]) -> bool:
         replay_cfg = self._replay_config()
@@ -157,6 +166,33 @@ class RayGearTreeTrainer(RayPPOTrainer):
         target = int(replay_cfg["target_edges_per_update"])
         return len(sampled_edges) < target and len(sampled_edges) % ppo_mini != 0
 
+    def _fetch_rollout_server_weight_version(self, gear_cfg: Dict[str, Any]) -> str | None:
+        """P0.1: server-reported weight version for the rollout replica.
+
+        The trainer probes the SAME endpoint the scorer probes, so a mismatch
+        between the two fingerprints proves the replicas have diverged. We do
+        not treat a missing server fingerprint as a passing weight-version
+        verification — the return value is either a non-empty string or None.
+        """
+
+        api_base = gear_cfg.get("rollout_api_base") or gear_cfg.get("scorer_api_base")
+        if not api_base:
+            return None
+        try:
+            from recipe.gear_tree.gear_core.gear.vllm_scorer import (
+                fetch_server_weight_version,
+            )
+        except Exception:
+            return None
+        try:
+            return fetch_server_weight_version(
+                str(api_base),
+                api_key=str(gear_cfg.get("scorer_api_key", "EMPTY")),
+                timeout=float(gear_cfg.get("scorer_version_timeout", 5.0)),
+            )
+        except Exception:
+            return None
+
     def _generate_tree_edges(self, gen_batch: DataProto) -> List[Dict[str, Any]]:
         """Run tree rollout and return raw replayable edge records."""
         gt = self._gear_tree_config()
@@ -166,11 +202,18 @@ class RayGearTreeTrainer(RayPPOTrainer):
         gear_cfg = gt.setdefault("gear", {})
         if isinstance(gear_cfg, dict):
             gear_cfg["policy_snapshot_id"] = snapshot_id
+        # P0.1: fetch the rollout server's own weight version once per
+        # generation. TreeAgentLoop.run reads
+        # non_tensor_batch['rollout_server_weight_version'] and passes it to
+        # gate.bind_snapshot, which lets the strict-mode gate refuse to
+        # continue when the scorer's server fingerprint diverges.
+        rollout_server_version = self._fetch_rollout_server_weight_version(gear_cfg)
         gen_batch.meta_info["gear_tree_config"] = gt
         gen_batch.meta_info["global_steps"] = self.global_steps
         gen_batch.meta_info["rollout_iteration"] = getattr(self, "rollout_iteration", 0)
         gen_batch.meta_info["policy_snapshot_id"] = snapshot_id
         gen_batch.meta_info["current_rollout_snapshot_id"] = snapshot_id
+        gen_batch.meta_info["rollout_server_weight_version"] = rollout_server_version
         # P0.1: propagate the snapshot into per-row non_tensor_batch so
         # AgentLoopWorker forwards it to TreeAgentLoop.run() as kwargs.
         # meta_info is retained above only for logging; the agent loop reads
@@ -181,6 +224,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
         snapshot_col = np.array([snapshot_id] * row_count, dtype=object)
         gen_batch.non_tensor_batch["policy_snapshot_id"] = snapshot_col
         gen_batch.non_tensor_batch["current_rollout_snapshot_id"] = snapshot_col
+        gen_batch.non_tensor_batch["rollout_server_weight_version"] = np.array(
+            [rollout_server_version] * row_count, dtype=object
+        )
         backend = gt.get("rollout_backend", "async")
         if backend != "async":
             raise NotImplementedError(
@@ -232,10 +278,12 @@ class RayGearTreeTrainer(RayPPOTrainer):
     def _edges_to_update_batch(self, sampled_edges: List[Dict[str, Any]], metrics: Dict[str, Any]) -> DataProto:
         from recipe.gear_tree.tree_data import edges_to_dataproto
 
+        # P0.2: use the same L_edge_max the startup validator resolved so a
+        # config that clears validation cannot then fail here on a deep edge.
         edge_batch = edges_to_dataproto(
             sampled_edges,
             self.tokenizer,
-            max_prompt_length=self.config.data.max_prompt_length,
+            max_prompt_length=self._resolved_max_edge_prompt_length(),
             max_response_length=self.config.data.max_response_length,
             include_old_log_probs=True,
         )
