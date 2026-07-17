@@ -126,6 +126,13 @@ class QueueFlushResult:
         return max(int(self.reserve_draw) - self.reserve_consumed, 0)
 
     def to_record(self) -> dict:
+        # P1.8: primary fields use pruned/expanded/transferred/lower_bounds/
+        # upper_bounds terminology; the legacy reserve_* fields are kept as
+        # deprecated compatibility aliases so existing dashboards continue
+        # to render while new consumers migrate.
+        saved = int(sum(self.summary.saved_allocations.values()))
+        unmet = int(sum(self.summary.unmet_demands.values()))
+        additional = int(sum(self.summary.additional_allocations.values()))
         return {
             "queue_id": self.queue_id,
             "policy_snapshot_id": self.items[0].policy_snapshot_id if self.items else None,
@@ -133,8 +140,17 @@ class QueueFlushResult:
             "queue_wait_seconds": self.queue_wait_seconds,
             "queue_size_at_flush": len(self.items),
             "default_queue_budget": self.base_budget,
-            "total_saved_budget": int(sum(self.summary.saved_allocations.values())),
-            "total_unmet_demand": int(sum(self.summary.unmet_demands.values())),
+            # --- P1.8 primary fields --------------------------------------
+            "pruned_budget": saved,
+            "expanded_budget": additional,
+            "transferred_budget_within_flush": additional,
+            "lower_bounds": dict(self.summary.lower_bounds),
+            "upper_bounds": dict(self.summary.upper_bounds),
+            "objective_before": float(self.summary.objective_before),
+            "objective_after": float(self.summary.objective_after),
+            # --- deprecated reserve_* aliases (P1.8) ----------------------
+            "total_saved_budget": saved,
+            "total_unmet_demand": unmet,
             "reserve_before_flush": self.reserve_available_at_flush,
             "reserve_drawn": self.reserve_draw,
             "reserve_after_flush": self.reserve_after_flush,

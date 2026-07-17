@@ -61,6 +61,208 @@ def test_async_segment_generator_fires_n_concurrent():
         assert len(s.token_ids) == len(s.logprobs)
 
 
+def test_prompt_sticky_key_supports_high_token_ids():
+    """P0.1: sticky key derivation must not crash on token IDs above 255."""
+
+    from recipe.gear_tree.async_tree_rollout import _prompt_sticky_key
+
+    # Real vocabularies have IDs up to ~130k; the legacy bytes(list) call
+    # raised on anything above 255.
+    key = _prompt_sticky_key([1, 2, 300, 50000, 128000])
+    assert key.startswith("stick:")
+    # Deterministic
+    assert key == _prompt_sticky_key([1, 2, 300, 50000, 128000])
+    # Different tails -> different keys
+    assert key != _prompt_sticky_key([1, 2, 300, 50000, 128001])
+
+
+def test_async_generate_gives_unique_request_ids_with_shared_sticky_key():
+    """P0.1: concurrent siblings must have unique request IDs but the pilot's
+    continuation must inherit its pilot's sticky key for prefix cache reuse."""
+
+    class RecordingManager:
+        def __init__(self):
+            self.calls = []
+
+        async def generate(self, request_id, *, prompt_ids, sampling_params, sticky_key=None, **_):
+            self.calls.append({
+                "request_id": request_id,
+                "sticky_key": sticky_key,
+                "prompt": list(prompt_ids),
+            })
+            return types.SimpleNamespace(token_ids=[42], log_probs=[-0.1], stop_reason="stop")
+
+    mgr = RecordingManager()
+    gen = AsyncServerSegmentGenerator(mgr, MockTok(), free_max_tokens=32)
+    # High-vocab prompt exercises the P0.1 fix end-to-end.
+    asyncio.run(gen.segment_fn([100_000, 128_000, 1], branch_factor=8, max_tokens=8))
+    request_ids = [c["request_id"] for c in mgr.calls]
+    sticky_keys = [c["sticky_key"] for c in mgr.calls]
+    # Eight concurrent siblings -> eight distinct request IDs, eight distinct
+    # sticky keys (so they load-balance across replicas).
+    assert len(set(request_ids)) == 8
+    assert len(set(sticky_keys)) == 8
+
+
+def test_assert_scorer_matches_rollout_requires_server_verification():
+    """P0.3: strict mode must fail when scorer has no server-verified fingerprint,
+    and must fail when scorer/rollout server fingerprints diverge even if the
+    client-side snapshot label matches."""
+
+    from recipe.gear_tree.async_tree_rollout import assert_scorer_matches_rollout
+
+    # No scorer -> no-op.
+    assert_scorer_matches_rollout(None, "step:1")
+
+    # Matching server-verified fingerprints -> passes.
+    ok = types.SimpleNamespace(
+        weight_version="server:v1",
+        server_weight_version="server:v1",
+        weight_version_verified=True,
+    )
+    assert_scorer_matches_rollout(
+        ok, "step:1", rollout_server_weight_version="server:v1", strict_vdra=True
+    )
+
+    # Mismatched server fingerprints raise even when snapshot labels agree.
+    mismatched = types.SimpleNamespace(
+        weight_version="server:v1",
+        server_weight_version="server:v1",
+        weight_version_verified=True,
+    )
+    with pytest.raises(RuntimeError):
+        assert_scorer_matches_rollout(
+            mismatched, "step:1", rollout_server_weight_version="server:v2", strict_vdra=True
+        )
+
+    # Strict mode with no server fingerprint raises when the trainer supplies
+    # one — this is the "labels match but weights unverified" case.
+    unverified = types.SimpleNamespace(
+        weight_version="step:1",
+        server_weight_version=None,
+        weight_version_verified=False,
+    )
+    with pytest.raises(RuntimeError):
+        assert_scorer_matches_rollout(
+            unverified, "step:1", rollout_server_weight_version="server:v1", strict_vdra=True
+        )
+
+
+def test_gear_gate_bind_snapshot_updates_scorer_and_rejects_sentinel():
+    """P0.2: rebind must stamp the scorer AND reject the unknown sentinel."""
+
+    from recipe.gear_tree.gear_gate import GearGate
+
+    class _StubScorer:
+        pass
+
+    scorer = _StubScorer()
+    scorer.policy_snapshot_id = None
+    scorer.weight_version = None
+    gate = GearGate(
+        k_algorithm="budget_allocation",
+        scorer=scorer,
+        pilot_branch_factor=2,
+        max_depth=2,
+    )
+    gate.bind_snapshot("step:5", weight_version="server:abc", weight_version_verified=True)
+    assert gate.current_snapshot_id == "step:5"
+    assert gate.current_weight_version == "server:abc"
+    assert gate.weight_version_verified is True
+    assert scorer.policy_snapshot_id == "step:5"
+    assert scorer.scorer_snapshot_id == "step:5"
+    assert scorer.weight_version == "server:abc"
+    assert scorer.weight_version_verified is True
+
+    # After actor step: rebinding with a new snapshot must succeed and update
+    # the scorer's stamped weight_version.
+    gate.bind_snapshot("step:6", weight_version="server:def", weight_version_verified=True)
+    assert scorer.weight_version == "server:def"
+
+    with pytest.raises(RuntimeError):
+        gate.bind_snapshot("rollout_step:unknown")
+
+
+def test_gear_gate_forwards_terminal_grader_into_estimator():
+    """P0.4: set_terminal_reward_fn must propagate through estimate_node_async
+    so terminal pilots contribute observed reward variance to dispersion."""
+
+    from recipe.gear_tree.gear_gate import GearGate
+
+    class _StubAsyncScorer:
+        async def score_one(self, prefix, y):
+            return -1.0
+
+        async def score_one_tokens(self, prefix, y):
+            return -1.0
+
+    gate = GearGate(
+        k_algorithm="budget_allocation",
+        scorer=_StubAsyncScorer(),
+        pilot_branch_factor=2,
+        max_depth=2,
+    )
+    calls = []
+
+    def grader(node):
+        calls.append(node.get("text"))
+        return 0.7
+
+    gate.set_terminal_reward_fn(grader)
+    assert gate.terminal_reward_fn(  # type: ignore[misc]
+        {"text": "hello", "full_text": "prompt hello"}
+    ) == 0.7
+    assert calls == ["hello"]
+
+
+def test_pilot_continuation_inherits_pilot_sticky_key():
+    """P0.1: SegmentNodeExpander must stamp a sticky key on each pilot so the
+    pilot completion path in _expand_reusing_pilots can reuse it."""
+
+    from recipe.gear_tree.tree_rollout import _expand_reusing_pilots
+
+    class _Tok(MockTok):
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) % 90 for c in text][:8]
+
+    mgr = MockServerManager(seed=13)
+    gen = AsyncServerSegmentGenerator(mgr, _Tok(), free_max_tokens=32)
+    expander = SegmentNodeExpander(gen, _Tok())
+    node = {"full_token_ids": [7], "gear_segment_id": "root"}
+    pilots = asyncio.run(
+        expander.expand(current_node=node, prefix="hi", depth=0, max_tokens=4, branch_factor=2)
+    )
+    assert all("vdra_sticky_key" in p for p in pilots)
+    assert pilots[0]["vdra_sticky_key"] != pilots[1]["vdra_sticky_key"]
+
+    # Continuation via _expand_reusing_pilots must forward the recorded key.
+    captured = []
+
+    async def segment_fn(prompt_ids, branch_factor, max_tokens, *, sibling_sticky_keys=None):
+        captured.append({
+            "sibling_sticky_keys": list(sibling_sticky_keys) if sibling_sticky_keys else None,
+            "prompt": list(prompt_ids),
+        })
+        return [types.SimpleNamespace(
+            token_ids=[99],
+            text="X",
+            finish_reason="stop",
+            logprobs=[-0.1],
+            sum_logprobs=-0.1,
+            num_tokens=1,
+        )]
+
+    # Force the pilot to be "length" so completion runs.
+    pilot = pilots[0]
+    pilot["finish_reason"] = "length"
+    parent = {
+        "full_token_ids": [7],
+        "vdra_pilot_children": [pilot],
+    }
+    asyncio.run(_expand_reusing_pilots(parent, 1, 4, segment_fn))
+    assert captured[0]["sibling_sticky_keys"] == [pilot["vdra_sticky_key"]]
+
+
 def test_async_full_path_to_dataproto():
     mgr = MockServerManager(seed=5)
     gen = AsyncServerSegmentGenerator(mgr, MockTok(), free_max_tokens=32)
