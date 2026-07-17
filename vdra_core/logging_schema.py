@@ -263,7 +263,11 @@ BUDGET_CLAIMS = {
         "fixed main expansion budget; pilot and scoring overhead reported separately"
     ),
     "fixed_total_generated": (
-        "fixed total generated tokens (pilot + support + main expansion under one cap); "
+        "legacy alias for uniform_full_tree_token_cap; pilot + support + main "
+        "expansion share one maximum-style full-tree token cap; likelihood scoring reported separately"
+    ),
+    "uniform_full_tree_token_cap": (
+        "pilot + support + main expansion share one maximum-style full-tree token cap; "
         "likelihood scoring reported separately"
     ),
 }

@@ -83,7 +83,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
         gear_invalid_support_policy: str = "error",
         gear_budget_mode: str = "fixed_main",
         gear_allocation_proxy: str = "vdra",
-        gear_rounding_strategy: str = "largest_remainder",
+        gear_rounding_strategy: str = "integer_marginal",
         gear_rounding_seed: int = 0,
         gear_n_min: int = 1,
         gear_budget_overhead_mode: str = "flexible",
@@ -188,9 +188,13 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
         }:
             raise ValueError(f"Unsupported gear_allocation_proxy: {gear_allocation_proxy}")
         self.gear_allocation_proxy = gear_allocation_proxy
-        if gear_rounding_strategy not in {"largest_remainder", "nearest_repair", "stochastic"}:
+        legacy_rounding = {"largest_remainder", "nearest_repair", "stochastic"}
+        current_rounding = {"integer_marginal", "bounded_marginal_integer"}
+        if gear_rounding_strategy not in legacy_rounding | current_rounding:
             raise ValueError(f"Unsupported gear_rounding_strategy: {gear_rounding_strategy}")
-        self.gear_rounding_strategy = gear_rounding_strategy
+        self.gear_rounding_strategy = (
+            "integer_marginal" if gear_rounding_strategy in legacy_rounding else gear_rounding_strategy
+        )
         self.gear_rounding_seed = int(gear_rounding_seed)
         self.gear_budget_queue_timeout_seconds = float(
             gear_budget_queue_timeout_seconds
@@ -491,7 +495,7 @@ class GEARInferenceStrategy(HybridInferenceStrategy):
             use_residual_budget=self.gear_use_residual_budget,
             policy_snapshot_id=problem_id,
             strict_vdra=getattr(self, "gear_strict_vdra", True),
-            rounding_strategy=getattr(self, "gear_rounding_strategy", "largest_remainder"),
+            rounding_strategy=getattr(self, "gear_rounding_strategy", "integer_marginal"),
             rounding_seed=getattr(self, "gear_rounding_seed", 0),
         )
 

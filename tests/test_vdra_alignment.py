@@ -224,6 +224,34 @@ def test_allocation_timing_wraps_allocator_call(monkeypatch):
     assert flushed[0].to_record()["allocation_seconds"] >= 0.02
 
 
+def test_queue_node_accounting_preserves_solver_bounds_and_objective_fields():
+    async def run():
+        manager = RootQueueManager(
+            queue_count=1,
+            queue_capacity=2,
+            timeout_seconds=99.0,
+            reserve_pool=SharedReservePool(queue_count=1),
+            policy_snapshot_id="p0",
+        )
+        cold = _node("cold", 6, 2, 0.1)
+        hot = _node("hot", 6, 10, 1.0)
+        manager.enqueue(OnlineQueueItem(cold, 6, 0, policy_snapshot_id="p0"), now=1.0)
+        manager.enqueue(OnlineQueueItem(hot, 6, 0, policy_snapshot_id="p0"), now=1.0)
+        flushed = await manager.flush_ready(now=1.0)
+        return cold, hot, flushed[0].summary
+
+    cold, hot, summary = asyncio.run(run())
+    for node in (cold, hot):
+        key = node["vdra_node_id"]
+        assert node["vdra_lower_bound_k"] == summary.lower_bounds[key]
+        assert node["vdra_upper_bound_k"] == summary.upper_bounds[key]
+        assert node["vdra_requested_budget"] == summary.requested_budget
+        assert node["vdra_allocated_budget"] == summary.allocated_budget
+        assert node["vdra_objective_before"] == summary.objective_before
+        assert node["vdra_objective_after"] == summary.objective_after
+        assert node["vdra_solver_name"] == summary.solver_name
+
+
 def test_default_verl_config_passes_strict_startup_invariants():
     import yaml
 
@@ -237,6 +265,8 @@ def test_default_verl_config_passes_strict_startup_invariants():
     assert gear["queue_timeout_seconds"] > 0
     assert gear["root_allocation"] is False
     assert gear["allocation_scope"] == "one_tree"
+    assert gear["pilot_execution_mode"] == "fresh_iid"
+    assert gear["terminal_pilot_handling"] == "include_in_dispersion"
 
 
 def test_calibration_artifact_round_trips_through_strict_loader(tmp_path):

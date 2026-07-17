@@ -9,6 +9,10 @@ import random
 
 import numpy as np
 import torch
+import transformers
+
+if not hasattr(transformers, "AutoModelForVision2Seq"):
+    transformers.AutoModelForVision2Seq = object
 
 from recipe.gear_tree.tree_rollout import SegmentSample, build_tree
 from recipe.gear_tree.tree_advantage import extract_edges_from_tree

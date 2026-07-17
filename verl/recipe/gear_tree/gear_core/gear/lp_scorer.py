@@ -33,30 +33,37 @@ class LPScorer:
 
     score_fn: Callable[..., Awaitable[List[float]]]
     tokenize_fn: Callable[[str], List[int]]
-    cache: Dict[Tuple[str, int], float] = field(default_factory=dict)
+    cache: Dict[Tuple[Any, ...], float] = field(default_factory=dict)
+
+    async def score_one_tokens(
+        self, prefix_token_ids: Sequence[int], continuation_token_ids: Sequence[int]
+    ) -> float:
+        """Return exact token-boundary ``log pi(continuation | prefix)``."""
+
+        prefix_tokens = [int(tok) for tok in prefix_token_ids]
+        continuation_tokens = [int(tok) for tok in continuation_token_ids]
+        if not continuation_tokens:
+            return 0.0
+        full_tokens = prefix_tokens + continuation_tokens
+        prompt_logprobs = await self.score_fn(prompt_token_ids=full_tokens)
+        if not prompt_logprobs or len(prompt_logprobs) != len(full_tokens):
+            return -math.inf
+
+        tail = prompt_logprobs[-len(continuation_tokens):]
+        clean = [lp for lp in tail if lp is not None]
+        if len(clean) != len(continuation_tokens):
+            return -math.inf
+        return float(sum(clean))
 
     async def score_one(self, prefix: str, y_text: str) -> float:
-        """Return sum of log pi(y_text | prefix) per token."""
+        """Return sum of log pi(y_text | prefix) per token on the legacy text path."""
 
-        full = prefix + y_text
         prefix_tokens = self.tokenize_fn(prefix)
-        full_tokens = self.tokenize_fn(full)
+        full_tokens = self.tokenize_fn(prefix + y_text)
         suffix_len = len(full_tokens) - len(prefix_tokens)
         if suffix_len <= 0:
             return 0.0
-
-        prompt_logprobs = await self.score_fn(prompt=full)
-        if not prompt_logprobs:
-            return -math.inf
-
-        # vLLM returns one logprob per prompt token; take the tail of length
-        # suffix_len. The first token of any prompt has logprob None, but it
-        # belongs to the prefix so it does not affect the suffix slice.
-        tail = prompt_logprobs[-suffix_len:]
-        clean = [lp for lp in tail if lp is not None]
-        if not clean:
-            return -math.inf
-        return float(sum(clean))
+        return await self.score_one_tokens(prefix_tokens, full_tokens[-suffix_len:])
 
     async def score_batch(
         self,

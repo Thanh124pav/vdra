@@ -76,7 +76,8 @@ def test_budget_claim_follows_budget_mode():
     from vdra_core.logging_schema import budget_claim_for_mode
 
     assert "fixed main expansion budget" in budget_claim_for_mode("fixed_main")
-    assert "one cap" in budget_claim_for_mode("fixed_total_generated")
+    assert "uniform_full_tree_token_cap" in budget_claim_for_mode("fixed_total_generated")
+    assert "maximum-style full-tree token cap" in budget_claim_for_mode("uniform_full_tree_token_cap")
     assert "fixed main expansion budget" in budget_claim_for_mode(None)
     with pytest.raises(ValueError, match="Unknown VDRA budget mode"):
         budget_claim_for_mode("free_lunch")
@@ -105,5 +106,5 @@ def test_demo_logger_manifest_reflects_tree_budget_mode(tmp_path: Path):
     logger.close()
     manifest = json.loads((tmp_path / "run_manifest.json").read_text())
     assert manifest["budget_mode"] == "fixed_total_generated"
-    assert "one cap" in manifest["budget_claim"]
+    assert "uniform_full_tree_token_cap" in manifest["budget_claim"]
     assert "pilot-support decode tokens" in manifest["compute_proxy_definition"]

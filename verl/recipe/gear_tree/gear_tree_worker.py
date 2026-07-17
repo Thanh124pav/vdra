@@ -58,6 +58,12 @@ def _build_gate(gt: dict, scorer=None):
         artifact_dir=g.get("artifact_dir"),
         eps_tail_calibration_path=g.get("eps_tail_source"),
         eps_tail_calibration_metadata=g.get("eps_tail_calibration_metadata"),
+        pilot_execution_mode=g.get("pilot_execution_mode", "fresh_iid"),
+        weighted_reuse_fallback=g.get("weighted_reuse_fallback", "fresh_iid"),
+        representative_weight_mode=g.get("representative_weight_mode", "cluster_multiplicity"),
+        terminal_pilot_handling=g.get("terminal_pilot_handling", "include_in_dispersion"),
+        rollout_temperature=g.get("rollout_temperature", 1.0),
+        rollout_top_p=g.get("rollout_top_p", 1.0),
     )
 
 

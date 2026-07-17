@@ -320,6 +320,8 @@ class MegatronPPOActor(BasePPOActor):
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
+        if "edge_weights" in data.batch.keys():
+            select_keys.append("edge_weights")
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         if self.has_multi_modal_inputs:
             data = data.select(select_keys, ["multi_modal_inputs"])
@@ -441,20 +443,24 @@ class MegatronPPOActor(BasePPOActor):
                 # Extract pre-computed rollout importance sampling weights if present
                 # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                 rollout_is_weights = data.get("rollout_is_weights", None)
+                edge_weights = data.get("edge_weights", None)
 
                 # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
                 # are computed centrally in ray_trainer.py for consistency and efficiency.
                 # This ensures metrics are computed uniformly across all batches at the trainer level
                 # and avoids redundant computation across workers and micro-batches.
-                pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                    old_log_prob=old_log_prob,
-                    log_prob=log_prob,
-                    advantages=advantages,
-                    response_mask=response_mask,
-                    loss_agg_mode=loss_agg_mode,
-                    config=self.config,
-                    rollout_is_weights=rollout_is_weights,
-                )
+                loss_kwargs = {
+                    "old_log_prob": old_log_prob,
+                    "log_prob": log_prob,
+                    "advantages": advantages,
+                    "response_mask": response_mask,
+                    "loss_agg_mode": loss_agg_mode,
+                    "config": self.config,
+                    "rollout_is_weights": rollout_is_weights,
+                }
+                if edge_weights is not None and "edge_weights" in policy_loss_fn.__code__.co_varnames:
+                    loss_kwargs["edge_weights"] = edge_weights
+                pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(**loss_kwargs)
 
                 stats.update(
                     {

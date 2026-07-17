@@ -205,6 +205,101 @@ async def _annotate_mc_async(tree, data_instance, mc_rollout, grade_fn, K, unfin
         tree["reward"] = sum(rewards) / len(rewards) if rewards else 0.0
 
 
+def _resolve_external_score_fn_cpu(g: dict):
+    """Import ``module:attr`` (default attr ``score_node``) if configured."""
+    spec = g.get("external_score_module")
+    if not spec:
+        return None
+    import importlib
+
+    module_name, _, attr = str(spec).partition(":")
+    module = importlib.import_module(module_name)
+    return getattr(module, attr or "score_node")
+
+
+def _build_scorer_cpu(g: dict, tokenizer: Any):
+    """Build the log-prob scorer without depending on agent-loop imports."""
+    api_base = g.get("scorer_api_base")
+    if not api_base or tokenizer is None:
+        return None
+    from recipe.gear_tree.gear_core.gear.vllm_scorer import (
+        VLLMLogprobClient,
+        make_lp_scorer,
+        resolve_vllm_model_id,
+    )
+
+    rollout_snapshot = g.get("policy_snapshot_id")
+    scorer_snapshot = g.get("scorer_snapshot_id", rollout_snapshot)
+    if rollout_snapshot is not None and scorer_snapshot != rollout_snapshot:
+        raise RuntimeError(
+            "VDRA scorer snapshot does not match rollout snapshot: "
+            f"{scorer_snapshot!r} != {rollout_snapshot!r}"
+        )
+    model_id = resolve_vllm_model_id(
+        str(api_base),
+        g.get("scorer_model"),
+        api_key=str(g.get("scorer_api_key", "EMPTY")),
+        timeout=float(g.get("scorer_model_resolve_timeout", 10.0)),
+    )
+    client = VLLMLogprobClient(
+        api_base=str(api_base),
+        model=model_id,
+        api_key=str(g.get("scorer_api_key", "EMPTY")),
+        max_concurrency=int(g.get("scorer_max_concurrency", 64)),
+    )
+    scorer = make_lp_scorer(
+        client, lambda text: tokenizer.encode(text, add_special_tokens=False)
+    )
+    scorer.policy_snapshot_id = rollout_snapshot
+    scorer.scorer_snapshot_id = scorer_snapshot
+    scorer.scorer_model = model_id
+    return scorer
+
+
+def _build_gate_cpu(gt: dict, tokenizer: Any = None):
+    if not gt.get("gear", {}).get("enabled", False):
+        return None
+    from recipe.gear_tree.gear_gate import GearGate
+    from recipe.gear_tree.calibration import resolve_gear_calibration
+
+    g = resolve_gear_calibration(dict(gt["gear"]))
+    if gt.get("policy_snapshot_id") is not None:
+        g.setdefault("policy_snapshot_id", gt.get("policy_snapshot_id"))
+    scorer = _build_scorer_cpu(g, tokenizer)
+    return GearGate(
+        epsilon=g.get("epsilon", 0.02), r_max=g.get("r_max", 1.0), gamma=g.get("gamma", 0.9),
+        alpha=g.get("alpha", 0.05), k_algorithm=g.get("k_algorithm", "budget_allocation"),
+        n_min=g.get("n_min", 1), pilot_branch_factor=g.get("pilot_branch_factor", None), likelihood_samples_per_distribution=g.get("likelihood_samples_per_distribution", 2), root_allocation=g.get("root_allocation", False),
+        skip_near_leaf_expand=g.get("skip_near_leaf_expand", True),
+        max_depth=len(gt.get("tree_shape", [])) or None, enable_share=g.get("enable_share", False),
+        scorer=scorer,
+        eps_tail=g.get("eps_tail", 0.0),
+        eps_tail_by_depth=g.get("eps_tail_by_depth", None),
+        bound_form=g.get("bound_form", "linear"),
+        tv_estimator=g.get("tv_estimator", "tanh"),
+        tv_first_phase_tokens=g.get("tv_first_phase_tokens", 60),
+        tv_second_phase_tokens=g.get("tv_second_phase_tokens", 60),
+        queue_count=g.get("queue_count", 4), queue_capacity=g.get("queue_capacity", 8),
+        queue_timeout_seconds=g.get("queue_timeout_seconds", 1.0),
+        use_residual_budget=g.get("use_residual_budget", True), strict_vdra=g.get("strict_vdra", True), invalid_support_policy=g.get("invalid_support_policy", "error"), budget_mode=g.get("budget_mode", "fixed_main"),
+        allocation_proxy=g.get("allocation_proxy", "vdra"),
+        allocation_runtime=g.get("allocation_runtime", "online_timeout"),
+        artifact_dir=g.get("artifact_dir"),
+        eps_tail_calibration_path=g.get("eps_tail_source"),
+        eps_tail_calibration_metadata=g.get("eps_tail_calibration_metadata"),
+        oracle_rollouts_per_node=g.get("oracle_rollouts_per_node", 16),
+        external_score_fn=_resolve_external_score_fn_cpu(g),
+        rounding_strategy=g.get("rounding_strategy", "integer_marginal"),
+        rounding_seed=g.get("rounding_seed", 0),
+        pilot_execution_mode=g.get("pilot_execution_mode", "fresh_iid"),
+        weighted_reuse_fallback=g.get("weighted_reuse_fallback", "fresh_iid"),
+        representative_weight_mode=g.get("representative_weight_mode", "cluster_multiplicity"),
+        terminal_pilot_handling=g.get("terminal_pilot_handling", "include_in_dispersion"),
+        rollout_temperature=g.get("rollout_temperature", 1.0),
+        rollout_top_p=g.get("rollout_top_p", 1.0),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # TreeAgentLoop — registered agent for verl's agent-loop framework (GPU path).
 # --------------------------------------------------------------------------- #
@@ -218,6 +313,10 @@ try:  # keep CPU-importable when agent_loop isn't installed
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             gt = dict(self.config.get("gear_tree", {}))
+            gear_cfg = dict(gt.get("gear", {}))
+            gear_cfg.setdefault("rollout_temperature", float(self.rollout_config.temperature))
+            gear_cfg.setdefault("rollout_top_p", float(self.rollout_config.top_p))
+            gt["gear"] = gear_cfg
             self._gt = gt
             self._gen = AsyncServerSegmentGenerator(
                 self.server_manager, self.tokenizer,
@@ -324,6 +423,10 @@ try:  # keep CPU-importable when agent_loop isn't installed
             external_score_fn=_resolve_external_score_fn(g),
             rounding_strategy=g.get("rounding_strategy", "integer_marginal"),
             rounding_seed=g.get("rounding_seed", 0),
+            pilot_execution_mode=g.get("pilot_execution_mode", "fresh_iid"),
+            weighted_reuse_fallback=g.get("weighted_reuse_fallback", "fresh_iid"),
+            representative_weight_mode=g.get("representative_weight_mode", "cluster_multiplicity"),
+            terminal_pilot_handling=g.get("terminal_pilot_handling", "include_in_dispersion"),
         )
 
     def _resolve_external_score_fn(g: dict):
@@ -384,7 +487,7 @@ except Exception:  # pragma: no cover
     TreeAgentLoop = None  # type: ignore
 
     def _build_gate(gt, tokenizer=None):  # type: ignore
-        return None
+        return _build_gate_cpu(gt, tokenizer=tokenizer)
 
 
 def collect_tree_edges(dataproto) -> List[Dict[str, Any]]:

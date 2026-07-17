@@ -138,3 +138,41 @@ def test_generate_tree_edges_injects_policy_snapshot_into_config():
     assert seen["policy_snapshot_id"] == "global_step:7"
     assert seen["gear"]["policy_snapshot_id"] == "global_step:7"
     assert out[0]["policy_snapshot_id"] == "global_step:7"
+
+
+def test_edges_to_update_batch_rejects_overlength_without_mutating_logprobs():
+    trainer = _trainer()
+    edge = _edge()
+    edge["response_token_ids"] = [7, 8, 9, 10]
+    edge["actor_shifted_log_probs"] = [-0.1, -0.2, -0.3, -0.4]
+    original_logprobs = list(edge["actor_shifted_log_probs"])
+    with pytest.raises(ValueError, match="max_response_length"):
+        trainer._edges_to_update_batch([edge], {})
+    assert edge["actor_shifted_log_probs"] == original_logprobs
+
+
+def test_edges_to_update_batch_rejects_overlength_query():
+    trainer = _trainer()
+    edge = _edge()
+    edge["query_token_ids"] = [1, 2, 3, 4, 5]
+    with pytest.raises(ValueError, match="max_prompt_length"):
+        trainer._edges_to_update_batch([edge], {})
+
+
+def test_update_batch_threads_edge_weights_to_actor_tensor():
+    trainer = _trainer()
+    edge = _edge()
+    edge["edge_weight"] = 2.5
+    batch = trainer._edges_to_update_batch([edge], {})
+    assert "edge_weights" in batch.batch
+    assert batch.batch["edge_weights"][0, :2].tolist() == [2.5, 2.5]
+
+
+def test_missing_edge_weight_defaults_to_one_when_batch_has_weights():
+    trainer = _trainer()
+    weighted = _edge("weighted")
+    weighted["edge_weight"] = 2.0
+    plain = _edge("plain")
+    batch = trainer._edges_to_update_batch([weighted, plain], {})
+    assert batch.batch["edge_weights"][0, :2].tolist() == [2.0, 2.0]
+    assert batch.batch["edge_weights"][1, :2].tolist() == [1.0, 1.0]

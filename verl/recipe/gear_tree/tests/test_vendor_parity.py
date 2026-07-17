@@ -13,6 +13,7 @@ Run:
 """
 
 import dataclasses
+import inspect
 
 import numpy as np
 import pytest
@@ -79,10 +80,21 @@ def test_budget_allocation_parity():
         {"id": "b", "vdra_dispersion_C": 0.05},
         {"id": "c", "vdra_dispersion_C": 0.50},
     ]
-    o = ba_orig.allocate_branch_factors(nodes, total_budget=9, lambda_=0.02, n_min=0)
-    n = ba_new.allocate_branch_factors(nodes, total_budget=9, lambda_=0.02, n_min=0)
+    orig_kwargs = {"total_budget": 9, "n_min": 0}
+    new_kwargs = {"total_budget": 9, "n_min": 0}
+    if "lambda_" in inspect.signature(ba_orig.allocate_branch_factors).parameters:
+        orig_kwargs["lambda_"] = 0.02
+    if "lambda_" in inspect.signature(ba_new.allocate_branch_factors).parameters:
+        new_kwargs["lambda_"] = 0.02
+    o = ba_orig.allocate_branch_factors(nodes, **orig_kwargs)
+    n = ba_new.allocate_branch_factors(nodes, **new_kwargs)
     # AllocationSummary is a distinct class per package, so compare field values.
-    assert dataclasses.asdict(o) == dataclasses.asdict(n)
+    # Runtime timing is intentionally measured per call and cannot be exact.
+    od = dataclasses.asdict(o)
+    nd = dataclasses.asdict(n)
+    od.pop("solver_time_ms", None)
+    nd.pop("solver_time_ms", None)
+    assert od == nd
 
 
 def test_tv_distance_parity():

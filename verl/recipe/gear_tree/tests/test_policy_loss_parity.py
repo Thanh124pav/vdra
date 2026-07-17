@@ -11,7 +11,12 @@ Run:
     PYTHONPATH=verl python -m pytest verl/recipe/gear_tree/tests/test_policy_loss_parity.py -q
 """
 
+import pytest
 import torch
+import transformers
+
+if not hasattr(transformers, "AutoModelForVision2Seq"):
+    transformers.AutoModelForVision2Seq = object
 
 from recipe.gear_tree.policy_loss import compute_policy_loss_treetune
 
@@ -113,3 +118,62 @@ def test_differs_from_no_prob_mask_when_high_prob_tokens_exist():
     )
     without_mask = _reference_loss(old, new, adv, mask, use_prob_mask=False)
     assert not torch.allclose(with_mask, without_mask)
+
+
+def test_all_masked_policy_loss_is_finite_zero():
+    old = torch.full((2, 3), -0.01)  # prob mask removes every token.
+    new = old.clone().requires_grad_(True)
+    adv = torch.ones(2, 3)
+    mask = torch.ones(2, 3)
+    loss, clipfrac, kl, clipfrac_lower = compute_policy_loss_treetune(
+        old_log_prob=old,
+        log_prob=new,
+        advantages=adv,
+        response_mask=mask,
+        config=_Cfg(),
+    )
+    assert loss.item() == 0.0
+    assert clipfrac.item() == 0.0
+    assert kl.item() == 0.0
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert new.grad is not None
+
+
+def test_edge_weighted_loss_matches_explicit_duplication():
+    old = torch.full((2, 2), -1.0)
+    new = old.clone()
+    adv = torch.tensor([[1.0, 1.0], [3.0, 3.0]])
+    mask = torch.ones(2, 2)
+    weights = torch.tensor([[2.0, 2.0], [1.0, 1.0]])
+
+    weighted, *_ = compute_policy_loss_treetune(
+        old_log_prob=old,
+        log_prob=new,
+        advantages=adv,
+        response_mask=mask,
+        config=_Cfg(),
+        edge_weights=weights,
+    )
+    duplicated, *_ = compute_policy_loss_treetune(
+        old_log_prob=torch.cat([old[:1], old[:1], old[1:]], dim=0),
+        log_prob=torch.cat([new[:1], new[:1], new[1:]], dim=0),
+        advantages=torch.cat([adv[:1], adv[:1], adv[1:]], dim=0),
+        response_mask=torch.ones(3, 2),
+        config=_Cfg(),
+    )
+    assert torch.allclose(weighted, duplicated)
+
+
+@pytest.mark.parametrize("bad_weight", [0.0, -1.0, float("nan"), float("inf")])
+def test_edge_weights_must_be_positive_and_finite(bad_weight):
+    old = torch.full((1, 2), -1.0)
+    with pytest.raises(ValueError, match="edge_weights"):
+        compute_policy_loss_treetune(
+            old_log_prob=old,
+            log_prob=old,
+            advantages=torch.ones(1, 2),
+            response_mask=torch.ones(1, 2),
+            config=_Cfg(),
+            edge_weights=torch.tensor([[bad_weight, 1.0]]),
+        )

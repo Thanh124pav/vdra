@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 class EngineLPScorer:
     engine: Any  # vllm.LLM (offline) or a fake with .generate
     tokenizer: Any
-    cache: Dict[Tuple[str, str], float] = field(default_factory=dict)
+    cache: Dict[Tuple[Any, ...], float] = field(default_factory=dict)
 
     def _prompt_token_logprobs(self, full_ids: Sequence[int]) -> List[Any]:
         from vllm import SamplingParams  # lazy import (GPU env)
@@ -44,25 +44,35 @@ class EngineLPScorer:
     def _encode(self, text: str) -> List[int]:
         return self.tokenizer.encode(text, add_special_tokens=False)
 
-    def score_one(self, prefix: str, y_text: str) -> float:
-        """Sum of ``log pi(y_text | prefix)`` per token (LPScorer.score_one parity)."""
-        key = (prefix, y_text)
+    def score_one_tokens(
+        self, prefix_token_ids: Sequence[int], continuation_token_ids: Sequence[int]
+    ) -> float:
+        """Sum ``log pi(continuation_token_ids | prefix_token_ids)`` exactly."""
+        prefix_tokens = [int(tok) for tok in prefix_token_ids]
+        continuation_tokens = [int(tok) for tok in continuation_token_ids]
+        key = ("tokens", tuple(prefix_tokens), tuple(continuation_tokens))
         if key in self.cache:
             return self.cache[key]
-
-        full = prefix + y_text
-        prefix_tokens = self._encode(prefix)
-        full_tokens = self._encode(full)
-        suffix_len = len(full_tokens) - len(prefix_tokens)
-        if suffix_len <= 0:
+        if not continuation_tokens:
             self.cache[key] = 0.0
             return 0.0
 
+        full_tokens = prefix_tokens + continuation_tokens
         plp = self._prompt_token_logprobs(full_tokens)
-        if not plp:
-            return -math.inf
-        tail = plp[-suffix_len:]
-        clean = [lp for lp in tail if lp is not None]
-        val = float(sum(clean)) if clean else -math.inf
+        if not plp or len(plp) != len(full_tokens):
+            val = -math.inf
+        else:
+            tail = plp[-len(continuation_tokens):]
+            clean = [lp for lp in tail if lp is not None]
+            val = float(sum(clean)) if len(clean) == len(continuation_tokens) else -math.inf
         self.cache[key] = val
         return val
+
+    def score_one(self, prefix: str, y_text: str) -> float:
+        """Sum of ``log pi(y_text | prefix)`` per token (legacy text path)."""
+        prefix_tokens = self._encode(prefix)
+        full_tokens = self._encode(prefix + y_text)
+        suffix_len = len(full_tokens) - len(prefix_tokens)
+        if suffix_len <= 0:
+            return 0.0
+        return self.score_one_tokens(prefix_tokens, full_tokens[-suffix_len:])

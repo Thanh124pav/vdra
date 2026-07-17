@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import random
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
 
@@ -19,6 +20,14 @@ _REQUIRED_EDGE_FIELDS = (
     "value",
     "reward",
 )
+
+
+@dataclass(frozen=True)
+class ReplayReservation:
+    reservation_id: int
+    edge_ids: Tuple[str, ...]
+    edges: Tuple[Dict[str, Any], ...]
+    stats: Dict[str, Any]
 
 
 class GearTreeReplayBuffer:
@@ -43,10 +52,15 @@ class GearTreeReplayBuffer:
             raise ValueError("Only underfill_policy='use_available' is currently supported")
         self.sampling_seed = int(sampling_seed)
         self._edges: Dict[str, Dict[str, Any]] = {}
+        self._reserved: Dict[str, int] = {}
+        self._next_reservation_id = 1
         self.metrics: Dict[str, int] = {
             "added_edges": 0,
             "expired_edges": 0,
             "sampled_edges": 0,
+            "reserved_edges": 0,
+            "committed_edges": 0,
+            "rolled_back_edges": 0,
         }
 
     def __len__(self) -> int:
@@ -82,6 +96,7 @@ class GearTreeReplayBuffer:
             edge_id
             for edge_id, edge in self._edges.items()
             if int(current_step) - int(edge.get("generation_step", current_step)) >= self.max_edge_age
+            and edge_id not in self._reserved
         ]
         for edge_id in expired:
             self._edges.pop(edge_id, None)
@@ -94,7 +109,9 @@ class GearTreeReplayBuffer:
         size_before = len(self._edges)
         expired_ids = self.expire(current_step=current_step)
         grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        for edge in self._edges.values():
+        for edge_id, edge in self._edges.items():
+            if edge_id in self._reserved:
+                continue
             grouped[str(edge["question_id"])].append(edge)
 
         rng = random.Random(self.sampling_seed + int(current_step))
@@ -127,6 +144,7 @@ class GearTreeReplayBuffer:
             "buffer/candidate_edges": len(candidates),
             "buffer/sampled_edges": len(sampled),
             "buffer/size_after": len(self._edges),
+            "buffer/reserved_edges": len(self._reserved),
             "buffer/underfilled": float(len(sampled) < self.target_edges_per_update),
             "buffer/unique_questions": len({edge["question_id"] for edge in sampled}),
             "buffer/mean_edge_age": sum(ages) / len(ages) if ages else 0.0,
@@ -143,12 +161,58 @@ class GearTreeReplayBuffer:
             )
         return [dict(edge) for edge in sampled], stats
 
+    def reserve_for_update(self, *, current_step: int) -> ReplayReservation:
+        sampled, stats = self.sample_for_update(current_step=current_step, remove=False)
+        reservation_id = self._next_reservation_id
+        self._next_reservation_id += 1
+        edge_ids = tuple(str(edge["edge_id"]) for edge in sampled)
+        for edge_id in edge_ids:
+            if edge_id in self._reserved:
+                raise RuntimeError(f"Replay edge {edge_id!r} is already reserved")
+            self._reserved[edge_id] = reservation_id
+        self.metrics["reserved_edges"] += len(edge_ids)
+        stats["buffer/reservation_id"] = reservation_id
+        stats["removed_edge_ids"] = list(edge_ids)
+        stats["buffer/reserved_edges"] = len(self._reserved)
+        return ReplayReservation(
+            reservation_id=reservation_id,
+            edge_ids=edge_ids,
+            edges=tuple(dict(edge) for edge in sampled),
+            stats=stats,
+        )
+
+    def commit(self, reservation: ReplayReservation) -> List[str]:
+        self._check_reservation(reservation)
+        removed = self.remove(reservation.edge_ids)
+        for edge_id in reservation.edge_ids:
+            self._reserved.pop(edge_id, None)
+        self.metrics["committed_edges"] += len(removed)
+        if sorted(removed) != sorted(reservation.edge_ids):
+            raise RuntimeError("Replay commit did not remove exactly the reserved edges")
+        return removed
+
+    def rollback(self, reservation: ReplayReservation) -> None:
+        self._check_reservation(reservation)
+        for edge_id in reservation.edge_ids:
+            self._reserved.pop(edge_id, None)
+        self.metrics["rolled_back_edges"] += len(reservation.edge_ids)
+
     def remove(self, edge_ids: Iterable[str]) -> List[str]:
         removed: List[str] = []
         for edge_id in sorted(str(edge_id) for edge_id in edge_ids):
             if self._edges.pop(edge_id, None) is not None:
+                self._reserved.pop(edge_id, None)
                 removed.append(edge_id)
         return removed
+
+    def _check_reservation(self, reservation: ReplayReservation) -> None:
+        mismatched = [
+            edge_id
+            for edge_id in reservation.edge_ids
+            if self._reserved.get(edge_id) != reservation.reservation_id
+        ]
+        if mismatched:
+            raise RuntimeError(f"Replay reservation is not active for edges: {mismatched}")
 
     def save(self, checkpoint_dir: str | Path) -> None:
         target = Path(checkpoint_dir)
@@ -170,6 +234,7 @@ class GearTreeReplayBuffer:
                     "underfill_policy": self.underfill_policy,
                     "sampling_seed": self.sampling_seed,
                     "metrics": self.metrics,
+                    "next_reservation_id": self._next_reservation_id,
                 },
                 indent=2,
                 sort_keys=True,
@@ -192,6 +257,7 @@ class GearTreeReplayBuffer:
             sampling_seed=meta.get("sampling_seed", 0),
         )
         buffer.metrics = dict(meta.get("metrics", {}))
+        buffer._next_reservation_id = int(meta.get("next_reservation_id", 1))
         edge_file = source / "gear_tree_replay_buffer.jsonl"
         if edge_file.exists():
             for line in edge_file.read_text(encoding="utf-8").splitlines():

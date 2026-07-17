@@ -33,6 +33,7 @@ class SegmentSample:
     logprobs: Optional[List[float]] = None  # per-token chosen-token logprob
     sum_logprobs: Optional[float] = None
     num_tokens: Optional[int] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.num_tokens is None:
@@ -143,9 +144,7 @@ def build_tree(
                 child["leaf"] = False
                 dfs(child, child["full_text"], depth + 1)
 
-        child_rewards = [child["reward"] for child in children]
-        node["reward"] = float(np.mean(child_rewards))
-        node["reward_std"] = float(np.std(child_rewards))
+        _aggregate_child_rewards(node, children)
 
     dfs(tree, root_prompt_text, 0)
     tree["tree_construction_seconds"] = time.time() - t0
@@ -282,9 +281,7 @@ async def async_build_tree(
                 child["leaf"] = False
                 await dfs(child, child["full_text"], depth + 1)
 
-        child_rewards = [child["reward"] for child in children]
-        node["reward"] = float(np.mean(child_rewards))
-        node["reward_std"] = float(np.std(child_rewards))
+        _aggregate_child_rewards(node, children)
 
     await dfs(tree, root_prompt_text, 0)
     tree["tree_construction_seconds"] = time.time() - t0
@@ -296,9 +293,9 @@ def _uniform_generated_token_cap(
 ) -> int:
     """Expected generated tokens of the uniform SPO tree with the same shape.
 
-    This is the ``fixed_total_generated`` budget cap: pilot, support and main
-    expansion generation must all fit under the token count the uniform
-    baseline would have spent on main expansion alone.
+    This is the ``uniform_full_tree_token_cap`` budget cap: pilot, support and
+    main expansion generation must all fit under the maximum-style token count
+    a full uniform tree would have spent on main expansion alone.
     """
 
     total = 0
@@ -308,6 +305,39 @@ def _uniform_generated_token_cap(
         per_node = int(free_max_tokens) if depth == max_depth - 1 else int(M)
         total += width * per_node
     return total
+
+
+def _aggregate_child_rewards(node: Dict[str, Any], children: List[Dict[str, Any]]) -> None:
+    child_rewards = [float(child["reward"]) for child in children]
+    if not child_rewards:
+        node["reward"] = 0.0
+        node["reward_std"] = 0.0
+        return
+    weights = []
+    has_weights = False
+    for child in children:
+        maybe = child.get("edge_weight", child.get("vdra_representative_weight"))
+        if maybe is None:
+            weights.append(1.0)
+            continue
+        weight = float(maybe)
+        if not np.isfinite(weight) or weight <= 0.0:
+            raise ValueError(f"invalid weighted-reuse child weight: {maybe!r}")
+        weights.append(weight)
+        has_weights = True
+    if not has_weights:
+        node["reward"] = float(np.mean(child_rewards))
+        node["reward_std"] = float(np.std(child_rewards))
+        return
+    total_weight = float(sum(weights))
+    if total_weight <= 0.0:
+        raise ValueError("weighted-reuse child weights sum to zero")
+    reward = sum(w * r for w, r in zip(weights, child_rewards)) / total_weight
+    variance = sum(w * (r - reward) ** 2 for w, r in zip(weights, child_rewards)) / total_weight
+    node["reward"] = float(reward)
+    node["reward_std"] = float(np.sqrt(max(variance, 0.0)))
+    node["vdra_weighted_parent_value"] = float(reward)
+    node["vdra_child_weight_sum"] = total_weight
 
 
 def _candidate_to_sample(node: Dict[str, Any], candidate: Dict[str, Any]) -> Optional[SegmentSample]:
@@ -329,6 +359,7 @@ def _candidate_to_sample(node: Dict[str, Any], candidate: Dict[str, Any]) -> Opt
         ),
         sum_logprobs=candidate.get("sum_logprobs"),
         num_tokens=candidate.get("num_tokens"),
+        metadata=dict(candidate.get("vdra_sample_metadata") or {}),
     )
 
 
@@ -356,6 +387,87 @@ def _retained_pilot_samples(node: Dict[str, Any], count: int) -> List[SegmentSam
     return samples
 
 
+def _pilot_overhead(node: Dict[str, Any]) -> tuple[List[Dict[str, Any]], int]:
+    all_pilots = list(node.get("vdra_all_pilot_children") or node.get("vdra_pilot_children") or [])
+    pilot_tokens = sum(len(candidate.get("response_token_ids") or []) for candidate in all_pilots)
+    return all_pilots, pilot_tokens
+
+
+def _refresh_generation_totals(node: Dict[str, Any]) -> None:
+    node["vdra_total_generated_tokens"] = (
+        int(node.get("vdra_pilot_generated_tokens", 0) or 0)
+        + int(node.get("vdra_pilot_support_generated_tokens", 0) or 0)
+        + int(node.get("vdra_main_expansion_generated_tokens", 0) or 0)
+    )
+
+
+async def _expand_fresh_iid(
+    node: Dict[str, Any],
+    allocated_k: int,
+    max_tokens: Optional[int],
+    segment_fn,
+    token_budget: Optional[Dict[str, Any]] = None,
+) -> List[SegmentSample]:
+    requested = max(int(allocated_k), 0)
+    final_count = requested
+    if token_budget is not None and final_count:
+        per_branch = int(max_tokens) if max_tokens is not None else int(token_budget.get("free_max_tokens", 1024))
+        remaining = max(int(token_budget["cap"]) - int(token_budget["used"]), 0)
+        allowed = min(final_count, remaining // per_branch) if per_branch > 0 else final_count
+        if allowed < final_count:
+            node["vdra_token_cap_hit"] = True
+            node["vdra_budget_capped"] = True
+            token_budget["cap_hit_count"] = int(token_budget.get("cap_hit_count", 0)) + 1
+        final_count = max(allowed, 0)
+
+    samples = await segment_fn(node["full_token_ids"], final_count, max_tokens) if final_count else []
+    if token_budget is not None and samples:
+        token_budget["used"] = int(token_budget["used"]) + sum(len(sample.token_ids) for sample in samples)
+
+    all_pilots, pilot_tokens = _pilot_overhead(node)
+    node["vdra_pilot_execution_mode"] = "fresh_iid"
+    node["vdra_pilot_children_generated"] = len(all_pilots)
+    node["vdra_pilot_generated_tokens"] = pilot_tokens
+    node["vdra_pilot_completion_generated_tokens"] = 0
+    node["vdra_pilot_children_shortcut"] = 0
+    node["vdra_shortcut_overage"] = len(node.get("vdra_shortcut_children") or [])
+    node["vdra_pilot_children_reused"] = 0
+    node["vdra_pilot_children_discarded"] = len(all_pilots)
+    node["vdra_additional_children_generated"] = len(samples)
+    node["vdra_generation_request_count"] = node.get("vdra_generation_request_count", 0) + len(samples)
+    node["vdra_main_expansion_generated_tokens"] = sum(len(sample.token_ids) for sample in samples)
+    node["vdra_pilot_reuse_rate"] = 0.0
+    _refresh_generation_totals(node)
+    if not node.get("vdra_budget_capped") and len(samples) != requested:
+        raise RuntimeError("fresh_iid expansion did not produce allocated_k final children")
+    return list(samples)
+
+
+def _sample_metadata(sample: Any) -> Dict[str, Any]:
+    metadata = getattr(sample, "metadata", None)
+    if metadata is None:
+        metadata = {}
+        try:
+            setattr(sample, "metadata", metadata)
+        except Exception:
+            return {}
+    return metadata
+
+
+def _annotate_weighted_reuse_samples(samples: List[SegmentSample], *, denominator: int) -> None:
+    multiplicities: List[int] = []
+    for sample in samples:
+        metadata = _sample_metadata(sample)
+        multiplicities.append(max(int(metadata.get("vdra_cluster_multiplicity", 1) or 1), 1))
+    denom = max(sum(multiplicities), int(denominator), 1)
+    for idx, (sample, multiplicity) in enumerate(zip(samples, multiplicities)):
+        metadata = _sample_metadata(sample)
+        metadata.setdefault("vdra_cluster_id", idx)
+        metadata["vdra_cluster_multiplicity"] = multiplicity
+        metadata["vdra_representative_weight"] = multiplicity / float(denom)
+        metadata.setdefault("vdra_original_pilot_indices", [idx])
+
+
 async def _expand_reusing_pilots(
     node: Dict[str, Any],
     allocated_k: int,
@@ -376,6 +488,7 @@ async def _expand_reusing_pilots(
     completion_tokens = 0
     completion_requests = 0
     for sample in retained:
+        sample_metadata = dict(_sample_metadata(sample))
         if sample.finish_reason == "length":
             # Free-budget depths (max_tokens None) must also finish the pilot,
             # otherwise a truncated 60-token prefix would be graded as final.
@@ -403,6 +516,7 @@ async def _expand_reusing_pilots(
                             + float(cont.sum_logprobs or 0.0)
                         ),
                         num_tokens=int(sample.num_tokens or 0) + int(cont.num_tokens or 0),
+                        metadata=sample_metadata,
                     )
                     completion_tokens += len(cont.token_ids)
         completed.append(sample)
@@ -412,7 +526,7 @@ async def _expand_reusing_pilots(
 
     missing = max(reuse_budget - len(completed), 0)
     if token_budget is not None and missing:
-        # fixed_total_generated: fresh branches only while the shared cap has
+        # uniform_full_tree_token_cap: fresh branches only while the shared cap has
         # room for a full segment each (completions may overshoot by at most
         # one segment).
         per_branch = (
@@ -435,14 +549,12 @@ async def _expand_reusing_pilots(
         token_budget["used"] = int(token_budget["used"]) + sum(
             len(sample.token_ids) for sample in additional
         )
-    all_pilots = list(node.get("vdra_all_pilot_children") or node.get("vdra_pilot_children") or [])
+    all_pilots, pilot_tokens = _pilot_overhead(node)
     generated = len(all_pilots)
     reused = len(completed) + len(shortcut)
+    node["vdra_pilot_execution_mode"] = "weighted_reuse"
     node["vdra_pilot_children_generated"] = generated
-    node["vdra_pilot_generated_tokens"] = sum(
-        len(candidate.get("response_token_ids") or [])
-        for candidate in all_pilots
-    )
+    node["vdra_pilot_generated_tokens"] = pilot_tokens
     node["vdra_pilot_completion_generated_tokens"] = completion_tokens
     node["vdra_pilot_children_shortcut"] = len(shortcut)
     node["vdra_pilot_children_reused"] = reused
@@ -460,7 +572,9 @@ async def _expand_reusing_pilots(
         + node["vdra_main_expansion_generated_tokens"]
     )
     node["vdra_pilot_reuse_rate"] = reused / generated if generated else 0.0
-    return shortcut + completed + list(additional)
+    samples = shortcut + completed + list(additional)
+    _annotate_weighted_reuse_samples(samples, denominator=generated + len(additional))
+    return samples
 
 async def async_build_tree_online_alloc(
     root_prompt_text: str,
@@ -505,7 +619,7 @@ async def async_build_tree_online_alloc(
     tree_id = str(data_instance.get("tree_id", policy_snapshot_id))
     budget_mode = str(getattr(gear_gate, "budget_mode", "fixed_main"))
     token_budget: Optional[Dict[str, Any]] = None
-    if budget_mode == "fixed_total_generated":
+    if budget_mode in {"fixed_total_generated", "uniform_full_tree_token_cap"}:
         token_budget = {
             "cap": _uniform_generated_token_cap(tree_shape, M, max_depth, free_max_tokens),
             "used": 0,
@@ -581,6 +695,10 @@ async def async_build_tree_online_alloc(
             "gear_segment_id": f"{parent.get('gear_segment_id', 'root')}/{depth}/{idx}",
             "gear_parent_segment_id": parent.get("gear_segment_id", "root"),
         }
+        metadata = _sample_metadata(sample)
+        child.update(dict(metadata or {}))
+        if metadata.get("vdra_representative_weight") is not None:
+            child["edge_weight"] = float(metadata["vdra_representative_weight"])
         if sample.sum_logprobs is not None:
             child["sum_logprobs"] = float(sample.sum_logprobs)
             child["num_tokens"] = int(sample.num_tokens)
@@ -665,7 +783,7 @@ async def async_build_tree_online_alloc(
             node["leaf"] = True
             return
         if token_budget is not None and token_budget["used"] >= token_budget["cap"]:
-            # fixed_total_generated: the shared cap is exhausted — grade the
+            # uniform_full_tree_token_cap: the shared cap is exhausted — grade the
             # truncated node instead of spending more pilot/main tokens.
             token_budget["cap_hit_count"] = int(token_budget["cap_hit_count"]) + 1
             node["vdra_token_cap_hit"] = True
@@ -751,12 +869,19 @@ async def async_build_tree_online_alloc(
             node["reward"] = float(grade_fn(node["full_text"], node["text"], data_instance))
             node["leaf"] = True
             return
-        samples = await _expand_reusing_pilots(
-            node, allocated_branch_factor, _max_tokens(depth), segment_fn,
-            token_budget=token_budget,
-        )
-        # _expand_reusing_pilots enforces the final branch budget, including
-        # terminal shortcut pilots and reusable nonterminal pilots.
+        pilot_mode = str(getattr(gear_gate, "pilot_execution_mode", "fresh_iid"))
+        if pilot_mode == "fresh_iid":
+            samples = await _expand_fresh_iid(
+                node, allocated_branch_factor, _max_tokens(depth), segment_fn,
+                token_budget=token_budget,
+            )
+        elif pilot_mode == "weighted_reuse":
+            samples = await _expand_reusing_pilots(
+                node, allocated_branch_factor, _max_tokens(depth), segment_fn,
+                token_budget=token_budget,
+            )
+        else:
+            raise ValueError(f"Unsupported pilot_execution_mode: {pilot_mode!r}")
         children = [
             _sample_child(node, depth, idx, sample)
             for idx, sample in enumerate(samples)
@@ -780,9 +905,7 @@ async def async_build_tree_online_alloc(
             await asyncio.gather(
                 *(_process_expandable(child, depth + 1) for child in expandable)
             )
-        child_rewards = [child["reward"] for child in children]
-        node["reward"] = float(np.mean(child_rewards)) if child_rewards else 0.0
-        node["reward_std"] = float(np.std(child_rewards)) if child_rewards else 0.0
+        _aggregate_child_rewards(node, children)
 
     try:
         await _process_expandable(tree, 0)
@@ -808,9 +931,7 @@ async def async_build_tree_online_alloc(
         for child in children:
             backprop(child)
         if children:
-            child_rewards = [child["reward"] for child in children]
-            node["reward"] = float(np.mean(child_rewards))
-            node["reward_std"] = float(np.std(child_rewards))
+            _aggregate_child_rewards(node, children)
 
     backprop(tree)
 
@@ -826,7 +947,15 @@ async def async_build_tree_online_alloc(
             reused = int(node.get("vdra_pilot_children_reused", 0) or 0)
             shortcut = int(node.get("vdra_pilot_children_shortcut", 0) or 0)
             discarded = int(node.get("vdra_pilot_children_discarded", 0) or 0)
-            if reused > generated or shortcut > reused or discarded != generated - reused:
+            mode = str(node.get("vdra_pilot_execution_mode", tree.get("vdra_pilot_execution_mode", "fresh_iid")))
+            if mode == "fresh_iid":
+                if reused != 0 or shortcut != 0 or discarded != generated:
+                    raise RuntimeError("VDRA fresh_iid pilot accounting invariant failed")
+                allocated = int(node.get("vdra_allocated_k", 0) or 0)
+                final_children = len(node.get("children") or [])
+                if not node.get("vdra_budget_capped") and final_children != allocated:
+                    raise RuntimeError("VDRA fresh_iid final child count invariant failed")
+            elif reused > generated or shortcut > reused or discarded != generated - reused:
                 raise RuntimeError("VDRA pilot accounting invariant failed")
             if int(node.get("vdra_total_generated_tokens", 0) or 0) != (
                 int(node.get("vdra_pilot_generated_tokens", 0) or 0)
@@ -851,6 +980,7 @@ async def async_build_tree_online_alloc(
     tree["vdra_allocation_scope"] = "one_tree"
     tree["vdra_budget_mode"] = budget_mode
     tree["vdra_allocation_proxy"] = allocation_proxy
+    tree["vdra_pilot_execution_mode"] = str(getattr(gear_gate, "pilot_execution_mode", "fresh_iid"))
     if token_budget is not None:
         tree["vdra_token_cap"] = int(token_budget["cap"])
         tree["vdra_generated_tokens_under_cap"] = int(token_budget["used"])
@@ -872,6 +1002,7 @@ async def async_build_tree_online_alloc(
                 # evaluation-only; they must never be reported as main results.
                 "run_valid_for_main_results": allocation_proxy != "oracle",
                 "allocation_proxy": allocation_proxy,
+                "pilot_execution_mode": tree["vdra_pilot_execution_mode"],
                 "oracle_rollouts_per_node": (
                     getattr(gear_gate, "oracle_rollouts_per_node", None)
                     if allocation_proxy == "oracle"
@@ -983,11 +1114,10 @@ async def async_build_tree_batch_alloc(
             expand_nodes.append(node)
             branch_factors.append(bf)
 
+        pilot_mode = str(getattr(gear_gate, "pilot_execution_mode", "fresh_iid"))
+        expand_fn = _expand_fresh_iid if pilot_mode == "fresh_iid" else _expand_reusing_pilots
         sample_batches = await asyncio.gather(
-            *[
-                _expand_reusing_pilots(node, bf, max_tokens, segment_fn)
-                for node, bf in zip(expand_nodes, branch_factors)
-            ]
+            *[expand_fn(node, bf, max_tokens, segment_fn) for node, bf in zip(expand_nodes, branch_factors)]
         ) if expand_nodes else []
 
         next_frontier: List[Dict[str, Any]] = []
@@ -1005,6 +1135,10 @@ async def async_build_tree_batch_alloc(
                 if s.sum_logprobs is not None:
                     child["sum_logprobs"] = float(s.sum_logprobs)
                     child["num_tokens"] = int(s.num_tokens)
+                metadata = _sample_metadata(s)
+                child.update(dict(metadata or {}))
+                if metadata.get("vdra_representative_weight") is not None:
+                    child["edge_weight"] = float(metadata["vdra_representative_weight"])
                 children.append(child)
 
             children = await _filter_children_any(
@@ -1034,9 +1168,7 @@ async def async_build_tree_batch_alloc(
             return
         for child in children:
             backprop(child)
-        child_rewards = [child["reward"] for child in children]
-        node["reward"] = float(np.mean(child_rewards))
-        node["reward_std"] = float(np.std(child_rewards))
+        _aggregate_child_rewards(node, children)
 
     backprop(tree)
     tree["tree_construction_seconds"] = time.time() - t0

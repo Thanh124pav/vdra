@@ -38,8 +38,44 @@ if TYPE_CHECKING:  # ActorConfig is only used as a type hint; avoid a hard impor
 
 
 def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Exactly ``treetune.trainers.utils.masked_mean`` with ``axis=None``."""
-    return (values * mask).sum() / mask.sum()
+    """Masked mean with a finite differentiable zero for empty masks."""
+
+    mask = mask.to(dtype=values.dtype)
+    numerator = (values * mask).sum()
+    denominator = mask.sum()
+    if denominator.item() == 0:
+        return numerator * 0.0
+    return numerator / denominator
+
+
+def _weighted_masked_mean(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    edge_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Mean over valid tokens, optionally normalized by positive edge weights."""
+
+    mask = mask.to(dtype=values.dtype)
+    if edge_weights is None:
+        return _masked_mean(values, mask)
+    weights = edge_weights.to(dtype=values.dtype, device=values.device)
+    if weights.shape != values.shape:
+        raise ValueError(
+            f"edge_weights shape {tuple(weights.shape)} must match values shape {tuple(values.shape)}"
+        )
+    valid_weights = weights[mask.bool()]
+    if valid_weights.numel() and (
+        not torch.isfinite(valid_weights).all().item()
+        or torch.any(valid_weights <= 0).item()
+    ):
+        raise ValueError("edge_weights must be finite and strictly positive on valid tokens")
+    weighted_mask = mask * weights
+    numerator = (values * weighted_mask).sum()
+    denominator = weighted_mask.sum()
+    if denominator.item() == 0:
+        return numerator * 0.0
+    return numerator / denominator
 
 
 @register_policy_loss("treetune_ppo")
@@ -51,6 +87,7 @@ def compute_policy_loss_treetune(
     loss_agg_mode: str = "token-mean",
     config: "Optional[ActorConfig]" = None,
     rollout_is_weights: torch.Tensor | None = None,
+    edge_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """PPO-clip loss identical to treetune ``_compute_actor_loss`` (PPO-clip core).
 
@@ -83,7 +120,7 @@ def compute_policy_loss_treetune(
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
 
-    pg_loss = _masked_mean(pg_losses, action_mask)
+    pg_loss = _weighted_masked_mean(pg_losses, action_mask, edge_weights=edge_weights)
 
     # --- ratio-threshold skip : ppo_trainer.py:1153-1160 ---
     avg_ratio = _masked_mean(ratio, action_mask)

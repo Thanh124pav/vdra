@@ -69,14 +69,18 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
-    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-        old_log_prob=old_log_prob,
-        log_prob=log_prob,
-        advantages=advantages,
-        response_mask=response_mask,
-        loss_agg_mode=loss_agg_mode,
-        config=config,
-    )
+    loss_kwargs = {
+        "old_log_prob": old_log_prob,
+        "log_prob": log_prob,
+        "advantages": advantages,
+        "response_mask": response_mask,
+        "loss_agg_mode": loss_agg_mode,
+        "config": config,
+    }
+    edge_weights = data.get("edge_weights", None)
+    if edge_weights is not None and "edge_weights" in policy_loss_fn.__code__.co_varnames:
+        loss_kwargs["edge_weights"] = edge_weights
+    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(**loss_kwargs)
 
     metrics.update(
         {

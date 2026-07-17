@@ -157,7 +157,7 @@ def test_generated_nodes_must_have_logprob_metadata():
         asyncio.run(strategy._construct_budget_allocated_tree("Q", max_depth=2))
 
 
-def test_queue_flush_draws_reserve_share_and_uses_largest_remainder():
+def test_queue_flush_keeps_budget_exact_without_drawing_reserve():
     async def go():
         reserve = SharedReservePool(queue_count=2)
         await reserve.add(3)
@@ -177,12 +177,12 @@ def test_queue_flush_draws_reserve_share_and_uses_largest_remainder():
         return await manager.flush_ready(), reserve
 
     results, reserve = asyncio.run(go())
-    assert sum(result.reserve_draw for result in results) == 3
-    assert reserve.value == 0
+    assert sum(result.reserve_draw for result in results) == 0
+    assert reserve.value == 3
     allocated = {}
     for result in results:
         allocated.update(result.summary.allocations)
-    assert sum(allocated.values()) == 5
+    assert sum(allocated.values()) == 2
     assert set(allocated) == {"a", "b"}
 
 

@@ -124,6 +124,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
             gear_cfg["policy_snapshot_id"] = snapshot_id
         gen_batch.meta_info["gear_tree_config"] = gt
         gen_batch.meta_info["global_steps"] = self.global_steps
+        gen_batch.meta_info["rollout_iteration"] = getattr(self, "rollout_iteration", 0)
         gen_batch.meta_info["policy_snapshot_id"] = snapshot_id
         gen_batch.meta_info["current_rollout_snapshot_id"] = snapshot_id
         backend = gt.get("rollout_backend", "async")
@@ -180,6 +181,11 @@ class RayGearTreeTrainer(RayPPOTrainer):
             raise AssertionError("edge_batch is missing stored old_log_probs")
         if edge_batch.batch["old_log_probs"].shape != edge_batch.batch["responses"].shape:
             raise AssertionError("old_log_probs shape must match responses shape")
+        if (
+            "edge_weights" in edge_batch.batch
+            and edge_batch.batch["edge_weights"].shape != edge_batch.batch["responses"].shape
+        ):
+            raise AssertionError("edge_weights shape must match responses shape")
         return edge_batch
 
     def _generate_edge_batch(self, gen_batch: DataProto) -> DataProto:
@@ -207,6 +213,10 @@ class RayGearTreeTrainer(RayPPOTrainer):
         )
 
         self.global_steps = 0
+        self.rollout_iteration = 0
+        self.successful_actor_updates = 0
+        self.postponed_updates = 0
+        self.failed_updates = 0
         self._load_checkpoint()
         self._validate_replay_startup()
         replay_resume_metrics = self._restore_or_init_replay_buffer()
@@ -224,14 +234,14 @@ class RayGearTreeTrainer(RayPPOTrainer):
         if replay_resume_metrics:
             logger.log(data=replay_resume_metrics, step=self.global_steps)
 
-        self.global_steps += 1
         test_freq = self.config.trainer.get("test_freq", -1)
         save_freq = self.config.trainer.get("save_freq", -1)
 
-        while self.global_steps <= self.total_training_steps:
+        while self.global_steps < self.total_training_steps:
             for batch_dict in self.train_dataloader:
-                if self.global_steps > self.total_training_steps:
+                if self.global_steps >= self.total_training_steps:
                     break
+                self.rollout_iteration += 1
                 metrics: Dict[str, Any] = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 gen_batch = self._get_gen_batch(batch)
@@ -244,37 +254,53 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     generation_step=self.global_steps,
                     policy_snapshot_id=self._current_policy_snapshot_id(),
                 )
-                sampled_edges, sample_stats = replay_buffer.sample_for_update(
-                    current_step=self.global_steps, remove=False
-                )
+                reservation = replay_buffer.reserve_for_update(current_step=self.global_steps)
+                sampled_edges = [dict(edge) for edge in reservation.edges]
+                sample_stats = reservation.stats
                 metrics.update({k: v for k, v in sample_stats.items() if k != "removed_edge_ids"})
                 metrics["buffer/new_edges"] = len(new_edges)
                 metrics["buffer/postponed_update"] = 0.0
+                metrics["training/rollout_iteration"] = float(self.rollout_iteration)
+                metrics["training/optimizer_step"] = float(self.global_steps)
+                metrics["training/successful_actor_updates"] = float(self.successful_actor_updates)
                 if not sampled_edges:
                     logger.log(data=metrics, step=self.global_steps)
-                    self.global_steps += 1
                     continue
                 if self._should_postpone_sampled_update(sampled_edges):
+                    replay_buffer.rollback(reservation)
+                    self.postponed_updates += 1
                     metrics["buffer/postponed_update"] = 1.0
+                    metrics["training/postponed_updates"] = float(self.postponed_updates)
                     metrics["buffer/size_after"] = float(len(replay_buffer))
                     logger.log(data=metrics, step=self.global_steps)
-                    self.global_steps += 1
                     continue
 
                 edge_batch = self._edges_to_update_batch(sampled_edges, metrics)
 
                 t0 = time.time()
                 actor_updated = False
-                if self.config.trainer.critic_warmup <= self.global_steps:
-                    actor_output = self.actor_rollout_wg.update_actor(edge_batch)
+                if self.config.trainer.critic_warmup <= self.rollout_iteration:
+                    try:
+                        actor_output = self.actor_rollout_wg.update_actor(edge_batch)
+                    except Exception:
+                        replay_buffer.rollback(reservation)
+                        self.failed_updates += 1
+                        raise
                     actor_updated = True
                     metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+                else:
+                    replay_buffer.rollback(reservation)
+                    self.postponed_updates += 1
+                    metrics["buffer/postponed_update"] = 1.0
+                    metrics["training/postponed_updates"] = float(self.postponed_updates)
+                    logger.log(data=metrics, step=self.global_steps)
+                    continue
                 if actor_updated:
-                    removed = replay_buffer.remove(sample_stats.get("removed_edge_ids", []))
-                    if sorted(removed) != sorted(sample_stats.get("removed_edge_ids", [])):
-                        raise RuntimeError("Replay buffer removal did not match sampled update edges")
+                    removed = replay_buffer.commit(reservation)
                     metrics["buffer/removed_edges"] = float(len(removed))
                     metrics["buffer/size_after"] = float(len(replay_buffer))
+                    self.successful_actor_updates += 1
+                    self.global_steps += 1
                 t_update = time.time() - t0
 
                 response_tokens = edge_batch.batch["response_mask"].sum().item()
@@ -282,6 +308,8 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 cum_train += t_gen + t_update
                 timing = {
                     "step": self.global_steps,
+                    "rollout_iteration": self.rollout_iteration,
+                    "optimizer_step": self.global_steps,
                     "timing/generation_seconds": t_gen,
                     "timing/update_seconds": t_update,
                     "timing/train_total_seconds": t_gen + t_update,
@@ -292,6 +320,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     "train/unique_questions": float(len({edge.get("question_id") for edge in sampled_edges})),
                     "train/mean_edge_age": float(sum(ages) / len(ages) if ages else 0.0),
                     "train/max_edge_age": float(max(ages) if ages else 0),
+                    "training/successful_actor_updates": float(self.successful_actor_updates),
+                    "training/postponed_updates": float(self.postponed_updates),
+                    "training/failed_updates": float(self.failed_updates),
                 }
                 with open(timing_path, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps(timing) + "\n")
@@ -315,7 +346,6 @@ class RayGearTreeTrainer(RayPPOTrainer):
 
                 if is_last_step:
                     return
-                self.global_steps += 1
 
         self._save_checkpoint()
         self._maybe_save_replay_buffer()

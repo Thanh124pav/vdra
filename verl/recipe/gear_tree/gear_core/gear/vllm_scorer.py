@@ -237,6 +237,68 @@ class VLLMLogprobClient:
         return list(token_logprobs)
 
 
+    async def prompt_token_logprobs(self, prompt_token_ids: List[int]) -> List[float]:
+        """Return prompt logprobs for an exact token-id prompt."""
+
+        url = f"{self.api_base.rstrip('/')}/completions"
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "prompt": [int(tok) for tok in prompt_token_ids],
+            "max_tokens": 0,
+            "logprobs": 1,
+            "echo": True,
+            "temperature": 0.0,
+        }
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        await self._ensure_async_resources()
+        assert self._semaphore is not None
+        assert self._client is not None
+
+        attempts = max(1, int(self.retry_attempts))
+        for attempt in range(1, attempts + 1):
+            try:
+                async with self._semaphore:
+                    resp = await self._client.post(url, json=payload, headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json()
+                break
+            except Exception as exc:
+                retryable = self._is_retryable_error(exc)
+                if retryable and attempt < attempts:
+                    delay = max(0.0, self.retry_backoff_seconds) * (2 ** (attempt - 1))
+                    logger.warning(
+                        "Transient vLLM token-id logprob failure for url=%r, model=%r "
+                        "(attempt %d/%d); retrying in %.2fs: %r",
+                        url,
+                        self.model,
+                        attempt,
+                        attempts,
+                        delay,
+                        exc,
+                    )
+                    if delay:
+                        await asyncio.sleep(delay)
+                    continue
+                if isinstance(exc, httpx.HTTPStatusError):
+                    response_text = exc.response.text[:500]
+                    raise RuntimeError(
+                        "vLLM token-id logprob request failed with HTTP "
+                        f"{exc.response.status_code} for url={url!r}, "
+                        f"model={self.model!r} after {attempt} attempt(s): "
+                        f"{response_text}"
+                    ) from exc
+                if retryable:
+                    raise RuntimeError(
+                        f"vLLM token-id logprob connection failed for url={url!r}, "
+                        f"model={self.model!r} after {attempt} attempt(s): {exc!r}"
+                    ) from exc
+                raise
+
+        choice = data["choices"][0]
+        token_logprobs = choice.get("logprobs", {}).get("token_logprobs") or []
+        return list(token_logprobs)
+
+
 def resolve_vllm_model_id(
     api_base: str,
     explicit_model: Optional[str] = None,
@@ -276,7 +338,11 @@ def resolve_vllm_model_id(
 
 
 def make_lp_scorer(client: VLLMLogprobClient, tokenize_fn) -> LPScorer:
-    async def score_fn(prompt: str, **_):
+    async def score_fn(prompt: Optional[str] = None, prompt_token_ids: Optional[List[int]] = None, **_):
+        if prompt_token_ids is not None:
+            return await client.prompt_token_logprobs(list(prompt_token_ids))
+        if prompt is None:
+            raise ValueError("LP scorer requires prompt or prompt_token_ids")
         return await client.prompt_logprobs(prompt)
 
     return LPScorer(score_fn=score_fn, tokenize_fn=tokenize_fn)

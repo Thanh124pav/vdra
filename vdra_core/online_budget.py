@@ -249,9 +249,21 @@ class RootQueueManager:
                 predicted_k=int(item.node["vdra_predicted_k"]),
                 allocated_k=summary.allocations[key],
                 k_min=self.n_min,
+                lower_bound=summary.lower_bounds[key],
+                upper_bound=summary.upper_bounds[key],
                 dispersion_C=float(item.node.get("vdra_dispersion_C", item.node.get("gear_reward_variance", 0.0)) or 0.0),
                 allocation_weight=summary.weights[key],
             )
+            item.node["vdra_requested_budget"] = summary.requested_budget
+            item.node["vdra_allocated_budget"] = summary.allocated_budget
+            item.node["vdra_pruned_k"] = summary.pruned_allocations[key]
+            item.node["vdra_expanded_k"] = summary.expanded_allocations[key]
+            item.node["vdra_transferred_budget"] = summary.transferred_budget
+            item.node["vdra_objective_before"] = summary.objective_before
+            item.node["vdra_objective_after"] = summary.objective_after
+            item.node["vdra_solver_name"] = summary.solver_name
+            item.node["vdra_solver_time_ms"] = summary.solver_time_ms
+            item.node["vdra_feasibility_repair_count"] = summary.feasibility_repair_count
             item.node["vdra_queue_wait_seconds"] = wait
             item.node["vdra_flush_reason"] = reason
         self.flush_count += 1

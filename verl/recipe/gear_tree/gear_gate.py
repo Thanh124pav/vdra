@@ -84,6 +84,12 @@ class GearGate:
         external_score_fn: Optional[Any] = None,
         rounding_strategy: str = "integer_marginal",
         rounding_seed: int = 0,
+        pilot_execution_mode: str = "fresh_iid",
+        weighted_reuse_fallback: str = "fresh_iid",
+        representative_weight_mode: str = "cluster_multiplicity",
+        terminal_pilot_handling: str = "include_in_dispersion",
+        rollout_temperature: float = 1.0,
+        rollout_top_p: float = 1.0,
     ) -> None:
         self.cfg = ThresholdConfig(
             epsilon=epsilon,
@@ -122,7 +128,7 @@ class GearGate:
         self.use_residual_budget = bool(use_residual_budget)
         self.strict_vdra = bool(strict_vdra)
         self.invalid_support_policy = str(invalid_support_policy)
-        if budget_mode not in {"fixed_main", "fixed_total_generated"}:
+        if budget_mode not in {"fixed_main", "fixed_total_generated", "uniform_full_tree_token_cap"}:
             raise ValueError(f"Unsupported VDRA budget_mode: {budget_mode}")
         self.budget_mode = budget_mode
         if allocation_proxy not in {
@@ -137,6 +143,20 @@ class GearGate:
             raise ValueError(f"Unsupported VDRA solver strategy: {rounding_strategy}")
         self.rounding_strategy = rounding_strategy
         self.rounding_seed = int(rounding_seed)
+        if pilot_execution_mode not in {"fresh_iid", "weighted_reuse"}:
+            raise ValueError(f"Unsupported pilot_execution_mode: {pilot_execution_mode}")
+        if weighted_reuse_fallback not in {"fresh_iid", "error"}:
+            raise ValueError(f"Unsupported weighted_reuse_fallback: {weighted_reuse_fallback}")
+        if representative_weight_mode != "cluster_multiplicity":
+            raise ValueError(f"Unsupported representative_weight_mode: {representative_weight_mode}")
+        if terminal_pilot_handling != "include_in_dispersion":
+            raise ValueError(f"Unsupported terminal_pilot_handling: {terminal_pilot_handling}")
+        self.pilot_execution_mode = str(pilot_execution_mode)
+        self.weighted_reuse_fallback = str(weighted_reuse_fallback)
+        self.representative_weight_mode = str(representative_weight_mode)
+        self.terminal_pilot_handling = str(terminal_pilot_handling)
+        self.rollout_temperature = float(rollout_temperature)
+        self.rollout_top_p = float(rollout_top_p)
         self.eps_tail_calibration_path = eps_tail_calibration_path
         self.eps_tail_calibration_metadata = (
             dict(eps_tail_calibration_metadata) if eps_tail_calibration_metadata else None
@@ -160,13 +180,24 @@ class GearGate:
     def validate_main_config(self, *, max_default_branch_factor: int, segment_length: Optional[int]) -> None:
         if not self.strict_vdra:
             return
-        if self.tv_first_phase_tokens > int(segment_length or self.tv_first_phase_tokens):
+        if (
+            self.pilot_execution_mode == "weighted_reuse"
+            and self.tv_first_phase_tokens > int(segment_length or self.tv_first_phase_tokens)
+        ):
             raise ValueError(
                 "VDRA pilot length cannot exceed the main segment length "
                 "when pilots are reused as tree children."
             )
         if self.use_online_allocation and self.queue_timeout_seconds <= 0.0:
             raise ValueError("VDRA online_timeout requires queue_timeout_seconds > 0 in strict mode")
+        if (
+            self.k_algorithm == "budget_allocation"
+            and (abs(self.rollout_temperature - 1.0) > 1e-12 or abs(self.rollout_top_p - 1.0) > 1e-12)
+        ):
+            raise ValueError(
+                "strict VDRA requires rollout temperature=1.0 and top_p=1.0 "
+                "unless scorer likelihoods implement the same transformed distribution."
+            )
         if (
             self.k_algorithm == "budget_allocation"
             and self.use_residual_budget
@@ -254,6 +285,10 @@ class GearGate:
 
         from vdra_core.proxies import select_dispersion_proxy
 
+        node["vdra_C_continuation"] = float(result.dispersion_C_continuation)
+        node["vdra_C_terminal"] = float(result.dispersion_C_terminal)
+        node["vdra_C_cross"] = float(result.dispersion_C_cross)
+        node["vdra_C_total"] = float(result.dispersion_C)
         node["vdra_dispersion_C"] = select_dispersion_proxy(
             self.allocation_proxy,
             vdra_dispersion_C=result.dispersion_C,
@@ -269,11 +304,23 @@ class GearGate:
         node["vdra_shortcut_children"] = shortcut_pilots
         node["vdra_reusable_pilot_children"] = reusable_pilots
         node["vdra_pilot_children"] = reusable_pilots  # legacy compatibility alias
+        node["vdra_pilot_execution_mode"] = self.pilot_execution_mode
+        node["vdra_cluster_id_per_pilot"] = list(result.cluster_id_per_pilot)
+        node["vdra_representative_index_per_cluster"] = {
+            str(k): int(v) for k, v in result.representative_index_per_cluster.items()
+        }
+        node["vdra_cluster_size"] = {str(k): int(v) for k, v in result.cluster_size.items()}
         node["vdra_pilot_children_generated"] = len(all_pilots)
-        node["vdra_pilot_children_shortcut"] = len(shortcut_pilots)
-        node["vdra_pilot_children_reused"] = len(reusable_pilots) + len(shortcut_pilots)
-        node["vdra_pilot_children_discarded"] = max(
-            len(all_pilots) - len(reusable_pilots) - len(shortcut_pilots), 0
+        node["vdra_pilot_children_shortcut"] = len(shortcut_pilots) if self.pilot_execution_mode == "weighted_reuse" else 0
+        node["vdra_pilot_children_reused"] = (
+            len(reusable_pilots) + len(shortcut_pilots)
+            if self.pilot_execution_mode == "weighted_reuse"
+            else 0
+        )
+        node["vdra_pilot_children_discarded"] = (
+            max(len(all_pilots) - len(reusable_pilots) - len(shortcut_pilots), 0)
+            if self.pilot_execution_mode == "weighted_reuse"
+            else len(all_pilots)
         )
         node["vdra_pilot_support_children_generated"] = len(support_nodes)
         node["vdra_pilot_support_generated_tokens"] = sum(
@@ -294,17 +341,19 @@ class GearGate:
         score_keys = list(set(estimator._score_cache) - score_keys_before)
         node["vdra_likelihood_scoring_requests"] = len(score_keys)
         tokenize = getattr(self.scorer, "tokenize_fn", None)
-        if tokenize is not None:
-            node["vdra_likelihood_scored_prompt_tokens"] = sum(
-                len(tokenize(prefix)) for prefix, _ in score_keys
-            )
-            node["vdra_likelihood_scored_continuation_tokens"] = sum(
-                len(tokenize(text)) for _, text in score_keys
-            )
-            node["vdra_total_scored_tokens"] = (
-                node.get("vdra_likelihood_scored_prompt_tokens", 0)
-                + node.get("vdra_likelihood_scored_continuation_tokens", 0)
-            )
+        prompt_tokens = 0
+        continuation_tokens = 0
+        for key in score_keys:
+            if len(key) >= 3 and key[0] == "tokens":
+                prompt_tokens += len(key[1])
+                continuation_tokens += len(key[2])
+            elif tokenize is not None and len(key) >= 3 and key[0] == "text":
+                prompt_tokens += len(tokenize(key[1]))
+                continuation_tokens += len(tokenize(key[2]))
+        if prompt_tokens or continuation_tokens:
+            node["vdra_likelihood_scored_prompt_tokens"] = prompt_tokens
+            node["vdra_likelihood_scored_continuation_tokens"] = continuation_tokens
+            node["vdra_total_scored_tokens"] = prompt_tokens + continuation_tokens
 
     async def _prepare_proxy_fields(
         self,
@@ -484,18 +533,8 @@ class GearGate:
                 f"VDRA pilot/scoring failed at depth {depth}; no fallback is allowed"
             ) from exc
 
-        manager = RootQueueManager(
-            queue_count=self.queue_count,
-            queue_capacity=self.queue_capacity,
-            timeout_seconds=self.queue_timeout_seconds,
-            reserve_pool=SharedReservePool(queue_count=self.queue_count),
-            n_min=self.n_min,
-            use_residual_budget=self.use_residual_budget,
-            policy_snapshot_id=f"depth-{depth}",
-            strict_vdra=self.strict_vdra,
-            rounding_strategy=self.rounding_strategy,
-            rounding_seed=self.rounding_seed,
-        )
+        from vdra_core.core import allocate_branch_factors
+
         for node in nodes:
             predicted_k = max(int(node["gear_predicted_k"]), self.n_min)
             write_node_accounting(
@@ -505,33 +544,46 @@ class GearGate:
                 allocated_k=self.n_min,
                 k_min=self.n_min,
             )
-            manager.enqueue(
-                OnlineQueueItem(
-                    node=node,
-                    default_branch_factor=int(default_bf),
-                    depth=depth,
-                    policy_snapshot_id=f"depth-{depth}",
-                )
+        target_budget = min(
+            int(default_bf) * len(nodes),
+            sum(max(int(node["vdra_predicted_k"]), self.n_min) for node in nodes),
+        )
+        summary = allocate_branch_factors(
+            nodes,
+            total_budget=target_budget,
+            n_min=self.n_min,
+            strict=self.strict_vdra,
+            rounding_strategy=self.rounding_strategy,
+            rounding_seed=self.rounding_seed,
+        )
+        for node in nodes:
+            node_id = str(node.get("gear_segment_id"))
+            allocated = summary.allocations.get(node_id)
+            if allocated is None:
+                raise RuntimeError(f"VDRA allocation missing node {node_id}")
+            write_node_accounting(
+                node,
+                default_k=int(default_bf),
+                predicted_k=int(node["vdra_predicted_k"]),
+                allocated_k=int(allocated),
+                k_min=self.n_min,
+                lower_bound=summary.lower_bounds[node_id],
+                upper_bound=summary.upper_bounds[node_id],
+                allocation_weight=summary.weights[node_id],
             )
-        for flush in await manager.drain():
-            for item in flush.items:
-                node = item.node
-                node_id = str(node.get("gear_segment_id"))
-                allocated = flush.summary.allocations.get(node_id)
-                if allocated is None:
-                    raise RuntimeError(f"VDRA allocation missing node {node_id}")
-                write_node_accounting(
-                    node,
-                    default_k=int(default_bf),
-                    predicted_k=int(node["vdra_predicted_k"]),
-                    allocated_k=int(allocated),
-                    k_min=self.n_min,
-                    allocation_weight=flush.summary.weights[node_id],
-                )
-                node["vdra_allocation_seconds"] = flush.allocation_seconds
-                node["vdra_additional_children_generated"] = max(
-                    int(allocated) - int(node.get("vdra_pilot_children_reused", 0) or 0), 0
-                )
+            node["vdra_requested_budget"] = summary.requested_budget
+            node["vdra_allocated_budget"] = summary.allocated_budget
+            node["vdra_pruned_k"] = summary.pruned_allocations[node_id]
+            node["vdra_expanded_k"] = summary.expanded_allocations[node_id]
+            node["vdra_transferred_budget"] = summary.transferred_budget
+            node["vdra_objective_before"] = summary.objective_before
+            node["vdra_objective_after"] = summary.objective_after
+            node["vdra_solver_name"] = summary.solver_name
+            node["vdra_solver_time_ms"] = summary.solver_time_ms
+            node["vdra_feasibility_repair_count"] = summary.feasibility_repair_count
+            node["vdra_additional_children_generated"] = max(
+                int(allocated) - int(node.get("vdra_pilot_children_reused", 0) or 0), 0
+            )
 
     # --- sibling-local value share ------------------------------------------ #
     def _annotate_children(

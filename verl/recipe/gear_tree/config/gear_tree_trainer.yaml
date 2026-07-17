@@ -154,14 +154,28 @@ gear_tree:
     # Share unused floor budget across queues via the reserve pool.
     use_residual_budget: true
 
+    # Pilot execution mode. fresh_iid is the theory-safe main-paper path:
+    # pilots/support estimate allocation only, then final children are freshly
+    # sampled iid. weighted_reuse is the compute-efficient reuse variant.
+    pilot_execution_mode: fresh_iid
+    weighted_reuse_fallback: fresh_iid
+    representative_weight_mode: cluster_multiplicity
+    terminal_pilot_handling: include_in_dispersion
+
     # Main method fails instead of changing algorithms or supports silently.
     strict_vdra: true
     invalid_support_policy: error
 
     # fixed_main: fixed main-expansion branch budget, pilot/scoring reported
-    # as overhead. fixed_total_generated: pilot + support + main generation
-    # under one token cap (the matched uniform-SPO expected token count).
+    # as overhead. uniform_full_tree_token_cap: pilot + support + main
+    # generation share one maximum-style cap derived from the uniform full tree.
+    # fixed_total_generated remains accepted as a legacy alias.
     budget_mode: fixed_main
+
+    # Strict VDRA assumes scorer likelihoods match rollout distribution. The
+    # auditable main path uses the unwarped policy distribution.
+    rollout_temperature: 1.0
+    rollout_top_p: 1.0
 
     # vdra | uniform | random | direct_tv | empirical_variance |
     # external_score | oracle (oracle = evaluation-only, flagged in manifest).

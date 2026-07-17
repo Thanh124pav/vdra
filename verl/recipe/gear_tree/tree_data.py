@@ -36,12 +36,12 @@ def _compute_position_id_with_mask(attention_mask: torch.Tensor) -> torch.Tensor
 
 
 def _left_pad(ids: Sequence[int], length: int, pad_id: int) -> List[int]:
-    ids = list(ids)[-length:]  # left-truncate to keep the most recent context
+    ids = list(ids)
     return [pad_id] * (length - len(ids)) + ids
 
 
 def _right_pad(ids: Sequence[int], length: int, pad_id: int) -> List[int]:
-    ids = list(ids)[:length]  # right-truncate over-long responses
+    ids = list(ids)
     return ids + [pad_id] * (length - len(ids))
 
 
@@ -88,19 +88,24 @@ def edges_to_dataproto(
         r_ids = edge.get("response_token_ids") or []
         if not r_ids:
             raise ValueError(f"edge {row} has no response_token_ids")
+        if len(q_ids) > max_prompt_length:
+            raise ValueError(
+                f"edge {row} query_token_ids length {len(q_ids)} exceeds max_prompt_length "
+                f"{max_prompt_length}; strict VDRA forbids silent context truncation"
+            )
+        if len(r_ids) > max_response_length:
+            raise ValueError(
+                f"edge {row} response_token_ids length {len(r_ids)} exceeds max_response_length "
+                f"{max_response_length}; strict VDRA forbids silent response truncation"
+            )
 
-        valid_r = min(len(r_ids), max_response_length)
-        valid_q = min(len(q_ids), max_prompt_length)
+        valid_r = len(r_ids)
+        valid_q = len(q_ids)
 
         prompts[row] = torch.tensor(_left_pad(q_ids, max_prompt_length, pad_id), dtype=torch.long)
         responses[row] = torch.tensor(_right_pad(r_ids, max_response_length, pad_id), dtype=torch.long)
         prompt_mask[row, max_prompt_length - valid_q :] = 1
         response_mask[row, :valid_r] = 1
-
-        # Keep old-logprobs consistent with the (possibly truncated) response.
-        alp = edge.get("actor_shifted_log_probs")
-        if alp is not None:
-            edge["actor_shifted_log_probs"] = list(alp)[:valid_r]
 
         qid = edge.get("question_id")
         if qid not in qid_to_uid:

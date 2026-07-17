@@ -123,3 +123,30 @@ def test_peek_sampling_does_not_remove_until_explicit_remove():
     assert len(buf) == 4
     assert buf.remove(stats["removed_edge_ids"]) == stats["removed_edge_ids"]
     assert len(buf) == 0
+
+
+def test_reservation_hides_edges_until_commit_or_rollback():
+    buf = _buffer(target_edges_per_update=2, max_edges_per_question=10)
+    buf.add([_edge(i, question_id=i) for i in range(3)], generation_step=0, policy_snapshot_id="snap")
+    reservation = buf.reserve_for_update(current_step=1)
+    assert len(reservation.edges) == 2
+    assert len(buf) == 3
+
+    sampled, stats = buf.sample_for_update(current_step=1, remove=False)
+    assert {edge["edge_id"] for edge in sampled}.isdisjoint(reservation.edge_ids)
+    assert len(sampled) == 1
+
+    buf.rollback(reservation)
+    assert len(buf) == 3
+    sampled_after_rollback, _ = buf.sample_for_update(current_step=1, remove=False)
+    assert set(reservation.edge_ids).issubset({edge["edge_id"] for edge in sampled_after_rollback})
+
+
+def test_commit_removes_only_reserved_edges():
+    buf = _buffer(target_edges_per_update=2, max_edges_per_question=10)
+    buf.add([_edge(i, question_id=i) for i in range(3)], generation_step=0, policy_snapshot_id="snap")
+    reservation = buf.reserve_for_update(current_step=1)
+    removed = buf.commit(reservation)
+    assert tuple(removed) == reservation.edge_ids
+    assert len(buf) == 1
+    assert {edge["edge_id"] for edge in buf.edges()}.isdisjoint(reservation.edge_ids)

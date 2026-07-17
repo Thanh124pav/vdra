@@ -9,6 +9,7 @@ import asyncio
 import random
 import types
 
+import pytest
 import torch
 
 from recipe.gear_tree.async_tree_rollout import (
@@ -202,7 +203,8 @@ def test_online_timeout_queue_flushes_before_final_drain():
                     }
                     for i in range(int(branch_factor))
                 ]
-            suffix = "s0" if prefix.endswith("p0") else "s1"
+            origin = int((current_node.get("full_token_ids") or [10])[-1]) - 10
+            suffix = f"s{origin}"
             return [
                 {
                     "text": f" {suffix}_{i}",
@@ -210,14 +212,18 @@ def test_online_timeout_queue_flushes_before_final_drain():
                     "finish_reason": "stop",
                     "sum_logprobs": -0.2,
                     "num_tokens": 1,
-                    "response_token_ids": [20 + i],
+                    "response_token_ids": [20 + origin],
                     "actor_shifted_log_probs": [-0.2],
-                    "full_token_ids": list(current_node.get("full_token_ids", [])) + [20 + i],
+                    "full_token_ids": list(current_node.get("full_token_ids", [])) + [20 + origin],
                 }
                 for i in range(int(branch_factor))
             ]
 
     class DistinctScorer:
+        async def score_one_tokens(self, prefix_token_ids, continuation_token_ids):
+            own = (prefix_token_ids[-1] - 10) == (continuation_token_ids[0] - 20)
+            return -0.1 if own else -20.0
+
         async def score_one(self, prefix, y):
             own = (prefix.endswith("p0") and "s0" in y) or (prefix.endswith("p1") and "s1" in y)
             return -0.1 if own else -20.0
@@ -291,6 +297,7 @@ class _HotColdPilotExpander:
                 for i in range(int(branch_factor))
             ]
         marker = prefix.rstrip()[-1]
+        origin = int((current_node.get("full_token_ids") or [50])[-1]) - 50
         return [
             {
                 "text": f" s{marker}_{i}",
@@ -298,9 +305,9 @@ class _HotColdPilotExpander:
                 "finish_reason": "stop",
                 "sum_logprobs": -0.2,
                 "num_tokens": 1,
-                "response_token_ids": [60 + i],
+                "response_token_ids": [60 + origin],
                 "actor_shifted_log_probs": [-0.2],
-                "full_token_ids": list(current_node.get("full_token_ids", [])) + [60 + i],
+                "full_token_ids": list(current_node.get("full_token_ids", [])) + [60 + origin],
             }
             for i in range(int(branch_factor))
         ]
@@ -308,6 +315,12 @@ class _HotColdPilotExpander:
 
 class _HotColdScorer:
     """Cold prefixes: identical likelihoods (TV=0). Hot: pilots disagree."""
+
+    async def score_one_tokens(self, prefix_token_ids, continuation_token_ids):
+        if prefix_token_ids and prefix_token_ids[1] in (11, 12):
+            return -5.0
+        own = (prefix_token_ids[-1] - 50) == (continuation_token_ids[0] - 60)
+        return -0.1 if own else -25.0
 
     async def score_one(self, prefix, y):
         if "cold" in prefix:
@@ -473,6 +486,7 @@ def test_all_terminal_pilots_shortcut_into_graded_leaves():
         skip_near_leaf_expand=False,
         root_allocation=True,
         max_depth=1,
+        pilot_execution_mode="weighted_reuse",
     )
     tree = asyncio.run(
         async_build_tree(
@@ -495,6 +509,86 @@ def test_all_terminal_pilots_shortcut_into_graded_leaves():
     assert tree["vdra_shortcut_overage"] == 1  # one terminal pilot exceeded the 1-branch budget
     assert tree["vdra_predicted_k"] == 2
     assert tree["vdra_dispersion_C"] == 0.0
+    assert "reward" in tree
+
+
+def test_fresh_iid_discards_terminal_pilots_and_generates_final_children():
+    """Fresh mode uses pilots only for allocation, never as final children."""
+
+    from recipe.gear_tree.tree_rollout import async_build_tree
+
+    class TerminalPilotExpander:
+        async def expand(self, *, current_node, prefix, depth, max_tokens, branch_factor):
+            return [
+                {
+                    "text": f" pilot{i}",
+                    "full_text": f"{prefix} pilot{i}",
+                    "finish_reason": "stop",
+                    "sum_logprobs": -0.1,
+                    "num_tokens": 1,
+                    "response_token_ids": [40 + i],
+                    "actor_shifted_log_probs": [-0.1],
+                    "full_token_ids": [7, 40 + i],
+                }
+                for i in range(int(branch_factor))
+            ]
+
+    class NeverScorer:
+        async def score_one(self, prefix, y):
+            raise AssertionError("terminal pilots must not be TV-scored")
+
+    calls = []
+
+    async def segment_fn(prompt_ids, branch_factor, max_tokens):
+        calls.append((list(prompt_ids), int(branch_factor), max_tokens))
+        return [
+            types.SimpleNamespace(
+                token_ids=[80 + i],
+                text=f" fresh{i}",
+                finish_reason="stop",
+                logprobs=[-0.3],
+                sum_logprobs=-0.3,
+                num_tokens=1,
+            )
+            for i in range(int(branch_factor))
+        ]
+
+    gate = GearGate(
+        k_algorithm="budget_allocation",
+        scorer=NeverScorer(),
+        pilot_branch_factor=2,
+        likelihood_samples_per_distribution=1,
+        queue_timeout_seconds=0.001,
+        tv_first_phase_tokens=1,
+        tv_second_phase_tokens=1,
+        skip_near_leaf_expand=False,
+        root_allocation=True,
+        max_depth=1,
+    )
+    tree = asyncio.run(
+        async_build_tree(
+            "PROMPT",
+            [7],
+            {"_treetune__idx": "fresh-shortcut"},
+            tree_shape=[1],
+            M=3,
+            segment_fn=segment_fn,
+            grade_fn=lambda query, response, inst: 1.0,
+            gear_gate=gate,
+            gear_node_expander=TerminalPilotExpander(),
+        )
+    )
+
+    children = tree.get("children") or []
+    assert tree["vdra_pilot_execution_mode"] == "fresh_iid"
+    assert tree["vdra_pilot_children_generated"] == 2
+    assert tree["vdra_pilot_children_reused"] == 0
+    assert tree["vdra_pilot_children_shortcut"] == 0
+    assert tree["vdra_pilot_children_discarded"] == 2
+    assert tree["vdra_shortcut_overage"] == 2
+    assert len(children) == tree["vdra_allocated_k"] == 1
+    assert children[0]["text"] == " fresh0"
+    assert calls == [([7], 1, None)]
     assert "reward" in tree
 
 
@@ -629,3 +723,18 @@ def test_duplicate_pilots_count_all_generated_for_compute_accounting():
     assert node["vdra_pilot_children_discarded"] == 6
     assert node["vdra_pilot_reuse_rate"] == 0.25
     assert node["vdra_pilot_generated_tokens"] == 8
+
+
+def test_weighted_parent_reward_matches_representative_weights():
+    from recipe.gear_tree.tree_rollout import _aggregate_child_rewards
+
+    node = {}
+    children = [
+        {"reward": 0.0, "edge_weight": 0.25},
+        {"reward": 1.0, "edge_weight": 0.75},
+    ]
+    _aggregate_child_rewards(node, children)
+    assert node["reward"] == pytest.approx(0.75)
+    assert node["vdra_weighted_parent_value"] == pytest.approx(0.75)
+    assert node["vdra_child_weight_sum"] == pytest.approx(1.0)
+    assert node["reward_std"] == pytest.approx((0.25 * 0.75**2 + 0.75 * 0.25**2) ** 0.5)

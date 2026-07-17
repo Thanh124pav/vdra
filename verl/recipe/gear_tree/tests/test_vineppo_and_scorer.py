@@ -1,11 +1,16 @@
 """CPU tests for VinePPO MC-value/step-advantages and the offline LP scorer."""
 
+import asyncio
 import math
 import types
+
+import pytest
 
 from recipe.gear_tree.tree_rollout import SegmentSample
 from recipe.gear_tree.vineppo_advantage import mc_value, step_advantages
 from recipe.gear_tree.engine_scorer import EngineLPScorer
+from recipe.gear_tree.gear_core.gear.lp_scorer import LPScorer
+from recipe.gear_tree.gear_core.gear.tv_estimators import ConditionalTVEstimator
 
 
 def test_step_advantages_td_residual():
@@ -84,3 +89,88 @@ def test_engine_scorer_sums_suffix_logprobs(monkeypatch):
     assert val == lp[ord("Y")]
     # caching returns same value.
     assert scorer.score_one("pre", "Y") == val
+
+
+def test_engine_scorer_scores_exact_token_ids_without_retokenizing(monkeypatch):
+    import sys
+
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.SamplingParams = lambda **kw: types.SimpleNamespace(**kw)
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+
+    lp = {1: -0.1, 2: -0.7, 99: -9.9}
+    scorer = EngineLPScorer(FakeEngine(lp), FakeTok())
+    assert scorer.score_one_tokens([1], [2]) == -0.7
+
+
+def test_lp_scorer_token_api_preserves_bpe_boundary():
+    seen = []
+
+    async def score_fn(prompt=None, prompt_token_ids=None, **_):
+        seen.append((prompt, list(prompt_token_ids or [])))
+        ids = list(prompt_token_ids or [])
+        return [None] + [-0.25 * tok for tok in ids[1:]]
+
+    def tokenize(text):
+        # Deliberately non-additive: text scoring would see AB as one token.
+        return {"A": [1], "B": [2], "AB": [99]}[text]
+
+    scorer = LPScorer(score_fn=score_fn, tokenize_fn=tokenize)
+    value = asyncio.run(scorer.score_one_tokens([1], [2]))
+    assert value == -0.5
+    assert seen == [(None, [1, 2])]
+
+
+def test_tv_estimator_uses_exact_token_id_scorer_in_strict_mode():
+    class TokenScorer:
+        def __init__(self):
+            self.calls = []
+
+        async def score_one_tokens(self, prefix_token_ids, continuation_token_ids):
+            self.calls.append((list(prefix_token_ids), list(continuation_token_ids)))
+            return -float(sum(continuation_token_ids))
+
+        async def score_one(self, prefix, y):
+            raise AssertionError("strict VDRA must not use text scoring")
+
+    scorer = TokenScorer()
+    estimator = ConditionalTVEstimator(
+        scorer=scorer,
+        node_expander=None,
+        gamma=0.9,
+        strict_vdra=True,
+    )
+    matrix = asyncio.run(
+        estimator._score_matrix_from_nodes(
+            [
+                {"full_text": "A", "full_token_ids": [1]},
+                {"full_text": "AB", "full_token_ids": [99]},
+            ],
+            [
+                {"text": "B", "response_token_ids": [2]},
+                {"text": "C", "response_token_ids": [3]},
+            ],
+        )
+    )
+    assert matrix == [[-2.0, -3.0], [-2.0, -3.0]]
+    assert ([99], [2]) in scorer.calls
+
+
+def test_tv_estimator_rejects_text_only_scorer_in_strict_mode():
+    class TextOnlyScorer:
+        async def score_one(self, prefix, y):
+            return -1.0
+
+    estimator = ConditionalTVEstimator(
+        scorer=TextOnlyScorer(),
+        node_expander=None,
+        gamma=0.9,
+        strict_vdra=True,
+    )
+    with pytest.raises(ValueError, match="exact token-id scoring"):
+        asyncio.run(
+            estimator._score_matrix_from_nodes(
+                [{"full_text": "A", "full_token_ids": [1]}],
+                [{"text": "B", "response_token_ids": [2]}],
+            )
+        )

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from typing import Any, Iterable
 
 import torch
@@ -137,7 +138,9 @@ def token_fields_for_edges(
     returns = torch.zeros_like(response_mask, dtype=dtype, device=device)
     rewards = torch.zeros_like(response_mask, dtype=dtype, device=device)
     old_log_probs = torch.zeros_like(response_mask, dtype=dtype, device=device)
+    edge_weights = torch.zeros_like(response_mask, dtype=dtype, device=device)
     has_old_log_probs = False
+    has_edge_weights = False
 
     for row, edge in enumerate(edge_list):
         valid_len = int(response_mask[row].sum().item())
@@ -157,6 +160,17 @@ def token_fields_for_edges(
             old_log_probs[row, :valid_len] = torch.as_tensor(maybe_log_probs, dtype=dtype, device=device)
             has_old_log_probs = True
 
+        maybe_weight = edge.get(
+            "edge_weight",
+            edge.get("vdra_representative_weight", edge.get("vdra_edge_weight")),
+        )
+        weight = 1.0 if maybe_weight is None else float(maybe_weight)
+        if maybe_weight is not None:
+            if not math.isfinite(weight) or weight <= 0.0:
+                raise ValueError(f"edge {row} has invalid edge weight {maybe_weight!r}")
+            has_edge_weights = True
+        edge_weights[row, :valid_len] = weight
+
     tensors = {
         "advantages": advantages,
         "values": values,
@@ -165,6 +179,8 @@ def token_fields_for_edges(
     }
     if has_old_log_probs:
         tensors["old_log_probs"] = old_log_probs
+    if has_edge_weights:
+        tensors["edge_weights"] = edge_weights
     return tensors
 
 
