@@ -1,475 +1,693 @@
-# PLAN.md — Theory–Runtime Alignment for VDRA
+# PLAN.md — VDRA Pipeline and Engineering Alignment
 
-## 0. Purpose and audited baseline
+## 0. Objective and audited baseline
 
-This plan replaces the previous migration checklist. It is based on repository state `de7d1ee32a2206505c0c1d772dfa1186cc27b2c2` and the follow-up audit performed after that commit.
+This plan is based on repository commit:
 
-The objective is not merely to make training run. Every main-paper result must correspond to a precisely defined estimator, sampling distribution, behavior policy, allocation problem, compute budget, and optimizer-update count.
+```text
+d137bd94bd700c2358a4394e930049af99bad02d
+```
+
+The goal is not only to make the code run. Every reported result must correspond to a clearly defined:
+
+- behavior-policy snapshot;
+- sampling and scoring distribution;
+- node-value estimator;
+- allocation scope and budget;
+- PPO denominator;
+- optimizer-step count;
+- compute accounting protocol.
 
 Status labels:
 
-- **DONE**: implemented and directly supported by code/tests.
-- **PARTIAL**: some plumbing or tests exist, but the scientific invariant is not yet guaranteed.
-- **OPEN**: not implemented or still inconsistent with the theory.
+- **DONE**: implemented and supported by direct tests.
+- **PARTIAL**: implementation exists, but the end-to-end invariant is not guaranteed.
+- **OPEN**: still inconsistent, ambiguous, or untested in the deployed Ray/FSDP/vLLM stack.
 
-No long main-paper run is allowed until all P0 items are complete and the end-to-end smoke test passes.
+**No long main-paper training run is allowed until every P0 item is complete and the real async smoke test passes.**
 
 ---
 
-# 1. Audited status of the current code
-
-## 1.1 Completed fixes
-
-### DONE — Exact unified bounded integer allocation
-
-The production allocator solves
-
-\[
-\min_{k_s\in\mathbb Z_+}\sum_{s\in\mathcal Q}\frac{C_s}{k_s}
-\]
-
-subject to
-
-\[
-\sum_{s\in\mathcal Q}k_s=B_{\mathrm{target}},\qquad
-\ell_s\le k_s\le u_s.
-\]
-
-The default path uses exact marginal gains
-
-\[
-\Delta_s(k)=\frac{C_s}{k(k+1)}
-\]
-
-with deterministic stable-ID tie breaking and exact budget preservation. Continuous relax-and-round is not the main runtime path.
-
-### DONE — Generation-time behavior log-probabilities are retained
-
-Normal training no longer recomputes `old_log_probs` immediately before actor update. Tree edges retain rollout-time token log-probabilities and replay them as the PPO denominator.
-
-### DONE — Replay sampling fairness and delayed removal
-
-The trainer-owned replay buffer applies the per-question cap before the global cap. The trainer samples with `remove=False` and removes edges only after `update_actor` succeeds. Actor failure therefore leaves sampled edges available.
-
-### DONE — Replay checkpoint restore/reset is explicit
-
-The trainer restores the replay buffer when its checkpoint exists. A missing replay checkpoint on resume causes an explicit reset metric rather than silently pretending the buffer was restored.
-
-### DONE — Tail modes
-
-`tail_mode=none` permits strict short-horizon operation with `eps_tail=0`. `calibrated` requires an artifact. `fixed` is an explicit numerical ablation.
-
-### DONE — Snapshot ID propagation through trainer, agent loop, tree, and edges
-
-A policy snapshot identifier is now propagated through the rollout metadata and stored on generated edges.
-
-### DONE — Solver microbenchmark scaffolding
-
-A CPU benchmark reports median and p99 allocation latency for normal queue sizes and budgets.
-
-### DONE — TreePO/TreeRL naming disclaimer
-
-The documentation now treats the corresponding objectives as style/parity ablations rather than verified official reproductions.
-
-## 1.2 Partially fixed items
-
-### PARTIAL — Policy snapshot consistency
-
-The code checks equality between `rollout_snapshot_id` and `scorer_snapshot_id`, but both can be labels attached to independently served models. Equal strings do not prove equal weights.
-
-Required invariant:
-
-\[
-\theta_{\mathrm{pilot}}
-=
-\theta_{\mathrm{support}}
-=
-\theta_{\mathrm{scorer}}
-=
-\theta_{\mathrm{behavior}}.
-\]
-
-The scorer must either use the same VERL async server manager/model instance as rollout generation or expose a verifiable model version/weight fingerprint synchronized after each actor update.
-
-### PARTIAL — Rollout-vs-actor log-prob parity
-
-Comparison helpers and unit tests exist, but the repository still needs a real diagnostic that produces records from the actual vLLM rollout server and FSDP actor for identical token sequences.
-
-### PARTIAL — Underfilled replay updates
-
-Indivisible underfilled batches are postponed, but `global_steps` still advances on postponed/no-edge iterations. Thus `trainer.total_training_steps` still counts loop iterations rather than successful optimizer updates.
-
-### PARTIAL — Replay transaction semantics
-
-Removal now happens after successful actor update, which is correct. However, sampled IDs should be represented by an explicit reservation/commit/rollback API to prevent concurrent or future callers from training the same reserved edges twice.
-
-## 1.3 Remaining open mismatches
-
-### OPEN — Representative reuse biases the node-value estimator
-
-Current runtime prunes pilot prefixes using TV-based duplicate structure, reuses surviving representatives, and computes the parent value as an unweighted mean of final children. The retained sample is not iid from the original rollout policy, so the estimator can be biased.
-
-### OPEN — Two required pilot execution modes
-
-The runtime must implement both:
-
-1. `fresh_iid`: theory-safe main mode;
-2. `weighted_reuse`: pilot-efficient mode with explicit multiplicity/weight correction.
-
-They must never silently fall back into one another.
-
-### OPEN — Terminal shortcuts are excluded from `C_s`
-
-Terminal phase-one pilots consume final branch slots but are excluded from the continuation TV matrix. Therefore the current `C_s` does not represent the dispersion of the actual final-child estimator.
-
-### OPEN — Scorer uses text concatenation instead of exact token IDs
-
-Retokenizing `prefix + continuation` can move the BPE boundary. The scorer must condition and slice using exact rollout token IDs.
-
-### OPEN — Sampling distribution and scoring distribution can differ
-
-Support continuations may be sampled with rollout temperature/top-p while scorer likelihoods are computed under a different distribution. The tanh likelihood-ratio estimator is meaningful only when samples and likelihoods refer to the same distributions.
-
-### OPEN — Query/response truncation can invalidate PPO ratios
-
-`edges_to_dataproto` can left-truncate queries and right-truncate responses after generation. Then current and stored behavior log-probabilities need not condition on the same token sequence.
-
-### OPEN — `global_steps` is not the optimizer-step counter
-
-No-edge, postponed, and warmup iterations currently consume global steps. Main curves by iteration and max-edge-age semantics are therefore ambiguous.
-
-### OPEN — PPO all-masked-token NaN
-
-The custom masked mean divides by `mask.sum()` without a zero-denominator guard.
-
-### OPEN — Allocation accounting overwrites true solver bounds
-
-The queue manager rewrites node accounting without forwarding `summary.lower_bounds` and `summary.upper_bounds`, so persisted caps may differ from the optimization problem actually solved.
-
-### OPEN — Queue-local versus frontier-global claim
-
-Online timeout allocation optimizes within each queue flush, not over the entire depth frontier. The paper and manifest must define `Q` as the flush set unless a depth-global allocator is used.
-
-### OPEN — Legacy reserve terminology remains primary
-
-Reserve contribution/consumption fields remain in logs although the reserve pool is no longer an allocation input. Primary reporting must use pruning, expansion, transfer, bounds, and objective fields.
-
-### OPEN — `fixed_total_generated` naming and claim
-
-The cap corresponds to a uniform full-tree maximum-style token cap, not expected or realized SPO compute under early stopping.
-
-### OPEN — No real end-to-end Ray + FSDP + async-vLLM smoke evidence
-
-Unit tests alone do not establish policy synchronization, log-prob alignment, optimizer-step counting, or absence of NaNs in the deployed stack.
+# 1. Current implementation status
+
+## 1.1 DONE
+
+The following parts are now substantially aligned:
+
+1. Exact bounded integer allocation is the production solver.
+2. The solver preserves the exact budget within each allocation flush.
+3. True lower and upper solver bounds are written into node accounting.
+4. `fresh_iid` exists and discards pilots before final-child generation.
+5. Pilot clusters and multiplicity metadata exist for `weighted_reuse`.
+6. Exact token-ID likelihood scoring exists.
+7. Silent query/response truncation is rejected.
+8. Replay uses reservation, commit, and rollback.
+9. Replay checkpoint restore/reset is explicit.
+10. `global_steps` increases only after a successful actor update.
+11. PPO masked means return a finite differentiable zero for empty masks.
+12. Edge-weighted PPO loss is implemented at the loss-function level.
+13. `tail_mode=none` with `eps_tail=0` is supported.
+14. Main configuration uses `bound_form=linear`, not the legacy simulation-lemma mode.
+15. TreePO/TreeRL modes are documented as style/parity ablations rather than exact reproductions.
+
+These fixes are necessary but not sufficient. Several pipeline connections remain broken or unverifiable.
 
 ---
 
-# 2. Canonical mathematical contract
+# 2. P0 blockers before any long run
 
-For every allocation flush `Q`, define one scalar nonnegative allocation coefficient `C_s` for each node `s` and solve the exact bounded integer problem above.
+## P0.1 Propagate the dynamic policy snapshot into the agent loop
 
-The allocation solver is valid conditional on its input coefficients. Claims about variance reduction additionally require the runtime estimator associated with `C_s` to match the theory.
+### Current risk
 
-The main paper must use the following careful language:
+The trainer writes the current snapshot to `gen_batch.meta_info`, while the upstream agent-loop worker passes per-sample fields from `non_tensor_batch` into `TreeAgentLoop.run()`.
 
-> VDRA uses short-horizon policy-divergence information to construct a node-wise dispersion proxy `C_s`, then solves an exact bounded integer resource-allocation problem within each online queue flush.
+Consequently, the agent loop may receive no dynamic snapshot and fall back to:
 
-With `tail_mode=none`, do not call `C_s` a certified full-horizon upper bound. It is a relative short-horizon allocation proxy inspired by value-difference bounds.
-
-For `fresh_iid`, the final branch samples are iid conditional on the parent and behavior policy, so the standard Monte Carlo variance interpretation remains defensible.
-
-For `weighted_reuse`, the final estimator is a weighted representative estimator and requires its own derivation and empirical validation. It must not inherit the iid Monte Carlo claim automatically.
-
----
-
-# 3. Dual pilot execution modes
-
-Add configuration:
-
-```yaml
-gear_tree:
-  gear:
-    pilot_execution_mode: fresh_iid  # fresh_iid | weighted_reuse
-    weighted_reuse_fallback: fresh_iid
-    representative_weight_mode: cluster_multiplicity
-    terminal_pilot_handling: include_in_dispersion
+```text
+rollout_step:unknown
 ```
 
-The selected mode must be written to every run manifest, tree artifact, node record, and experiment name.
+The trainer then expects `global_step:t`, causing either a mismatch error or incorrect provenance.
 
-## 3.1 Mode A — `fresh_iid` (main-paper default)
+### Required implementation
 
-### Semantics
+Before `generate_sequences`, add per-row fields:
 
-Pilots and support blocks are used only to estimate:
+```python
+gen_batch.non_tensor_batch["policy_snapshot_id"] = np.array(
+    [snapshot_id] * len(gen_batch), dtype=object
+)
+gen_batch.non_tensor_batch["current_rollout_snapshot_id"] = np.array(
+    [snapshot_id] * len(gen_batch), dtype=object
+)
+```
 
-- pairwise short-horizon divergence;
-- redundancy structure and `predicted_k`;
-- allocation coefficient `C_s`.
+Keep the `meta_info` copies for logging, but do not rely on them for agent-loop kwargs.
 
-After the allocator returns `k_s*`, discard pilot trajectories from the final value/training sample and generate exactly `k_s*` fresh children from the current frozen behavior policy:
+### Acceptance test
+
+Run two real rollout iterations and assert for every edge:
+
+```text
+edge.policy_snapshot_id == trainer snapshot at generation
+edge.policy_snapshot_id != rollout_step:unknown
+```
+
+---
+
+## P0.2 Prove scorer weights equal rollout weights
+
+### Current risk
+
+Generation uses the VERL async rollout server manager, while likelihood scoring uses a separately constructed HTTP client. Equal string snapshot IDs do not prove equal model parameters:
 
 \[
-x_{s,1},\ldots,x_{s,k_s^*}\overset{iid}{\sim}\pi_{\theta_t}(\cdot\mid s).
+\theta_{\mathrm{scorer}}=\theta_{\mathrm{rollout}}.
 \]
 
-The parent estimator is
+The scorer is also built inside each agent-loop instance, which can create one `/models` request, HTTP client, semaphore, and connection pool per prompt.
+
+### Preferred implementation
+
+Add token-logprob scoring to the same async rollout server manager used for generation:
+
+```python
+await server_manager.prompt_token_logprobs(
+    request_id=...,
+    prompt_ids=full_token_ids,
+)
+```
+
+Generation and scoring must share:
+
+- server pool;
+- loaded model replicas;
+- weight-update lifecycle;
+- tokenizer;
+- model revision/version.
+
+### Temporary acceptable implementation
+
+If an external scorer remains:
+
+1. construct one shared scorer per `AgentLoopWorker`, not per prompt;
+2. cache resolved model ID;
+3. expose a server-side `weight_version` or weight fingerprint;
+4. verify it against the rollout server after every actor update;
+5. close the HTTP client at worker shutdown;
+6. log scorer endpoint, model ID, weight version, and rollout version.
+
+### Acceptance test
+
+A real GPU diagnostic must score identical token sequences with:
+
+- rollout vLLM;
+- scorer path;
+- FSDP actor.
+
+Log:
 
 \[
-\hat V_s^{\mathrm{fresh}}
+\Delta_{\max}=\max_j|\ell_j^{a}-\ell_j^{b}|,
+\qquad
+\Delta_{\mathrm{mean}}=\frac1L\sum_j|\ell_j^{a}-\ell_j^{b}|.
+\]
+
+The test must fail when weight versions differ.
+
+---
+
+## P0.3 Validate the actual sampling distribution
+
+### Current risk
+
+The strict gate may validate configured defaults `temperature=1` and `top_p=1`, while the actual agent-loop generator uses values from `rollout_config`. Using `setdefault` can preserve stale config values instead of the actual runtime values.
+
+### Required implementation
+
+Overwrite, do not default:
+
+```python
+gear_cfg["rollout_temperature"] = float(self.rollout_config.temperature)
+gear_cfg["rollout_top_p"] = float(self.rollout_config.top_p)
+```
+
+Pass both values into every `GearGate` construction path.
+
+For the main tanh-TV estimator, enforce:
+
+```text
+actual rollout temperature == 1.0
+actual rollout top_p == 1.0
+```
+
+until the scorer explicitly implements the same transformed distribution.
+
+### Acceptance test
+
+A run configured with actual `temperature=0.7` must fail strict startup even if the nested VDRA config says `1.0`.
+
+---
+
+## P0.4 Preserve stored behavior log-probabilities in every actor batch
+
+### Current risk
+
+VERL actor code treats a single PPO minibatch with one epoch as on-policy and replaces stored old log-probabilities with current log-probabilities:
+
+```python
+old_log_prob = log_prob.detach()
+```
+
+This is invalid for replayed tree edges and forces the PPO ratio toward one.
+
+### Required implementation
+
+Set:
+
+```python
+edge_batch.meta_info["force_stored_old_log_probs"] = True
+```
+
+Actor logic must use current log-probabilities as the denominator only when this flag is false.
+
+The tree/replay trainer must always use stored generation-time values:
+
+\[
+r_j(\theta)
 =
-\frac{1}{k_s^*}\sum_{j=1}^{k_s^*}\hat V(x_{s,j}).
+\exp\left(
+\log\pi_{\theta_{t+d}}(a_j\mid s_j)
+-
+\log\pi_{\theta_t}(a_j\mid s_j)
+\right).
+\]
+
+### Acceptance test
+
+Use exactly one PPO minibatch where stored old log-probabilities differ from current values. Assert that the computed ratio is not identically one.
+
+---
+
+## P0.5 Complete the `weighted_reuse` tree-to-loss pipeline
+
+### Current risk
+
+Representative weights exist on tree children and the policy loss accepts `edge_weights`, but edge extraction currently does not guarantee that these fields survive:
+
+```text
+tree child -> replay edge -> DataProto -> actor worker -> policy loss
+```
+
+### Required implementation
+
+Copy these fields into every extracted edge:
+
+```python
+"edge_weight": node.get("edge_weight", node.get("vdra_representative_weight")),
+"vdra_cluster_id": node.get("vdra_cluster_id"),
+"vdra_cluster_multiplicity": node.get("vdra_cluster_multiplicity"),
+"vdra_original_pilot_indices": node.get("vdra_original_pilot_indices"),
+```
+
+Replay validation and checkpoint serialization must preserve them.
+
+### Acceptance test
+
+Construct a weighted tree with multiplicities `[2,1]` and verify end-to-end that:
+
+1. extracted edges contain weights;
+2. `DataProto.batch["edge_weights"]` exists;
+3. actor receives it;
+4. weighted loss equals explicit edge duplication.
+
+---
+
+## P0.6 Implement actual `weighted_reuse_fallback`
+
+### Current risk
+
+If the final allocation contains fewer slots than the number of required clusters, selecting only some representatives removes entire clusters. Renormalizing the remaining weights cannot recover the missing probability mass.
+
+The config contains:
+
+```yaml
+weighted_reuse_fallback: fresh_iid
+```
+
+but this must be an executed runtime rule, not only stored configuration.
+
+### Required contract
+
+Use weighted reuse only when every required cluster is represented:
+
+```text
+allocated_k >= number_of_required_clusters
+```
+
+Otherwise:
+
+- `fresh_iid`: generate all final children freshly and mark fallback;
+- `error`: abort the run.
+
+Required fields:
+
+```text
+vdra_weighted_reuse_fallback_triggered
+vdra_weighted_reuse_fallback_reason
+vdra_required_cluster_count
+vdra_allocated_k
+```
+
+### Acceptance test
+
+Create five clusters with allocation three. `fresh_iid` fallback must produce no representative-weighted final children.
+
+---
+
+## P0.7 Replace connected-component clusters with representative-valid clusters
+
+### Current risk
+
+Connected components only enforce paths of pairwise-near nodes. They do not guarantee that every member is close to the chosen representative.
+
+A cluster may satisfy:
+
+\[
+TV(A,B)<\epsilon,
+\quad
+TV(B,C)<\epsilon,
+\quad
+TV(A,C)\gg\epsilon.
 \]
 
 ### Required implementation
 
-1. Add a separate expansion function such as `_expand_fresh_iid`.
-2. Do not attach terminal shortcuts or reusable pilots as final children.
-3. Generate exactly `allocated_k` final children, subject only to an explicitly selected total-token cap mode.
-4. Preserve all pilot/support compute in overhead accounting.
-5. Store `pilot_execution_mode=fresh_iid` on nodes and edges.
-6. Assert:
-
-```text
-final_children == allocated_k
-pilot_children_reused == 0
-representative_weights_absent_or_all_one
-```
-
-7. If token-cap mode prevents exact generation, mark the run as budget-capped and not valid for the fixed-branch theoretical claim.
-
-### Reporting
-
-This is the default for primary accuracy, convergence-by-iteration, and theoretical-alignment experiments. It is more expensive because pilot work is not reused; report that overhead honestly.
-
-## 3.2 Mode B — `weighted_reuse` (efficiency variant)
-
-### Semantics
-
-Use pilot clustering to create representative groups. Every continuable pilot and terminal pilot must belong to exactly one cluster. For representative `r`, define multiplicity
+Use a deterministic clustering rule satisfying:
 
 \[
-m_r=|G_r|,
-\qquad
-w_r=\frac{m_r}{\sum_q m_q}.
+\max_{x\in G_r}TV(x,r)\le\epsilon.
 \]
 
-The cluster assignment must be deterministic for fixed inputs and may depend on pairwise TV/redundancy, but not on observed rewards.
+Recommended options:
 
-If a representative is completed into a child trajectory, compute the parent estimator as
+1. star clustering around a deterministic representative;
+2. complete-linkage clustering;
+3. medoid selection followed by a maximum-distance check.
+
+Do not use reward or correctness for representative selection.
+
+### Acceptance test
+
+Use a non-transitive A-B-C example and assert that A and C cannot share a cluster when their direct TV exceeds the threshold.
+
+---
+
+## P0.8 Correct terminal-pilot contribution to dispersion
+
+### Current risk
+
+Terminal-continuation pairs are conservatively assigned TV one, but terminal-terminal pairs currently contribute zero. This is wrong when terminal rewards differ.
+
+For observed terminal rewards:
+
+\[
+B_{ij}^{\mathrm{terminal}}=|R_i-R_j|.
+\]
+
+### Required implementation
+
+Grade terminal pilots before allocation and compute:
+
+\[
+C_s
+=
+\frac{1}{n^2}
+\left(
+\sum_{\mathrm{cont-cont}}B_{ij}^2
++
+\sum_{\mathrm{terminal-cont}}B_{ij}^2
++
+\sum_{\mathrm{terminal-terminal}}(R_i-R_j)^2
+\right).
+\]
+
+Keep terminal-continuation as a documented conservative bound if no sharper estimate is available.
+
+### Acceptance test
+
+Two terminal pilots with rewards `[0,1]` must yield:
+
+```text
+C_terminal > 0
+C_total > 0
+```
+
+---
+
+## P0.9 Disable the unused critic path
+
+### Current risk
+
+`algorithm.adv_estimator=gae` causes VERL to create a critic worker, while the custom trainer uses precomputed tree advantages and never trains the critic.
+
+This wastes memory and makes `critic_warmup` semantics misleading.
+
+### Required implementation
+
+Set explicitly:
+
+```yaml
+critic:
+  enable: false
+```
+
+Use or introduce an estimator/config path that does not imply a critic. Remove critic warmup from the custom actor-only loop.
+
+### Acceptance test
+
+Startup logs and Ray roles must show no critic worker for SPO-tree and VDRA runs.
+
+---
+
+# 3. Canonical pilot execution modes
+
+## 3.1 `fresh_iid` — main-paper default
+
+Pilots and support blocks estimate redundancy and the allocation coefficient only. After solving for `allocated_k`, generate exactly that many new final children:
+
+\[
+x_{s,1},\ldots,x_{s,k_s^*}
+\overset{iid}{\sim}
+\pi_{\theta_t}(\cdot\mid s).
+\]
+
+Parent value:
+
+\[
+\hat V_s^{\mathrm{fresh}}
+=
+\frac1{k_s^*}
+\sum_{j=1}^{k_s^*}\hat V(x_{s,j}).
+\]
+
+Required invariants:
+
+```text
+pilot_children_reused == 0
+terminal_shortcuts_reused == 0
+final_children == allocated_k, unless an explicit token cap is hit
+all final children carry the same generation snapshot
+```
+
+This is the only mode that may directly use the iid Monte Carlo interpretation in the main theory.
+
+## 3.2 `weighted_reuse` — approximate efficiency variant
+
+For representative `r` of cluster `G_r`:
+
+\[
+m_r=|G_r|.
+\]
+
+With fresh extra children `F_s`, use:
 
 \[
 \hat V_s^{\mathrm{reuse}}
-=
-\sum_{r\in\mathcal R_s}w_r\hat V(r).
-\]
-
-If fresh extra branches are added beyond the representative set, define and implement a single mathematically explicit mixture estimator. Do not combine weighted representatives and fresh samples with an arbitrary unweighted mean.
-
-Recommended estimator:
-
-1. Representatives account for `M_rep` original pilot draws through multiplicities.
-2. Each fresh child has multiplicity 1.
-3. Normalize all multiplicities:
-
-\[
-\hat V_s
 =
 \frac{
 \sum_{r\in\mathcal R_s}m_r\hat V(r)
 +
 \sum_{f\in\mathcal F_s}\hat V(f)
-}{M_{rep}+|\mathcal F_s|}.
+}{
+\sum_r m_r+|\mathcal F_s|
+}.
 \]
 
-This estimator approximates the empirical pilot distribution plus additional iid draws. It is not exactly the same estimator as fresh iid Monte Carlo; treat it as a separate method variant.
-
-### Required implementation
-
-1. Replace survivor-only output from `_unique_prefix_indices` with explicit cluster assignments:
-
-```python
-cluster_id_per_pilot: list[int]
-representative_index_per_cluster: dict[int, int]
-cluster_size: dict[int, int]
-```
-
-2. Every pilot, including terminal shortcuts, must be assigned to a cluster.
-3. Store on each representative:
+Required invariants:
 
 ```text
-vdra_cluster_id
-vdra_cluster_multiplicity
-vdra_representative_weight
-vdra_original_pilot_indices
+every pilot belongs to exactly one cluster
+every retained cluster has exactly one representative
+sum(cluster multiplicities) == number of represented pilot draws
+all required clusters are covered, otherwise fallback
+parent aggregation and PPO loss use the same weights
 ```
 
-4. Propagate edge/sample weights through:
-
-- parent reward aggregation;
-- parent reward standard deviation or weighted dispersion statistic;
-- local child-parent advantage;
-- replay edge records;
-- token-level actor loss via `rollout_is_weights` or a dedicated `edge_weights` field.
-
-5. The weighted parent value used to compute advantages must be identical to the value logged in artifacts.
-6. Representative selection must not use reward or correctness.
-7. If valid cluster weights cannot be formed, apply the configured explicit fallback `fresh_iid`, set `weighted_reuse_fallback_triggered=true`, and exclude that tree from pure weighted-reuse analysis.
-8. Assert:
-
-```text
-sum(cluster_multiplicity) == pilot_children_generated
-all cluster_multiplicity >= 1
-sum(representative_weight) == 1 within tolerance
-no pilot belongs to multiple clusters
-no pilot is unassigned
-```
-
-### Required theory note
-
-The paper must present weighted reuse as a coreset/representative estimator based on empirical pilot multiplicities, not as iid Monte Carlo. The variance objective used for allocation must either be rederived for this weighted estimator or be described as a heuristic allocation proxy for this variant.
-
-## 3.3 Ablation matrix
-
-At minimum run:
-
-| Variant | Pilot mode | Allocation | Purpose |
-|---|---|---|---|
-| SPO | none | uniform | baseline |
-| VDRA-Fresh | fresh_iid | exact VDRA | theory-safe main |
-| VDRA-Weighted | weighted_reuse | exact VDRA | compute-efficient variant |
-| Uniform-Fresh | fresh_iid | uniform | isolates allocation signal |
-| Uniform-Weighted | weighted_reuse | uniform | isolates reuse/weighting effect |
-
-Primary method claims should be based on `VDRA-Fresh` until the weighted estimator derivation and tests are complete.
+This mode must be reported as a compute-efficient representative/coreset variant. It must not inherit the iid estimator claim.
 
 ---
 
-# 4. Terminal pilots and definition of `C_s`
+# 4. P1 engineering hardening
 
-Terminal phase-one pilots have observed bounded return and consume branch probability mass. They cannot be excluded from dispersion while still consuming final branch slots.
+## P1.1 Correct allocation-scope terminology
 
-Implement one of the following, with `include_in_dispersion` as the main choice:
+Runtime allocation is solved separately for each queue flush, not for the complete depth frontier or whole tree.
 
-1. Include each terminal pilot as a distribution atom with known terminal value/reward.
-2. Extend the pairwise bound matrix to terminal–terminal and terminal–continuation pairs.
-3. Construct `C_s` over all pilot groups used by the selected estimator.
-
-For `fresh_iid`, terminal pilots affect `C_s` and `predicted_k` but are still discarded before final iid generation.
-
-For `weighted_reuse`, terminal pilots become weighted representatives and their observed terminal values enter the weighted estimator.
-
-Log separately:
+Use:
 
 ```text
+allocation_scope: per_queue_flush_within_tree
+```
+
+The method statement should define `Q` as the set of nodes in one flush. Queue count, capacity, timeout, and flush-size histograms must be reported.
+
+## P1.2 Remove reserve terminology from primary reporting
+
+The exact bounded solver redistributes budget inside a flush. The old reserve pool is no longer the optimization mechanism.
+
+Primary fields:
+
+```text
+pruned_k
+expanded_k
+transferred_budget_within_flush
+lower_bound_k
+upper_bound_k
+objective_before
+objective_after
+```
+
+Keep `gear_reserve_*` only as deprecated compatibility aliases.
+
+## P1.3 Add context-length startup validation
+
+Strict no-truncation can fail during training when accumulated parent trajectories exceed `max_prompt_length`.
+
+Before training, compute or conservatively bound:
+
+\[
+L_{\max}^{\mathrm{edge-query}}
+\le
+L_{\max}^{\mathrm{original-prompt}}
++(d-1)M.
+\]
+
+Validate it against configured prompt length and log dataset statistics.
+
+## P1.4 Make `replay_buffer.enabled` real or remove it
+
+If `enabled=false` is supported, implement a direct non-replay update path. Otherwise remove the field so an ablation cannot silently do nothing.
+
+## P1.5 Use deterministic edge IDs
+
+Replace random UUID edge IDs with a stable hash of:
+
+```text
+policy_snapshot_id
+stable_question_id
+tree_id
+parent_path
+child_index
+```
+
+This is required for reproducible replay sampling.
+
+## P1.6 Require stable global question IDs
+
+Do not fall back to a per-batch index. Require a dataset UID or hash of the normalized problem. The per-question replay cap must never combine different questions that happen to share a batch-local index.
+
+## P1.7 Avoid placeholder reward computation
+
+Tree construction already grades the actual leaves. The placeholder response returned only to satisfy `AgentLoopOutput` should not trigger another reward-manager call.
+
+Add a tree-output flag or explicit sentinel reward to skip this redundant computation.
+
+## P1.8 Preserve sticky sessions for pilot completion
+
+Do not create unrelated random request IDs for every pilot and continuation. Use stable session IDs derived from tree/node/branch identity so continuation requests remain on the same server and can reuse prefix cache.
+
+This also reduces latency-driven variation in queue composition.
+
+## P1.9 Fix or quarantine legacy simulation-lemma mode
+
+The main run must remain:
+
+```yaml
+tail_mode: none
+bound_form: linear
+```
+
+Do not claim a certified tight simulation-lemma bound for this mode. Either correct and separately test the legacy discounted formula or mark it unsupported for paper experiments.
+
+---
+
+# 5. Required tests
+
+## 5.1 CPU/unit tests
+
+1. Exact allocator vs exhaustive brute force on many random small instances.
+2. True lower/upper bound persistence.
+3. Replay reservation–commit–rollback.
+4. Replay resume with exact edge records.
+5. One-minibatch stored-old-logprob preservation.
+6. Dynamic snapshot propagation through non-tensor kwargs.
+7. Exact token-ID scorer boundary alignment.
+8. Actual rollout temperature/top-p validation.
+9. `fresh_iid` never reuses pilots.
+10. Weighted tree-to-edge-to-loss propagation.
+11. Weighted fallback when cluster coverage is impossible.
+12. Non-transitive clustering counterexample.
+13. Terminal rewards `[0,1]` produce positive terminal dispersion.
+14. Empty PPO mask produces finite zero and backward succeeds.
+15. Stable question and edge IDs are deterministic.
+
+## 5.2 Real integration tests
+
+Run with real Ray, FSDP, and async vLLM:
+
+### Smoke A — SPO-tree
+
+- 2–5 successful actor updates;
+- no critic worker;
+- finite loss and gradients;
+- stored old log-probabilities preserved.
+
+### Smoke B — VDRA `fresh_iid`
+
+- 2–5 successful actor updates;
+- scorer and rollout report the same weight version;
+- exact token scorer is used;
+- no pilot is reused;
+- final-child count matches allocation;
+- queue flushes contain more than one node at least once.
+
+### Smoke C — VDRA `weighted_reuse`
+
+- 2–5 successful actor updates;
+- all cluster coverage invariants pass;
+- edge weights reach actor loss;
+- fallback is exercised at least once in a controlled test;
+- no NaN/Inf in weighted value, advantage, ratio, loss, or gradient.
+
+---
+
+# 6. Required runtime logging
+
+Every run manifest must contain:
+
+```text
+commit_sha
+algorithm_requested
+algorithm_executed
+pilot_execution_mode
+weighted_reuse_fallback
+allocation_scope
+allocation_proxy
+bound_form
+tail_mode
+eps_tail
+tree_shape
+segment_length
+pilot_branch_factor
+likelihood_samples_per_distribution
+queue_count
+queue_capacity
+queue_timeout_seconds
+actual_rollout_temperature
+actual_rollout_top_p
+policy_snapshot_id
+rollout_weight_version
+scorer_weight_version
+scorer_model
+critic_enabled
+budget_mode
+run_valid_for_main_results
+```
+
+Every node/allocation record must contain:
+
+```text
+default_k
+predicted_k
+allocated_k
+lower_bound_k
+upper_bound_k
+pruned_k
+expanded_k
+transferred_budget_within_flush
 C_continuation
 C_terminal
 C_cross
 C_total
+objective_before
+objective_after
+solver_time_ms
+queue_id
+queue_size_at_flush
+flush_reason
+queue_wait_seconds
+pilot_execution_mode
+pilot_generated
+pilot_reused
+pilot_discarded
+cluster_count
+fallback_triggered
+final_child_count
 ```
 
-Assert `C_total` is the coefficient passed to the allocator.
-
----
-
-# 5. Scorer, token, and policy invariants
-
-## 5.1 Real policy synchronization
-
-Preferred implementation: expose prompt-token log-prob scoring through the same `AsyncLLMServerManager`/served rollout model used for pilots and main generation.
-
-Alternative implementation: maintain an external scorer server only if all of the following are enforced:
-
-- actor update synchronizes both rollout and scorer weights;
-- both expose a monotonic model version;
-- a weight fingerprint or version handshake is verified before every rollout iteration;
-- scorer requests carry that version;
-- mismatch aborts strict VDRA.
-
-Snapshot strings supplied by configuration are not sufficient evidence.
-
-## 5.2 Exact token-ID scorer
-
-Replace text-only scorer calls with:
-
-```python
-score_one(
-    prefix_token_ids: list[int],
-    continuation_token_ids: list[int],
-    policy_snapshot_id: str,
-) -> float
-```
-
-The scorer must compute the continuation log-likelihood on exact concatenated token IDs. No decode–concatenate–retokenize path is allowed in strict mode.
-
-Required assertions:
-
-```text
-scored_input_ids == prefix_token_ids + continuation_token_ids
-returned continuation logprobs count == len(continuation_token_ids)
-all scored values finite or handled by explicit invalid-support policy
-```
-
-## 5.3 Same sampling and likelihood distributions
-
-For the main configuration, choose the simplest auditable setting:
-
-```yaml
-actor_rollout_ref:
-  rollout:
-    temperature: 1.0
-    top_p: 1.0
-```
-
-If nontrivial temperature/top-p is used, scorer likelihoods must apply the same transformed and renormalized distribution. Store these parameters in the manifest and parity records.
-
-## 5.4 Real log-prob parity diagnostic
-
-Add a script that:
-
-1. freezes one actor/rollout snapshot;
-2. generates or loads fixed exact prompt/response token IDs;
-3. gets chosen-token log-probs from vLLM;
-4. gets aligned log-probs from the actor forward pass;
-5. records model version, tokenizer ID, temperature, top-p, precision, BOS/EOS convention;
-6. checks max and mean absolute deltas.
-
-The helper-only JSON test is not sufficient. A real diagnostic must pass before long runs.
-
----
-
-# 6. PPO conditioning and truncation
-
-PPO numerator and denominator must condition on identical token sequences.
-
-In strict mode, `edges_to_dataproto` must never silently truncate an edge generated under a longer context.
-
-Before replay insertion or batch conversion, enforce:
-
-```text
-len(query_token_ids) <= max_prompt_length
-len(response_token_ids) <= max_response_length
-```
-
-Recommended behavior: reject the edge and fail the smoke test. Do not crop only at training time.
-
-If context cropping is necessary, crop before generation and store the exact cropped behavior query tokens. Add fields:
-
-```text
-behavior_query_token_ids
-behavior_response_token_ids
-behavior_context_truncated
-```
-
-Then assert actor input exactly equals the stored behavior sequence.
-
-Do not mutate `actor_shifted_log_probs` inside `edges_to_dataproto`.
-
----
-
-# 7. Trainer counters and replay semantics
-
-Maintain distinct counters:
+Training logs must separate:
 
 ```text
 rollout_iteration
@@ -477,319 +695,73 @@ optimizer_step
 successful_actor_updates
 postponed_updates
 failed_updates
+replay_buffer_size
+mean_edge_age
+max_edge_age
 ```
-
-Use `optimizer_step` for:
-
-- `trainer.total_training_steps`;
-- replay edge age;
-- policy snapshot version;
-- validation/save frequency when reporting performance by training iteration.
-
-A no-edge, postponed, critic-warmup, or failed actor call must not increment `optimizer_step`.
-
-Refactor replay into an explicit transaction:
-
-```python
-reservation = replay_buffer.reserve_for_update(current_optimizer_step)
-try:
-    actor_output = update_actor(batch)
-except Exception:
-    replay_buffer.rollback(reservation)
-    raise
-else:
-    replay_buffer.commit(reservation)
-    optimizer_step += 1
-```
-
-Reserved edges must not be sampled by another reservation.
-
-Underfill policy for main runs:
-
-- postpone until at least one valid mini-batch exists;
-- prefer exactly `target_edges_per_update` for baseline parity;
-- log every underfill/postponement;
-- never duplicate edges.
 
 ---
 
-# 8. PPO numerical safety and weighted loss
+# 7. Paper-safe claims
 
-Fix `_masked_mean`:
+For the current main configuration, use language equivalent to:
 
-```python
-mask_sum = mask.sum()
-if mask_sum == 0:
-    return a differentiable zero and zero-valued metrics
-```
+> VDRA estimates a short-horizon node-wise dispersion proxy from conditional policy divergence and solves an exact bounded integer allocation problem within each online queue flush.
 
-Log:
+Do not claim:
+
+- full-frontier global optimality;
+- full-horizon certified value bounds when `tail_mode=none`;
+- exact TreePO or TreeRL reproduction;
+- unbiased Monte Carlo estimation for `weighted_reuse`;
+- equal scorer and rollout policies based only on equal string IDs;
+- equal compute based only on the full-tree maximum token cap.
+
+`fresh_iid` is the primary theory-aligned method. `weighted_reuse` is a separately named efficiency variant.
+
+---
+
+# 8. Implementation order
+
+Execute in this order:
+
+1. Dynamic snapshot propagation through `non_tensor_batch`.
+2. Force stored old log-probabilities in actor updates.
+3. Shared scorer lifecycle and verifiable weight-version equality.
+4. Actual temperature/top-p propagation and strict validation.
+5. Tree-to-edge representative-weight propagation.
+6. Weighted-reuse coverage fallback.
+7. Representative-valid clustering.
+8. Terminal-terminal dispersion from observed rewards.
+9. Disable critic and remove critic warmup semantics.
+10. Context-length and stable-ID validation.
+11. Scope/terminology/logging cleanup.
+12. CPU test suite.
+13. Real SPO, fresh-iid, and weighted-reuse smoke tests.
+14. Only then start long comparison runs.
+
+---
+
+# 9. Go / no-go gate
+
+A long run is **GO** only when all conditions are true:
 
 ```text
-actor/all_tokens_prob_masked
-actor/valid_action_tokens
+[ ] Dynamic snapshot reaches every agent-loop sample.
+[ ] Scorer and rollout weights are verifiably identical.
+[ ] Actual sampling distribution is validated.
+[ ] Stored behavior log-probabilities are never overwritten.
+[ ] fresh_iid passes exact final-child invariants.
+[ ] weighted_reuse weights reach the actor loss.
+[ ] weighted_reuse fallback handles missing cluster coverage.
+[ ] Cluster membership is representative-valid.
+[ ] Terminal reward disagreement contributes to C_s.
+[ ] No unused critic worker is created.
+[ ] Stable global question IDs and deterministic edge IDs are used.
+[ ] Context-length validation passes.
+[ ] Real Ray/FSDP/async-vLLM smoke tests pass for all three modes.
+[ ] No NaN/Inf appears in value, advantage, PPO ratio, loss, or gradients.
+[ ] Manifests and artifacts identify the exact executed estimator and scope.
 ```
 
-For `weighted_reuse`, propagate representative/example weights into the actor loss. Define whether weights normalize per edge, per question, or globally. Recommended:
-
-\[
-L
-=
-\frac{\sum_e w_e\sum_t m_{e,t}\ell_{e,t}}
-{\sum_e w_e\sum_t m_{e,t}}.
-\]
-
-Do not multiply the loss by weights and then divide by an unweighted token count.
-
-Add tests for:
-
-- all tokens masked;
-- one weighted representative with multiplicity greater than one;
-- weighted loss equivalence to explicitly duplicated identical edges;
-- zero/negative/nonfinite weights rejected.
-
----
-
-# 9. Allocation bounds and accounting
-
-The queue manager must pass the actual solver outputs back into node accounting:
-
-```python
-lower_bound=summary.lower_bounds[node_id]
-upper_bound=summary.upper_bounds[node_id]
-```
-
-Persist:
-
-```text
-requested_budget
-allocated_budget
-lower_bound
-upper_bound
-predicted_k
-default_k
-allocated_k
-pruned_k
-expanded_k
-transferred_budget
-objective_before
-objective_after
-solver_name
-solver_time_ms
-feasibility_repair_count
-```
-
-Compute `objective_before` on a feasible reference allocation with the same total budget and bounds. Never compare the optimized objective to an infeasible raw default vector.
-
-Legacy reserve fields may remain aliases temporarily, but must not be the primary paper metrics.
-
----
-
-# 10. Allocation scope and reproducibility
-
-For `allocation_runtime=online_timeout`, define:
-
-\[
-\mathcal Q=\text{the set of nodes in one queue flush}.
-\]
-
-Do not claim a depth-global optimum.
-
-Because queue membership can depend on wall-clock scheduling, log:
-
-```text
-queue_id
-node_ids_in_flush
-queue_size_at_flush
-flush_reason
-queue_wait_seconds
-arrival_order
-policy_snapshot_id
-```
-
-Add a deterministic `depth_batch` comparison that allocates over the complete depth frontier. Use it as an ablation to quantify the effect of online queue partitioning.
-
-Run repeated fixed-seed online rollouts and report allocation stability across scheduling runs.
-
----
-
-# 11. Compute-budget terminology
-
-Rename `fixed_total_generated` to a name that matches its semantics, for example:
-
-```text
-uniform_full_tree_token_cap
-```
-
-Describe it as a maximum-style cap derived from a full uniform tree with configured segment limits, not expected or realized SPO compute.
-
-Report separately:
-
-```text
-pilot_decode_tokens
-support_decode_tokens
-final_expansion_decode_tokens
-proxy_rollout_tokens
-scorer_prefill_tokens
-scorer_continuation_tokens
-wall_clock_seconds
-```
-
-For fair main comparisons, always report both:
-
-1. performance versus successful optimizer updates;
-2. performance versus wall-clock time / total token-equivalent compute.
-
----
-
-# 12. Required tests
-
-## 12.1 Unit tests
-
-### Pilot modes
-
-- `fresh_iid` never reuses pilots as final children.
-- `fresh_iid` produces exactly `allocated_k` final children when not token-capped.
-- `weighted_reuse` assigns every pilot to exactly one cluster.
-- multiplicities sum to number of pilots.
-- weighted parent value matches explicit pilot duplication.
-- terminal pilots enter `C_total`.
-- representative selection is reward-independent.
-
-### Scorer and policy
-
-- exact token-ID boundary test with a tokenizer where `tok(x+y) != tok(x)+tok(y)`.
-- real snapshot/version mismatch aborts.
-- temperature/top-p mismatch aborts in strict mode.
-- actual rollout-vs-actor parity diagnostic fixture.
-
-### PPO and replay
-
-- overlength query/response fails before training.
-- batch conversion does not mutate stored edge log-probs.
-- all-masked PPO loss is finite zero.
-- reserve/commit/rollback semantics.
-- postponed iteration does not increment optimizer step.
-- failed actor update leaves edges in replay.
-- age uses optimizer steps, not rollout attempts.
-
-### Allocation and accounting
-
-- brute-force optimality over randomized small bounded instances.
-- exact budget and bounds.
-- persisted lower/upper equal solver summary.
-- feasible baseline objective.
-- median <1 ms and p99 <5 ms for normal target environment, with nonbinding CI fallback thresholds where needed.
-
-## 12.2 End-to-end smoke test
-
-Run 2–5 successful actor optimizer updates with Ray + FSDP + async vLLM for:
-
-1. SPO-tree;
-2. VDRA `fresh_iid`;
-3. VDRA `weighted_reuse`.
-
-The smoke test must assert:
-
-```text
-successful_actor_updates == requested_steps
-no NaN or Inf in loss, ratio, KL, advantages, values, or weights
-rollout/scorer/edge snapshot versions match
-rollout-vs-actor old-logprob parity within configured tolerance
-no query or response truncation
-replay removal equals successfully trained edge IDs
-all queues empty and all futures resolved
-all finalized nodes have rewards
-sum allocations equals target per flush
-final children obey selected pilot-mode contract
-all compute counters are nonnegative and internally consistent
-```
-
-Persist a machine-readable smoke report. A unit-test-only pass is not sufficient.
-
----
-
-# 13. Experiment protocol after P0 completion
-
-Main-paper default:
-
-```yaml
-pilot_execution_mode: fresh_iid
-tail_mode: none
-bound_form: linear
-allocation_runtime: online_timeout
-allocation_proxy: vdra
-strict_vdra: true
-temperature: 1.0
-top_p: 1.0
-```
-
-Required comparisons:
-
-- same model checkpoint;
-- same tokenizer and prompt template;
-- same dataset order and seeds;
-- same successful optimizer updates;
-- same replay protocol;
-- same PPO mini-batch and epochs;
-- exact logged tree/segment configuration;
-- wall-clock and total compute accounting.
-
-`weighted_reuse` is reported as a separate efficiency variant until its estimator derivation and weighted-loss validation are complete.
-
-TreePO/TreeRL variants remain `*-style` unless official parity is established.
-
----
-
-# 14. Implementation order
-
-## P0 — Before any long run
-
-1. Implement `fresh_iid` and make it the main default.
-2. Implement complete clustering/multiplicity representation for `weighted_reuse`.
-3. Include terminal pilots in the coefficient used by allocation.
-4. Replace text scorer with exact token-ID scoring.
-5. Guarantee real scorer/rollout weight synchronization.
-6. Enforce matching sampling/scoring distributions.
-7. Remove silent query/response truncation.
-8. Separate rollout iteration from optimizer step.
-9. Add replay reserve/commit/rollback.
-10. Add zero-mask PPO guard and weighted loss.
-11. Preserve true allocation bounds/objectives in artifacts.
-12. Pass all unit tests and the three-mode end-to-end smoke test.
-
-## P1 — Before main paper experiments
-
-1. Run real log-prob parity diagnostics on the target model/precision.
-2. Validate weighted estimator against explicit duplication on sampled trees.
-3. Compare online-timeout versus depth-batch allocation.
-4. Finalize compute-budget terminology and plots.
-5. Freeze controlled SPO and VDRA presets.
-6. Run short paired-seed experiments before committing to full runs.
-
-## P2 — Paper/rebuttal strengthening
-
-1. Derive or bound variance for the weighted representative estimator.
-2. Calibrate tail correction and compare `none` versus `calibrated`.
-3. Study allocation stability under runtime scheduling.
-4. Add oracle and empirical-variance proxy diagnostics.
-5. Establish official baseline parity where feasible.
-
----
-
-# 15. Stop conditions
-
-Do not start or report a long main-paper run if any of the following holds:
-
-- final estimator mode is missing from the manifest;
-- scorer and rollout weights are not verifiably synchronized;
-- PPO context was silently truncated;
-- optimizer-step count differs from successful actor updates;
-- any sampled edge is removed without successful training;
-- `fresh_iid` reuses a pilot;
-- `weighted_reuse` has missing/invalid multiplicities or unweighted aggregation;
-- terminal pilots are excluded from the actual allocation coefficient;
-- allocation artifacts do not match solver bounds;
-- smoke test contains NaN/Inf or unresolved queue state.
-
-Partial completion is not sufficient for main claims. Any remaining deviation must be labeled as an ablation or engineering approximation rather than silently folded into VDRA.
+Until this gate passes, results are engineering diagnostics rather than main-paper evidence.
