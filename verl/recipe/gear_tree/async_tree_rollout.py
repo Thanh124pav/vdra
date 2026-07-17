@@ -32,6 +32,22 @@ from recipe.gear_tree.tree_advantage import extract_edges_from_tree
 from recipe.gear_tree.gear_core.reward_function import MathRewardFunction
 
 
+def _prompt_sticky_key(prompt_ids: Sequence[int]) -> str:
+    """Compute a deterministic sticky-routing key from the tail of a prompt.
+
+    P0.1: the previous implementation called ``bytes(list(prompt_ids)[-256:])``
+    which raises ``ValueError`` on real vocabulary IDs above 255. blake2b
+    accepts arbitrary bytes; we pack each token id as 4 little-endian bytes to
+    keep the digest defined for the full 32-bit id space.
+    """
+
+    import hashlib
+
+    tail = list(prompt_ids)[-256:]
+    buf = b"".join(int(x).to_bytes(4, "little", signed=False) for x in tail)
+    return "stick:" + hashlib.blake2b(buf, digest_size=12).hexdigest()
+
+
 class AsyncServerSegmentGenerator:
     """Async ``segment_fn`` backed by ``AsyncLLMServerManager.generate``."""
 
@@ -48,24 +64,40 @@ class AsyncServerSegmentGenerator:
         self.base_sampling_params = dict(base_sampling_params or {})
         self.free_max_tokens = free_max_tokens
 
-    async def _one(self, prompt_ids: Sequence[int], sp: Dict[str, Any]) -> SegmentSample:
-        # P1.8: derive a sticky session id from the prompt prefix so
-        # continuation requests hit the same server replica and can reuse the
-        # prefix cache. Random uuids per pilot/continuation break stickiness
-        # and introduce latency-driven variation in queue composition.
-        import hashlib
-
-        session = sp.pop("_session_id", None)
-        if session is None:
-            digest = hashlib.blake2b(
-                bytes(list(prompt_ids)[-256:]), digest_size=12
-            ).hexdigest()
-            session = f"stick:{digest}"
-        out = await self.server_manager.generate(
-            request_id=session,
-            prompt_ids=list(prompt_ids),
-            sampling_params=sp,
-        )
+    async def _one(
+        self,
+        prompt_ids: Sequence[int],
+        sp: Dict[str, Any],
+        *,
+        sticky_key: Optional[str] = None,
+    ) -> SegmentSample:
+        # P0.1: request_id is unique per generation call (concurrent siblings
+        # must not collide on the server), sticky_key is the stable branch/
+        # session identifier used only for server routing so pilot + its
+        # continuation land on the same replica for prefix cache reuse. The
+        # legacy bytes(prompt_ids) digest raised on real vocabulary IDs above
+        # 255 and gave concurrent siblings the same request id.
+        legacy_key = sp.pop("_session_id", None)
+        if sticky_key is None:
+            sticky_key = legacy_key
+        if sticky_key is None:
+            sticky_key = _prompt_sticky_key(prompt_ids)
+        request_id = f"req:{uuid4().hex}"
+        # Forward sticky_key when the wrapped manager supports it; fall back
+        # to plain request_id routing on older managers (mock/test doubles).
+        try:
+            out = await self.server_manager.generate(
+                request_id=request_id,
+                prompt_ids=list(prompt_ids),
+                sampling_params=sp,
+                sticky_key=str(sticky_key),
+            )
+        except TypeError:
+            out = await self.server_manager.generate(
+                request_id=request_id,
+                prompt_ids=list(prompt_ids),
+                sampling_params=sp,
+            )
         tids = list(out.token_ids)
         logps = list(out.log_probs) if getattr(out, "log_probs", None) else None
         cap = sp.get("max_tokens", self.free_max_tokens)
@@ -82,7 +114,13 @@ class AsyncServerSegmentGenerator:
         )
 
     async def segment_fn(
-        self, prompt_token_ids: Sequence[int], branch_factor: int, max_tokens: Optional[int]
+        self,
+        prompt_token_ids: Sequence[int],
+        branch_factor: int,
+        max_tokens: Optional[int],
+        *,
+        sticky_key: Optional[str] = None,
+        sibling_sticky_keys: Optional[Sequence[str]] = None,
     ) -> List[SegmentSample]:
         sp = {
             **self.base_sampling_params,
@@ -90,8 +128,25 @@ class AsyncServerSegmentGenerator:
             "logprobs": 1,
             "max_tokens": max_tokens if max_tokens is not None else self.free_max_tokens,
         }
+        bf = int(branch_factor)
+        if sibling_sticky_keys is not None:
+            keys = list(sibling_sticky_keys)
+            if len(keys) != bf:
+                raise ValueError(
+                    f"sibling_sticky_keys length {len(keys)} != branch_factor {bf}"
+                )
+        else:
+            # Concurrent siblings must not collide on a single server: split
+            # the parent sticky_key by sibling index. Continuations pass the
+            # already-split sibling key explicitly via `sticky_key=` so the
+            # pilot's continuation lands on the same replica.
+            base = sticky_key if sticky_key is not None else _prompt_sticky_key(prompt_token_ids)
+            keys = [f"{base}/s{i}" for i in range(bf)]
         return await asyncio.gather(
-            *[self._one(prompt_token_ids, dict(sp)) for _ in range(int(branch_factor))]
+            *[
+                self._one(prompt_token_ids, dict(sp), sticky_key=keys[i])
+                for i in range(bf)
+            ]
         )
 
 
@@ -116,11 +171,21 @@ class SegmentNodeExpander:
         prompt_ids = current_node.get("full_token_ids")
         if prompt_ids is None:
             prompt_ids = self.tokenizer.encode(prefix, add_special_tokens=False)
+        # P0.1: derive sibling sticky keys from a stable node identity so
+        # the pilot and its continuation share routing (prefix cache reuse)
+        # while concurrent siblings get unique request IDs.
+        parent_key = (
+            current_node.get("gear_segment_id")
+            or current_node.get("vdra_node_id")
+            or _prompt_sticky_key(prompt_ids)
+        )
+        keys = [f"branch:{parent_key}/d{int(depth)}/i{i}" for i in range(int(branch_factor))]
         samples = await self.segment_generator.segment_fn(
-            prompt_ids, int(branch_factor), int(max_tokens)
+            prompt_ids, int(branch_factor), int(max_tokens),
+            sibling_sticky_keys=keys,
         )
         nodes: List[Dict[str, Any]] = []
-        for s in samples:
+        for i, s in enumerate(samples):
             nodes.append(
                 {
                     "text": s.text,
@@ -132,6 +197,9 @@ class SegmentNodeExpander:
                     "full_token_ids": list(prompt_ids) + list(s.token_ids),
                     "response_token_ids": list(s.token_ids),
                     "actor_shifted_log_probs": list(s.logprobs) if s.logprobs is not None else None,
+                    # P0.1: pilot continuations must land on the same server
+                    # replica as the original pilot for prefix cache reuse.
+                    "vdra_sticky_key": keys[i],
                 }
             )
         return nodes
@@ -244,6 +312,7 @@ def _build_scorer_cpu(g: dict, tokenizer: Any):
         return None
     from recipe.gear_tree.gear_core.gear.vllm_scorer import (
         VLLMLogprobClient,
+        fetch_server_weight_version,
         make_lp_scorer,
         resolve_vllm_model_id,
     )
@@ -278,25 +347,65 @@ def _build_scorer_cpu(g: dict, tokenizer: Any):
         )
         scorer.scorer_model = model_id
         scorer._client = client
+        scorer.api_base = str(api_base)
         _SCORER_CACHE_CPU[cache_key] = scorer
     else:
         scorer = cached
     scorer.policy_snapshot_id = rollout_snapshot
     scorer.scorer_snapshot_id = scorer_snapshot
-    scorer.weight_version = rollout_snapshot
+    # P0.3: prefer a server-reported fingerprint over the client snapshot label.
+    server_version = None
+    try:
+        server_version = fetch_server_weight_version(
+            str(api_base),
+            api_key=api_key,
+            timeout=float(g.get("scorer_version_timeout", 5.0)),
+        )
+    except Exception:
+        server_version = None
+    scorer.server_weight_version = server_version
+    scorer.weight_version_verified = server_version is not None
+    scorer.weight_version = server_version or rollout_snapshot
     return scorer
 
 
-def assert_scorer_matches_rollout(scorer, rollout_snapshot_id: str) -> None:
-    """P0.2 acceptance helper: trainer calls this after every actor update.
+def assert_scorer_matches_rollout(
+    scorer,
+    rollout_snapshot_id: str,
+    *,
+    rollout_server_weight_version: Optional[str] = None,
+    strict_vdra: bool = True,
+) -> None:
+    """P0.2 / P0.3 acceptance helper: trainer calls this after every actor update.
 
-    Raises when the scorer's stamped weight_version drifts from the current
-    rollout snapshot id, which indicates the scorer replica is running stale
-    weights (or a different model) than the rollout replica.
+    In strict mode with ``rollout_server_weight_version`` supplied, this asserts
+    the server-reported scorer fingerprint EQUALS the rollout server's
+    fingerprint — matching client-side snapshot strings alone is not proof of
+    equal weights (PLAN.md P0.3). If no server-side fingerprint is available
+    on the scorer, strict mode fails so the trainer cannot silently proceed
+    with unverified weights.
     """
     if scorer is None:
         return
     stamped = getattr(scorer, "weight_version", None)
+    server_version = getattr(scorer, "server_weight_version", None)
+    verified = bool(getattr(scorer, "weight_version_verified", False))
+
+    if rollout_server_weight_version is not None:
+        if not verified or server_version is None:
+            if strict_vdra:
+                raise RuntimeError(
+                    "Scorer weight version is not server-verified: "
+                    "strict_vdra requires a server-reported fingerprint "
+                    "for both rollout and scorer replicas."
+                )
+        elif str(server_version) != str(rollout_server_weight_version):
+            raise RuntimeError(
+                "Scorer server_weight_version does not match rollout server: "
+                f"scorer={server_version!r} rollout={rollout_server_weight_version!r}"
+            )
+        return
+
     if stamped is None or str(stamped) != str(rollout_snapshot_id):
         raise RuntimeError(
             "Scorer weight_version does not match current rollout snapshot: "
@@ -435,6 +544,32 @@ try:  # keep CPU-importable when agent_loop isn't installed
                 "current_rollout_snapshot_id": snapshot_id,
             }
 
+            # P0.2 / P0.3: rebind the gate/scorer to THIS rollout's snapshot
+            # before touching the tree builder. The gate was constructed in
+            # __init__ from static config; without a per-rollout re-bind the
+            # scorer keeps its init-time weight_version even after the actor
+            # has stepped, and strict-mode invariants would compare stale
+            # state.
+            if self._gate is not None:
+                server_weight_version = (
+                    kwargs.get("rollout_server_weight_version")
+                    or kwargs.get("scorer_server_weight_version")
+                )
+                self._gate.bind_snapshot(
+                    snapshot_id,
+                    weight_version=server_weight_version,
+                    weight_version_verified=server_weight_version is not None,
+                )
+                # P0.4: wire the terminal grader so terminal pilots contribute
+                # observed reward differences to the dispersion estimate.
+                reward_fn = self._reward_fn
+
+                def _terminal_grader(node):
+                    text = node.get("full_text") or node.get("text") or ""
+                    return float(reward_fn(prompt_text, text, data_instance)[0])
+
+                self._gate.set_terminal_reward_fn(_terminal_grader)
+
             edges = await build_tree_edges_async(
                 prompt_text, prompt_ids, data_instance,
                 segment_generator=self._gen, reward_fn=self._reward_fn,
@@ -456,11 +591,16 @@ try:  # keep CPU-importable when agent_loop isn't installed
                 self.tokenizer.eos_token_id
             ]
             resp = resp[: self.rollout_config.response_length]
+            # P1.2: skip placeholder reward computation. The custom trainer
+            # scores tree edges, not this placeholder — grading it wastes
+            # reward-model calls (and, for MathReward, can flag legitimate
+            # tree edges as wrong).
             return AgentLoopOutput(
                 prompt_ids=prompt_ids,
                 response_ids=resp,
                 response_mask=[1] * len(resp),
                 num_turns=2,
+                reward_score=0.0,
                 metrics=AgentLoopMetrics(),
                 extra_fields={"gear_tree_edges": edges},
             )
@@ -538,10 +678,10 @@ try:  # keep CPU-importable when agent_loop isn't installed
             return None
         from recipe.gear_tree.gear_core.gear.vllm_scorer import (
             VLLMLogprobClient,
+            fetch_server_weight_version,
             make_lp_scorer,
+            resolve_vllm_model_id,
         )
-
-        from recipe.gear_tree.gear_core.gear.vllm_scorer import resolve_vllm_model_id
 
         rollout_snapshot = g.get("policy_snapshot_id")
         scorer_snapshot = g.get("scorer_snapshot_id", rollout_snapshot)
@@ -578,6 +718,7 @@ try:  # keep CPU-importable when agent_loop isn't installed
             )
             scorer.scorer_model = model_id
             scorer._client = client  # retained so shutdown can aclose() it
+            scorer.api_base = str(api_base)
             _SCORER_CACHE[cache_key] = scorer
         else:
             scorer = cached
@@ -586,12 +727,25 @@ try:  # keep CPU-importable when agent_loop isn't installed
         # must reflect the current expected weight version.
         scorer.policy_snapshot_id = rollout_snapshot
         scorer.scorer_snapshot_id = scorer_snapshot
-        # weight_version is the fingerprint we use to verify scorer/rollout
-        # parity: today it mirrors the rollout snapshot id (best proxy
-        # available without a server-side handshake); if the vLLM server
-        # later exposes a real weight fingerprint, replace this line with a
-        # call that reads it and stash both here for the trainer to compare.
-        scorer.weight_version = rollout_snapshot
+        # P0.3: attempt a real server-side handshake before falling back to
+        # the client-side snapshot label. The server may respond with a real
+        # fingerprint (checkpoint revision, actor update number); the trainer
+        # then compares this against the rollout server's fingerprint via
+        # assert_scorer_matches_rollout(). If no fingerprint is available we
+        # keep the snapshot string but flag it as unverified so downstream
+        # code (run manifest) does NOT report version_verified=True.
+        server_version = None
+        try:
+            server_version = fetch_server_weight_version(
+                str(api_base),
+                api_key=api_key,
+                timeout=float(g.get("scorer_version_timeout", 5.0)),
+            )
+        except Exception:
+            server_version = None
+        scorer.server_weight_version = server_version
+        scorer.weight_version_verified = server_version is not None
+        scorer.weight_version = server_version or rollout_snapshot
         return scorer
 
     async def _close_cached_scorers() -> None:

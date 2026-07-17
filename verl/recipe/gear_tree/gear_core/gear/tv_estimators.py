@@ -220,19 +220,36 @@ class ConditionalTVEstimator:
         n_total = len(first_nodes)
         if n_total < 2:
             return {}, 0.0, 0.0, 0.0, 0.0
-        # P0.8: grade terminal pilots (no-op when no grader configured or
-        # when a reward is already present).
+        # P0.4: grade terminal pilots (no-op when no grader configured or when
+        # a reward is already present). Strict mode surfaces grader failures
+        # instead of silently attributing zero terminal dispersion to a graded
+        # pilot; strict mode also refuses to leave a terminal pilot ungraded
+        # (would understate C_s in exactly the case terminal_pilot_handling=
+        # include_in_dispersion is supposed to cover).
         grader = getattr(self, "terminal_reward_fn", None)
+        strict = bool(getattr(self, "strict_vdra", False))
         if grader is not None:
             for node in shortcut_nodes:
                 if node.get("reward") is not None:
                     continue
                 try:
                     reward = grader(node)
-                except Exception:
+                except Exception as exc:
+                    if strict:
+                        raise RuntimeError(
+                            "Terminal-pilot grader failed in strict VDRA mode"
+                        ) from exc
                     reward = None
                 if reward is not None:
                     node["reward"] = float(reward)
+        if strict and shortcut_nodes and any(
+            node.get("reward") is None for node in shortcut_nodes
+        ):
+            raise RuntimeError(
+                "strict VDRA: terminal pilot has no reward and no grader is "
+                "wired; call GearGate.set_terminal_reward_fn(...) before "
+                "estimating dispersion."
+            )
         global_pairs: Dict[PairKey, float] = {}
         local_to_global = {local: int(global_idx) for local, (global_idx, _) in enumerate(continuable_pairs)}
         for (i, j), tv in local_pair_tvs.items():

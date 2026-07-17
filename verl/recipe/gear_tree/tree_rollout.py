@@ -340,6 +340,33 @@ def _aggregate_child_rewards(node: Dict[str, Any], children: List[Dict[str, Any]
     node["vdra_child_weight_sum"] = total_weight
 
 
+async def _segment_fn_call(
+    segment_fn,
+    prompt_ids: Sequence[int],
+    branch_factor: int,
+    max_tokens: Optional[int],
+    *,
+    sibling_sticky_keys: Optional[Sequence[str]] = None,
+) -> List[SegmentSample]:
+    """Call ``segment_fn`` and forward ``sibling_sticky_keys`` when accepted.
+
+    P0.1: production segment functions (AsyncServerSegmentGenerator.segment_fn)
+    forward the sticky key to the server manager for prefix-cache-aware
+    routing. Test doubles that only accept positional args continue to work
+    via the ``TypeError`` fallback.
+    """
+
+    if sibling_sticky_keys is not None:
+        try:
+            return await segment_fn(
+                prompt_ids, int(branch_factor), max_tokens,
+                sibling_sticky_keys=list(sibling_sticky_keys),
+            )
+        except TypeError:
+            pass
+    return await segment_fn(prompt_ids, int(branch_factor), max_tokens)
+
+
 def _candidate_to_sample(node: Dict[str, Any], candidate: Dict[str, Any]) -> Optional[SegmentSample]:
     token_ids = candidate.get("response_token_ids")
     if token_ids is None:
@@ -348,6 +375,24 @@ def _candidate_to_sample(node: Dict[str, Any], candidate: Dict[str, Any]) -> Opt
         token_ids = full_ids[len(parent_ids):] if full_ids[:len(parent_ids)] == parent_ids else []
     if not token_ids:
         return None
+    metadata = dict(candidate.get("vdra_sample_metadata") or {})
+    # P0.W1: cluster metadata is written on the candidate node by the TV
+    # estimator (see gear_core/gear/tv_estimators.py). Copy the known VDRA
+    # fields into the sample metadata so downstream code (_expand_reusing_pilots,
+    # _annotate_weighted_reuse_samples, _sample_child) can read them without
+    # walking back to the original candidate dict.
+    for key in (
+        "vdra_cluster_id",
+        "vdra_cluster_multiplicity",
+        "vdra_representative_weight",
+        "vdra_original_pilot_indices",
+    ):
+        if candidate.get(key) is not None and key not in metadata:
+            metadata[key] = candidate[key]
+    # P0.1: propagate the pilot's routing key so its continuation lands on
+    # the same server replica for prefix cache reuse.
+    if candidate.get("vdra_sticky_key") is not None and "vdra_sticky_key" not in metadata:
+        metadata["vdra_sticky_key"] = candidate["vdra_sticky_key"]
     return SegmentSample(
         token_ids=list(token_ids),
         text=str(candidate.get("text", "")),
@@ -359,7 +404,7 @@ def _candidate_to_sample(node: Dict[str, Any], candidate: Dict[str, Any]) -> Opt
         ),
         sum_logprobs=candidate.get("sum_logprobs"),
         num_tokens=candidate.get("num_tokens"),
-        metadata=dict(candidate.get("vdra_sample_metadata") or {}),
+        metadata=metadata,
     )
 
 
@@ -454,17 +499,58 @@ def _sample_metadata(sample: Any) -> Dict[str, Any]:
     return metadata
 
 
-def _annotate_weighted_reuse_samples(samples: List[SegmentSample], *, denominator: int) -> None:
+def _annotate_weighted_reuse_samples(
+    samples: List[SegmentSample],
+    *,
+    denominator: int,
+    strict: bool = False,
+) -> None:
+    """Stamp cluster metadata on each weighted-reuse sample.
+
+    P0.W1 / P0.W3: representative samples carry the cluster multiplicity
+    written by the TV estimator (via _candidate_to_sample); fresh additional
+    samples carry multiplicity 1. The runtime *must never* reconstruct a
+    missing known multiplicity as 1 without an explicit error, so strict mode
+    raises when a sample is missing the cluster fields but was supposed to be
+    a representative. The per-sample ``edge_weight`` is set to the raw
+    cluster multiplicity (representatives) or 1 (fresh), matching the
+    "duplicate empirical samples" actor objective; representative weights are
+    also stored (as multiplicity / total_weight) so the parent-value reducer
+    can weight representative contributions correctly, but the actor uses
+    ``edge_weight`` directly per PLAN.md P0.W3.
+    """
     multiplicities: List[int] = []
+    is_representative: List[bool] = []
     for sample in samples:
         metadata = _sample_metadata(sample)
-        multiplicities.append(max(int(metadata.get("vdra_cluster_multiplicity", 1) or 1), 1))
-    denom = max(sum(multiplicities), int(denominator), 1)
+        raw = metadata.get("vdra_cluster_multiplicity")
+        if raw is None:
+            multiplicities.append(1)
+            is_representative.append(False)
+        else:
+            try:
+                mult = max(int(raw), 1)
+            except (TypeError, ValueError):
+                if strict:
+                    raise RuntimeError(
+                        "strict weighted_reuse: sample carries a non-integer "
+                        f"vdra_cluster_multiplicity {raw!r}"
+                    )
+                mult = 1
+            multiplicities.append(mult)
+            is_representative.append(True)
+    total_weight = float(sum(multiplicities)) if multiplicities else 1.0
     for idx, (sample, multiplicity) in enumerate(zip(samples, multiplicities)):
         metadata = _sample_metadata(sample)
         metadata.setdefault("vdra_cluster_id", idx)
         metadata["vdra_cluster_multiplicity"] = multiplicity
-        metadata["vdra_representative_weight"] = multiplicity / float(denom)
+        # P0.W3: representative_weight is kept for parent-value aggregation
+        # (multiplicity / total_weight is the empirical proportion of the
+        # parent distribution). The actor's global weight is the raw
+        # multiplicity via edge_weight below.
+        metadata["vdra_representative_weight"] = multiplicity / total_weight
+        metadata["edge_weight"] = float(multiplicity)
+        metadata["vdra_weight_objective"] = "duplicate_empirical_samples"
         metadata.setdefault("vdra_original_pilot_indices", [idx])
 
 
@@ -499,7 +585,13 @@ async def _expand_reusing_pilots(
             )
             if remaining is None or remaining > 0:
                 prompt_ids = list(node["full_token_ids"]) + list(sample.token_ids)
-                continuation = await segment_fn(prompt_ids, 1, remaining)
+                # P0.1: reuse the pilot's sticky_key for its continuation so
+                # both requests hit the same server replica (prefix cache).
+                cont_sticky = sample_metadata.get("vdra_sticky_key")
+                continuation = await _segment_fn_call(
+                    segment_fn, prompt_ids, 1, remaining,
+                    sibling_sticky_keys=[cont_sticky] if cont_sticky else None,
+                )
                 completion_requests += 1
                 if continuation:
                     cont = continuation[0]
@@ -697,7 +789,16 @@ async def async_build_tree_online_alloc(
         }
         metadata = _sample_metadata(sample)
         child.update(dict(metadata or {}))
-        if metadata.get("vdra_representative_weight") is not None:
+        # P0.W3: the actor's global weight is the raw cluster multiplicity
+        # (equivalent to duplicating the represented pilots), NOT the per-
+        # parent normalized probability. _annotate_weighted_reuse_samples
+        # writes edge_weight=multiplicity onto metadata; use it directly so
+        # the actor loss matches the "duplicate empirical samples" objective.
+        raw_edge_weight = metadata.get("edge_weight")
+        if raw_edge_weight is not None:
+            child["edge_weight"] = float(raw_edge_weight)
+        elif metadata.get("vdra_representative_weight") is not None:
+            # Legacy fallback (fresh_iid + noop annotator paths).
             child["edge_weight"] = float(metadata["vdra_representative_weight"])
         if sample.sum_logprobs is not None:
             child["sum_logprobs"] = float(sample.sum_logprobs)
@@ -882,9 +983,18 @@ async def async_build_tree_online_alloc(
             # missing probability mass. Detect the coverage shortfall and
             # execute the configured fallback here rather than trusting the
             # config field to have effect.
+            # P0.W2: required coverage counts continuable representative
+            # clusters PLUS terminal singleton clusters. The estimator writes
+            # vdra_required_cluster_count = len(representative_index_per_cluster)
+            # which already sums both; the fallback below reconstructs the
+            # same total from the reusable pilots and shortcut children in
+            # case the field was not set upstream.
             required_clusters = int(
                 node.get("vdra_required_cluster_count")
-                or len(node.get("vdra_reusable_pilot_children") or node.get("vdra_pilot_children") or [])
+                or (
+                    len(node.get("vdra_reusable_pilot_children") or node.get("vdra_pilot_children") or [])
+                    + len(node.get("vdra_shortcut_children") or [])
+                )
             )
             node["vdra_required_cluster_count"] = required_clusters
             node["vdra_allocated_k"] = allocated_branch_factor
@@ -1066,7 +1176,8 @@ async def async_build_tree_online_alloc(
                 "first_phase_tokens": getattr(gear_gate, "tv_first_phase_tokens", None),
                 "second_phase_tokens": getattr(gear_gate, "tv_second_phase_tokens", None),
                 "allocation_runtime": getattr(gear_gate, "allocation_runtime", None),
-                "allocation_scope": "one_tree",
+                # P1.3: canonical value everywhere — see PLAN.md.
+                "allocation_scope": "per_queue_flush_within_tree",
                 "queue_count": getattr(gear_gate, "queue_count", None),
                 "queue_capacity": getattr(gear_gate, "queue_capacity", None),
                 "queue_timeout_seconds": getattr(gear_gate, "queue_timeout_seconds", None),
@@ -1186,7 +1297,11 @@ async def async_build_tree_batch_alloc(
                     child["num_tokens"] = int(s.num_tokens)
                 metadata = _sample_metadata(s)
                 child.update(dict(metadata or {}))
-                if metadata.get("vdra_representative_weight") is not None:
+                # P0.W3: multiplicity-based edge_weight (see _sample_child).
+                raw_edge_weight = metadata.get("edge_weight")
+                if raw_edge_weight is not None:
+                    child["edge_weight"] = float(raw_edge_weight)
+                elif metadata.get("vdra_representative_weight") is not None:
                     child["edge_weight"] = float(metadata["vdra_representative_weight"])
                 children.append(child)
 

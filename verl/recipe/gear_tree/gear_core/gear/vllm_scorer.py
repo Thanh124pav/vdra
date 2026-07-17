@@ -299,6 +299,69 @@ class VLLMLogprobClient:
         return list(token_logprobs)
 
 
+def fetch_server_weight_version(
+    api_base: str,
+    *,
+    api_key: str = "EMPTY",
+    timeout: float = 10.0,
+) -> Optional[str]:
+    """Return a best-effort server-reported weight-version fingerprint.
+
+    P0.3: the trainer must be able to prove rollout and scorer replicas run
+    matching weights. vLLM does not currently expose a first-class weight
+    fingerprint, so this probe walks a small fallback ladder:
+
+      1. ``/version`` or ``/health`` endpoints on the vLLM server (present in
+         some deployments; used verbatim when returned).
+      2. ``/models`` metadata, using any ``root``/``revision``/``created``
+         field alongside the model id.
+
+    Returns ``None`` when the server does not expose any usable fingerprint —
+    the caller should record ``weight_version_verified=False`` in that case
+    instead of asserting matching weights.
+    """
+
+    base = str(api_base).rstrip("/")
+    headers = {"Authorization": f"Bearer {api_key}"}
+    for path in ("/version", "/health"):
+        url = f"{base}{path}"
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                response = client.get(url, headers=headers)
+            if response.status_code == 200:
+                data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+                version = (
+                    data.get("weight_version")
+                    or data.get("version")
+                    or data.get("commit")
+                    or data.get("revision")
+                )
+                if version:
+                    return str(version)
+        except Exception:
+            continue
+
+    url = f"{base}/models"
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            response = client.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+    except Exception:
+        return None
+    models = data.get("data") or []
+    if not models or not isinstance(models[0], dict):
+        return None
+    model = models[0]
+    parts = [str(model.get("id", ""))]
+    for key in ("root", "revision", "created", "sha", "checksum"):
+        val = model.get(key)
+        if val is not None:
+            parts.append(f"{key}={val}")
+    fingerprint = "|".join(p for p in parts if p)
+    return fingerprint or None
+
+
 def resolve_vllm_model_id(
     api_base: str,
     explicit_model: Optional[str] = None,

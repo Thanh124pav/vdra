@@ -107,7 +107,9 @@ gear_tree:
     # Current verl runtime owns one queue manager per tree; do not claim
     # cross-root minibatch allocation until that shared context is implemented.
     root_allocation: false
-    allocation_scope: one_tree
+    # P1.3 canonical value: runtime solver acts per queue flush within one tree
+    # (see PLAN.md §2.1).
+    allocation_scope: per_queue_flush_within_tree
 
     skip_near_leaf_expand: true
 

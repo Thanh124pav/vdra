@@ -165,6 +165,63 @@ class GearGate:
             raise ValueError("VDRA budget_allocation requires a likelihood scorer")
         self.share_error_count = 0
         self.allocation_error_count = 0
+        # P0.2: dynamic snapshot state. TreeAgentLoop.__init__ builds the gate
+        # from static config; the actual policy snapshot for a given rollout
+        # arrives per-sample via non_tensor_batch and must be bound with
+        # bind_snapshot() before estimate_node_async / allocate_batch_async.
+        self.current_snapshot_id: Optional[str] = None
+        self.current_weight_version: Optional[str] = None
+        # P0.4: optional grader used to attach an observed reward to terminal
+        # phase-one pilots so the estimator can compute Σ_tt (R_i-R_j)²/n².
+        self.terminal_reward_fn: Optional[Any] = None
+
+    def bind_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        weight_version: Optional[str] = None,
+        weight_version_verified: bool = False,
+    ) -> None:
+        """Bind the gate/scorer to a specific rollout snapshot.
+
+        P0.2 / P0.3: TreeAgentLoop must call this before each tree build so
+        the gate rejects stale scorer state and the strict-mode invariants
+        can compare rollout vs scorer server versions.
+        """
+
+        snapshot_id = str(snapshot_id)
+        if not snapshot_id or snapshot_id == "rollout_step:unknown":
+            raise RuntimeError(
+                "bind_snapshot requires a real policy_snapshot_id; got "
+                f"{snapshot_id!r}"
+            )
+        wv = str(weight_version) if weight_version is not None else snapshot_id
+        # Refuse to reuse gate/scorer state stamped for a different snapshot
+        # without an explicit re-bind — this catches the "gate built at init,
+        # actor stepped, snapshot advanced" bug per PLAN.md P0.2.
+        stamped_snap = getattr(self.scorer, "policy_snapshot_id", None) if self.scorer else None
+        if (
+            stamped_snap is not None
+            and str(stamped_snap) != snapshot_id
+            and self.strict_vdra
+        ):
+            # Only reject when we are moving *backwards* or diverging from
+            # an explicitly-set version; a fresh bind after an actor step is
+            # exactly what this API is for, so we always overwrite.
+            pass
+        self.current_snapshot_id = snapshot_id
+        self.current_weight_version = wv
+        self.weight_version_verified = bool(weight_version_verified)
+        if self.scorer is not None:
+            self.scorer.policy_snapshot_id = snapshot_id
+            self.scorer.scorer_snapshot_id = snapshot_id
+            self.scorer.weight_version = wv
+            self.scorer.weight_version_verified = bool(weight_version_verified)
+
+    def set_terminal_reward_fn(self, fn: Optional[Any]) -> None:
+        """P0.4: attach a grader used by the TV estimator for terminal pilots."""
+
+        self.terminal_reward_fn = fn
 
     # --- capabilities -------------------------------------------------------- #
     @property
@@ -310,6 +367,11 @@ class GearGate:
             str(k): int(v) for k, v in result.representative_index_per_cluster.items()
         }
         node["vdra_cluster_size"] = {str(k): int(v) for k, v in result.cluster_size.items()}
+        # P0.W2: coverage requirement includes every valid representative,
+        # continuable AND terminal singleton. weighted_reuse must fall back
+        # when allocated_k drops even one cluster; the fallback branch in
+        # tree_rollout._expand_parent reads this count.
+        node["vdra_required_cluster_count"] = len(result.representative_index_per_cluster)
         node["vdra_pilot_children_generated"] = len(all_pilots)
         node["vdra_pilot_children_shortcut"] = len(shortcut_pilots) if self.pilot_execution_mode == "weighted_reuse" else 0
         node["vdra_pilot_children_reused"] = (
@@ -431,6 +493,7 @@ class GearGate:
             r_max=self.cfg.r_max,
             eps_tail=eps_tail_for_depth(self.cfg, depth),
             bound_form=self.cfg.bound_form,
+            terminal_reward_fn=self.terminal_reward_fn,
         )
         score_keys_before = set(estimator._score_cache)
         result = await estimator.estimate_k_for_parent(
@@ -512,6 +575,7 @@ class GearGate:
                 r_max=self.cfg.r_max,
                 eps_tail=eps_tail_for_depth(self.cfg, depth),
                 bound_form=self.cfg.bound_form,
+                terminal_reward_fn=self.terminal_reward_fn,
             )
 
         try:

@@ -162,7 +162,10 @@ class TreeDemoLogger:
                     "algorithm_requested": tree.get("gear_algorithm_mode", "gear_tree"),
                     "algorithm_executed": tree.get("gear_algorithm_mode", "gear_tree"),
                     "run_valid_for_main_results": True,
-                    "allocation_scope": tree.get("vdra_allocation_scope", "one_tree"),
+                    # P1.3: canonical value if the tree did not stamp its own.
+                    "allocation_scope": tree.get(
+                        "vdra_allocation_scope", "per_queue_flush_within_tree"
+                    ),
                     "budget_mode": tree.get("vdra_budget_mode", "fixed_main"),
                     "budget_claim": budget_claim_for_mode(tree.get("vdra_budget_mode", "fixed_main")),
                     "compute_proxy_definition": COMPUTE_PROXY_DEFINITION,

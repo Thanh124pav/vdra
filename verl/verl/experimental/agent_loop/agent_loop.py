@@ -90,18 +90,27 @@ class AsyncLLMServerManager:
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
+        sticky_key: Optional[str] = None,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
 
         Args:
-            request_id (str): request id for sticky session.
+            request_id (str): unique identifier for this generation call. Forwarded
+                to the underlying vLLM server as the request id.
             prompt_ids (List[int]): List of prompt token ids.
             sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
+            image_data: Optional multi-modal image inputs.
+            sticky_key (Optional[str]): stable key used only for server routing so
+                calls that share a branch/session land on the same server replica
+                (prefix cache reuse). If ``None`` the ``request_id`` is reused for
+                routing (legacy behavior). Concurrent siblings must supply the
+                same sticky_key but distinct request_ids.
 
         Returns:
             TokenOutput: token output
         """
-        server = self._choose_server(request_id)
+        routing_key = sticky_key if sticky_key is not None else request_id
+        server = self._choose_server(routing_key)
         output = await server.generate.remote(
             request_id=request_id,
             prompt_ids=prompt_ids,

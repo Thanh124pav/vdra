@@ -110,25 +110,38 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 "gear_tree.replay_buffer.enabled=false is not supported "
                 "(PLAN.md P1.4). Remove the field or set it to true."
             )
-        # P1.3: strict no-truncation forbids silent context-length overflow at
-        # training time. Bound the worst-case edge-query length as
-        # L_max_original_prompt + (d - 1) * M and reject configs that would
-        # certainly overflow max_prompt_length once the deepest edges land in
-        # the actor batch.
+        # P0.5: strict no-truncation forbids silent context-length overflow at
+        # training time. edges_to_dataproto REJECTS any accumulated edge query
+        # longer than data.max_prompt_length (there is no truncation escape
+        # hatch), so the correct precondition is:
+        #     L_original_max + (d - 1) * M  <=  L_edge_max
+        # where L_edge_max is the actor's edge-input limit (data.max_edge_prompt_length
+        # if set, otherwise data.max_prompt_length — the *same* limit
+        # edges_to_dataproto uses). The previous "max_prompt * 8" heuristic
+        # accepted configs that then failed at training time when the deepest
+        # edge query overflowed the actor limit.
         gt = self._gear_tree_config()
         tree_shape = list(gt.get("tree_shape") or [])
         max_depth = max(len(tree_shape), 1)
         M = int(gt.get("segment_length", 0) or 0)
-        max_prompt = int(self.config.data.max_prompt_length)
-        worst_case = max_prompt + max(max_depth - 1, 0) * M
-        if max_prompt > 0 and worst_case > max_prompt * 8:
-            # 8x is a generous headroom for the M budget itself; only warn
-            # loudly (via ValueError) when M * d clearly dwarfs max_prompt.
+        max_original = int(
+            self.config.data.get("max_original_prompt_length", 0)
+            or self.config.data.max_prompt_length
+        )
+        max_edge = int(
+            self.config.data.get("max_edge_prompt_length", 0)
+            or self.config.data.max_prompt_length
+        )
+        worst_case = max_original + max(max_depth - 1, 0) * M
+        if max_edge > 0 and worst_case > max_edge:
             raise ValueError(
-                "context-length bound overflow (PLAN.md P1.3): "
-                f"max_prompt_length={max_prompt}, worst-case edge query "
-                f"length={worst_case} for depth={max_depth}, M={M}. Reduce "
-                "M or tree_shape depth, or raise max_prompt_length."
+                "context-length bound overflow (PLAN.md P0.5): "
+                f"max_original_prompt_length={max_original}, deepest edge "
+                f"depth={max_depth}, segment_length={M}, worst-case edge "
+                f"query length={worst_case} > max_edge_prompt_length={max_edge}. "
+                "Either reduce M or tree_shape depth, pre-filter prompts to "
+                "reserve segment headroom, or raise data.max_edge_prompt_length "
+                "(within the model context length)."
             )
 
     def _should_postpone_sampled_update(self, sampled_edges: List[Dict[str, Any]]) -> bool:
