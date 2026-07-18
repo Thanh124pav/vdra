@@ -1,15 +1,43 @@
-"""Tree policy update objectives shared by SPO/GEAR-style generators."""
+"""Tree policy update objectives shared by SPO/GEAR-style generators.
+
+PLAN.md P0.N3: ``treepo_original`` and ``treerl_original`` scalarise a single
+per-edge advantage and are NOT byte-faithful reproductions of the official
+TreePO or TreeRL algorithms (those use different credit assignment and
+aggregation). They are retained here only as scalar-objective ablations. The
+canonical names are ``treepo_style_ablation`` and ``treerl_style_ablation``;
+the ``_original`` names are kept as deprecated aliases only so vendor parity
+tests against upstream ``treetune`` (which still uses those strings) keep
+passing. Do not use the ``_original`` names in main VDRA configs.
+"""
 
 from __future__ import annotations
 
 from typing import Any, Dict
 
 
+# Canonical ablation names.
+_TREEPO_ABLATION = "treepo_style_ablation"
+_TREERL_ABLATION = "treerl_style_ablation"
+
+# Deprecated aliases kept for treetune vendor parity only.
+_LEGACY_ALIASES = {
+    "treepo_original": _TREEPO_ABLATION,
+    "treerl_original": _TREERL_ABLATION,
+}
+
+
 SUPPORTED_TREE_UPDATE_MODES = {
     "spo",
+    _TREEPO_ABLATION,
+    _TREERL_ABLATION,
+    # Deprecated aliases — retained for vendor parity, not for main runs.
     "treepo_original",
     "treerl_original",
 }
+
+
+def _canonicalise(mode: str) -> str:
+    return _LEGACY_ALIASES.get(mode, mode)
 
 
 def validate_tree_update_mode(mode: str) -> str:
@@ -32,13 +60,21 @@ def compute_tree_update_values(
 ) -> Dict[str, Any]:
     """Return edge-level advantage/value fields for tree policy training.
 
-    `spo` preserves the current local parent-child advantage.
-    `treepo_original` scalarizes TreePO's local and global segment objectives
-    into the single advantage tensor consumed by this PPO trainer.
-    `treerl_original` uses a TD-style dense process target for each tree edge.
+    ``spo`` preserves the current local parent-child advantage — the main VDRA
+    setting until another estimator is implemented faithfully.
+
+    ``treepo_style_ablation`` (alias: ``treepo_original``) scalarises TreePO's
+    local and global segment objectives into the single advantage tensor
+    consumed by this PPO trainer. This is a scalar-objective ablation, not a
+    faithful TreePO reproduction.
+
+    ``treerl_style_ablation`` (alias: ``treerl_original``) uses a TD-style
+    dense process target for each tree edge. This is a scalar-objective
+    ablation, not a faithful TreeRL reproduction.
     """
 
     mode = validate_tree_update_mode(mode)
+    canonical = _canonicalise(mode)
     parent_reward_std = float(parent_reward_std or 0.0)
     child_reward = float(child_reward)
     parent_reward = float(parent_reward)
@@ -53,10 +89,10 @@ def compute_tree_update_values(
 
     global_advantage = child_reward - root_reward
 
-    if mode == "spo":
+    if canonical == "spo":
         advantage = local_advantage
         value = child_reward
-    elif mode == "treepo_original":
+    elif canonical == _TREEPO_ABLATION:
         global_weight = min(max(float(treepo_global_weight), 0.0), 1.0)
         advantage = (
             (1.0 - global_weight) * local_advantage
