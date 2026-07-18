@@ -84,32 +84,45 @@ class GearTreeReplayBuffer:
         generation_step: int,
         policy_snapshot_id: str,
     ) -> int:
-        count = 0
+        # PLAN.md P0.3: replay insertion must be TRANSACTIONAL — a duplicate
+        # edge_id anywhere in the incoming batch (against existing rows or
+        # against another row in the same batch) must leave the buffer
+        # unchanged. Validate every incoming edge first; only mutate on
+        # success.
+        prepared: List[Dict[str, Any]] = []
+        seen_ids: set[str] = set()
         for edge in edges:
             record = dict(edge)
             self._validate_edge(record)
-            record["generation_step"] = int(record.get("generation_step", generation_step))
-            record["policy_snapshot_id"] = str(record.get("policy_snapshot_id", policy_snapshot_id))
+            record["generation_step"] = int(
+                record.get("generation_step", generation_step)
+            )
+            record["policy_snapshot_id"] = str(
+                record.get("policy_snapshot_id", policy_snapshot_id)
+            )
             if record["policy_snapshot_id"] != str(policy_snapshot_id):
                 raise ValueError(
                     "new edge policy_snapshot_id does not match current rollout snapshot"
                 )
             edge_id = str(record["edge_id"])
-            # PLAN.md P0.2: duplicate edge_ids indicate that two rollouts
+            # PLAN.md P0.3: duplicate edge_ids indicate that two rollouts
             # collapsed to the same (question, snapshot, path) tuple — either
             # tree_instance_id was not made unique or a caller re-sent the
             # same edge. Silently overwriting a live row would corrupt the
             # per-parent group and mask a rollout-side bug.
-            if edge_id in self._edges:
+            if edge_id in self._edges or edge_id in seen_ids:
                 raise ValueError(
                     f"Replay edge {edge_id!r} is already in the buffer; "
                     "duplicate edge_ids indicate the rollout did not assign a "
-                    "unique tree_instance_id (PLAN.md P0.2)."
+                    "unique tree_instance_id (PLAN.md P0.3)."
                 )
-            self._edges[edge_id] = record
-            count += 1
-        self.metrics["added_edges"] += count
-        return count
+            seen_ids.add(edge_id)
+            prepared.append(record)
+        # All-or-nothing commit.
+        for record in prepared:
+            self._edges[str(record["edge_id"])] = record
+        self.metrics["added_edges"] += len(prepared)
+        return len(prepared)
 
     def expire(self, *, current_step: int) -> List[str]:
         expired = [

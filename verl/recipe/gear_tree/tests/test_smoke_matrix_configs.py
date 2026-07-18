@@ -72,14 +72,14 @@ def _matrix_cell(resolved: dict) -> tuple[str, str, str, str]:
             ("legacy_token_mean", "budget_allocation", "fresh_iid", "treetune_ppo"),
         ),
         (
-            # Smoke C: uniform construction + node-balanced.
+            # Smoke C: uniform construction + node-balanced (labeled ablation).
             "smoke_c_uniform_alloc_node_balanced",
             ("vdra_node_balanced", "simple", "fresh_iid", "vdra_node_balanced_ppo"),
         ),
         (
-            # Smoke D: full VDRA (construction + node-balanced).
+            # Smoke D: full VDRA (segment-average main path, PLAN.md P0.1).
             "smoke_d_full_vdra",
-            ("vdra_node_balanced", "budget_allocation", "fresh_iid", "vdra_node_balanced_ppo"),
+            ("global_segment_mean", "budget_allocation", "fresh_iid", "vdra_segment_mean_ppo"),
         ),
     ],
 )
@@ -105,22 +105,53 @@ def test_smoke_matrix_cells_are_pairwise_distinct():
 def test_smoke_d_full_vdra_enables_strict_group_integrity():
     resolved = _resolved("smoke_d_full_vdra")
     assert resolved["tree_policy"]["strict_group_integrity"] is True
-    assert resolved["tree_policy"]["policy_aggregation"] == "vdra_node_balanced"
-    assert (
-        resolved["actor_rollout_ref"]["actor"]["policy_loss"]["loss_mode"]
-        == "vdra_node_balanced_ppo"
-    )
+    # PLAN.md P0.1: main VDRA is the segment-average path.
+    assert resolved["tree_policy"]["policy_aggregation"] == "global_segment_mean"
+    assert resolved["tree_policy"]["segment_token_reduction"] == "mean"
+    policy_loss = resolved["actor_rollout_ref"]["actor"]["policy_loss"]
+    assert policy_loss["loss_mode"] == "vdra_segment_mean_ppo"
+    assert policy_loss["segment_token_reduction"] == "mean"
     gear = resolved["gear_tree"]["gear"]
     assert gear["strict_vdra"] is True
     assert gear["pilot_execution_mode"] == "fresh_iid"
     assert gear["allocation_runtime"] == "online_timeout"
     assert gear["bound_form"] == "linear"
+    assert gear["tail_mode"] == "none"
+    assert float(gear["eps_tail"]) == 0.0
+    assert gear["allocation_scope"] == "per_queue_flush_within_tree"
 
 
 def test_smoke_a_baseline_labels_itself_as_legacy():
     resolved = _resolved("smoke_a_spo_baseline")
     assert resolved["tree_policy"]["policy_aggregation"] == "legacy_token_mean"
     assert resolved["gear_tree"]["gear"]["enabled"] is False
+
+
+def test_segment_token_reduction_sum_override_preserves_pipeline():
+    """PLAN.md P0.7: overriding segment_token_reduction=sum must not change
+    allocation, replay, segment counting, or outer aggregation settings.
+    """
+    base = _load_yaml("gear_tree_trainer")
+    overridden = _dict_deep_merge(
+        base,
+        {
+            "tree_policy": {"segment_token_reduction": "sum"},
+            "actor_rollout_ref": {"actor": {"policy_loss": {"segment_token_reduction": "sum"}}},
+        },
+    )
+    # Only the two segment_token_reduction knobs differ.
+    assert overridden["tree_policy"]["policy_aggregation"] == "global_segment_mean"
+    assert (
+        overridden["actor_rollout_ref"]["actor"]["policy_loss"]["loss_mode"]
+        == "vdra_segment_mean_ppo"
+    )
+    assert overridden["gear_tree"]["gear"]["allocation_runtime"] == "online_timeout"
+    assert (
+        overridden["gear_tree"]["gear"]["allocation_scope"]
+        == "per_queue_flush_within_tree"
+    )
+    assert overridden["gear_tree"]["gear"]["pilot_execution_mode"] == "fresh_iid"
+    assert overridden["gear_tree"]["gear"]["bound_form"] == "linear"
 
 
 def test_smoke_b_and_c_are_labelled_as_ablations():

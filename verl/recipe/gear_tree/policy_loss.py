@@ -1,24 +1,27 @@
 """Policy losses for the tree-family algorithms.
 
-Two losses are registered here:
+Three losses are registered here:
 
 * ``treetune_ppo`` — the byte-faithful port of treetune's
   ``PPOTrainer._compute_actor_loss`` used by SPO/TreeRL/TreePO/GEAR-*. Kept as
   the SPO baseline and legacy aggregation; see the module docstring below.
-* ``vdra_node_balanced_ppo`` — the canonical VDRA loss described in PLAN.md
-  Section 4. It uses the same PPO-clipped token surrogate but reduces the
-  contributions hierarchically:
-      token -> child (token mean per row)
-      child -> parent group (mean weighted by sample_multiplicity)
-      parent group -> tree (mean of parent scalars per tree_group_id)
-      tree -> batch (mean of tree scalars)
-  so a parent group's optimization importance does not scale with its branch
-  factor. The loss requires the group tensors emitted by
-  ``tree_data.edges_to_dataproto`` (``parent_group_ids``, ``tree_group_ids``,
-  ``sample_multiplicity`` and ``allocated_k``) — passing an aggregation-time
-  ``edge_weights`` here would double-count against ``sample_multiplicity``.
+* ``vdra_segment_mean_ppo`` — PLAN.md P0.1 / P0.4 canonical main-run loss.
+  Global segment-average with configurable within-segment token reduction:
 
-Both are registered on module import; select via
+      token -> segment (``segment_token_reduction=mean|sum``)
+      segment -> tree (divide by pre-filter ``tree_total_segment_count``)
+      tree -> update (average over trees)
+
+  Neither reduction couples to parent branch factor: the loss depends only on
+  ``tree_id`` and ``tree_total_segment_count``, not on ``parent_group_id``,
+  ``allocated_k``, or ``queue_flush_id``. The precomputed row weights come
+  from ``tree_data.compute_segment_objective_weights`` and are attached to
+  the DataProto as ``segment_objective_weights``.
+* ``vdra_node_balanced_ppo`` — legacy parent-balanced ablation. NOT the main
+  VDRA path (PLAN.md P0.1). Kept for controlled comparison runs; it must not
+  be selected by the main config.
+
+All three are registered on module import; select via
 ``actor_rollout_ref.actor.policy_loss.loss_mode=<name>``.
 
 --- treetune_ppo notes (unchanged) ---
@@ -241,6 +244,179 @@ def hierarchical_reference_reduction(
         parent_to_tree[i] = tree_ids[matches[0]]
     tree_losses, _ = _reduce_parent_to_tree(parent_losses, parent_to_tree)
     return tree_losses.mean()
+
+
+_VALID_SEGMENT_TOKEN_REDUCTIONS = ("mean", "sum")
+
+
+def _resolve_segment_token_reduction(config) -> str:
+    """PLAN.md P0.1: `segment_token_reduction` must be exactly ``mean`` or
+    ``sum``. An invalid value is an actionable startup error, not a silent
+    fallback.
+    """
+
+    raw = "mean"
+    if config is not None:
+        raw = config.get("segment_token_reduction", "mean")
+    if raw is None:
+        raw = "mean"
+    reduction = str(raw).strip().lower()
+    if reduction not in _VALID_SEGMENT_TOKEN_REDUCTIONS:
+        raise ValueError(
+            f"segment_token_reduction={raw!r} is invalid; must be one of "
+            f"{_VALID_SEGMENT_TOKEN_REDUCTIONS} (PLAN.md P0.1)."
+        )
+    return reduction
+
+
+def _segment_row_losses(
+    pg_losses: torch.Tensor,
+    action_mask: torch.Tensor,
+    *,
+    reduction: str,
+) -> torch.Tensor:
+    """PLAN.md P0.1 / P0.4: reduce active token losses per segment row.
+
+    ``mean``: ``L_s = sum_t M_st * ell_st / sum_t M_st``, with an empty-mask
+    fallback of zero (still counted in ``N_seg(T)`` upstream).
+    ``sum``:  ``L_s = sum_t M_st * ell_st``.
+    """
+
+    numerator = (pg_losses * action_mask).sum(dim=-1)
+    if reduction == "sum":
+        return numerator
+    denominator = action_mask.sum(dim=-1)
+    empty = denominator <= 0
+    safe = torch.where(empty, torch.ones_like(denominator), denominator)
+    row_losses = numerator / safe
+    return torch.where(empty, torch.zeros_like(row_losses), row_losses)
+
+
+@register_policy_loss("vdra_segment_mean_ppo")
+def compute_policy_loss_vdra_segment_mean(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: "Optional[ActorConfig]" = None,
+    rollout_is_weights: torch.Tensor | None = None,
+    edge_weights: torch.Tensor | None = None,
+    segment_objective_weights: torch.Tensor | None = None,
+    tree_group_ids: torch.Tensor | None = None,
+    tree_total_segment_count: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """PLAN.md P0.1 / P0.4 canonical VDRA main-run loss.
+
+    ``segment_objective_weights`` is expected to be precomputed by
+    ``tree_data.compute_segment_objective_weights`` and attached to the
+    DataProto. The loss is a single weighted reduction:
+
+        L = sum_row w_row * L_row^r
+
+    where ``L_row^r`` is either ``TokenMean(pg_row)`` (``r=mean``) or the raw
+    token sum (``r=sum``) — selected by ``config.segment_token_reduction``.
+
+    Mini/microbatch splits partition ``w_row`` and preserve the invariant
+    total loss (see ``test_vdra_full_vs_split_parity.py``).
+
+    ``tree_group_ids`` + ``tree_total_segment_count`` are accepted for
+    backwards compatibility when the DataProto lacks precomputed weights.
+    Passing ``edge_weights`` is a hard error — the main path does not mix
+    row-level edge weights with the segment objective.
+    """
+
+    assert config is not None
+    if edge_weights is not None:
+        raise ValueError(
+            "vdra_segment_mean_ppo does not accept edge_weights; the main "
+            "VDRA path uses only the segment-average weight (PLAN.md P0.1)."
+        )
+
+    reduction = _resolve_segment_token_reduction(config)
+    cliprange = float(config.clip_ratio)
+    use_prob_mask = bool(config.get("use_prob_mask", True))
+    # PLAN.md P0.4: report the ratio as a metric; do NOT skip microbatches on
+    # the canonical VDRA path.
+    ratio_threshold = float(config.get("ratio_threshold", float("inf")))
+
+    pg_losses, action_mask, ratio, pg_losses1, pg_losses2 = _ppo_clipped_token_surrogate(
+        old_log_prob, log_prob, advantages, response_mask,
+        cliprange=cliprange, use_prob_mask=use_prob_mask,
+        rollout_is_weights=rollout_is_weights,
+    )
+
+    row_losses = _segment_row_losses(pg_losses, action_mask, reduction=reduction)
+
+    if segment_objective_weights is None:
+        # Fallback path: derive w_row from tree_id + tree_total_segment_count.
+        # WARNING: this uses the LOCAL unique-tree count and therefore only
+        # matches the full-batch objective when the caller runs a single
+        # microbatch. For mini/microbatch splits the trainer must pass
+        # precomputed ``segment_objective_weights`` (attached by
+        # ``tree_data.edges_to_dataproto``); those weights encode the
+        # pre-split ``N_T`` and reproduce the full-batch objective under
+        # sums-of-splits.
+        if tree_group_ids is None or tree_total_segment_count is None:
+            raise ValueError(
+                "vdra_segment_mean_ppo requires segment_objective_weights OR "
+                "(tree_group_ids, tree_total_segment_count). Attach them via "
+                "tree_data.edges_to_dataproto (PLAN.md P0.4)."
+            )
+        tids = tree_group_ids.to(dtype=torch.long, device=row_losses.device)
+        unique_trees = torch.unique(tids)
+        n_tree = float(unique_trees.numel())
+        counts = tree_total_segment_count.to(
+            dtype=row_losses.dtype, device=row_losses.device
+        )
+        safe_counts = torch.where(
+            counts > 0, counts, torch.ones_like(counts)
+        )
+        w = 1.0 / (n_tree * safe_counts)
+    else:
+        w = segment_objective_weights.to(
+            dtype=row_losses.dtype, device=row_losses.device
+        )
+        if w.shape != row_losses.shape:
+            raise ValueError(
+                "segment_objective_weights shape must match [batch]; got "
+                f"{tuple(w.shape)}"
+            )
+
+    pg_loss = (w * row_losses).sum()
+
+    # Report ratio as a metric.
+    avg_ratio = _masked_mean(ratio, action_mask)
+    _ = avg_ratio
+    _ = ratio_threshold
+
+    pg_clipfrac = _masked_mean(torch.gt(pg_losses2, pg_losses1).float(), action_mask)
+    approx_kl = 0.5 * _masked_mean((log_prob - old_log_prob) ** 2, action_mask)
+    pg_clipfrac_lower = torch.zeros((), dtype=pg_loss.dtype, device=pg_loss.device)
+    return pg_loss, pg_clipfrac, approx_kl, pg_clipfrac_lower
+
+
+def segment_average_reference(
+    row_losses: torch.Tensor,
+    tree_ids: torch.Tensor,
+    tree_total_segment_count: torch.Tensor,
+) -> torch.Tensor:
+    """PLAN.md P0.4 test reference: direct evaluation of
+
+        L = (1/N_T) sum_T (1/N_seg(T)) sum_{s in retained(T)} L_s.
+
+    Used by the parity tests. ``tree_total_segment_count`` must be the
+    pre-filter ``N_seg(T)`` (not the retained row count).
+    """
+    tree_ids = tree_ids.to(dtype=torch.long)
+    unique_trees = torch.unique(tree_ids)
+    total = row_losses.new_zeros(())
+    n_tree = float(unique_trees.numel())
+    for tid in unique_trees.tolist():
+        mask = (tree_ids == tid)
+        n_seg = float(tree_total_segment_count[mask][0].item())
+        total = total + row_losses[mask].sum() / max(n_seg, 1.0)
+    return total / max(n_tree, 1.0)
 
 
 @register_policy_loss("vdra_node_balanced_ppo")

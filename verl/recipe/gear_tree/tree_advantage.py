@@ -95,6 +95,17 @@ def extract_edges_from_tree(
     expanded_parent_group_ids: set[str] = set()
     trainable_child_count = 0
     queue_to_parent_group_counts: dict[Any, set[str]] = {}
+    # PLAN.md P0.2: pre-filter segment counts. Every realized (non-pruned)
+    # segment increments ``tree_total_segment_count`` even if its advantage
+    # ends up zero and it gets dropped from ``edges`` — the segment denominator
+    # ``N_seg(T)`` must not shift under advantage sparsity. Queue counts obey
+    # the same rule so the identity ``sum_q n_q == N_seg(T)`` holds.
+    tree_total_segment_count = 0
+    queue_released_segment_count: dict[Any, int] = {}
+    # PLAN.md P0.2: per-parent realized-vs-allocated snapshot. Fresh_iid
+    # requires ``realized_child_count == allocated_k`` at construction time;
+    # zero-advantage filtering may only shrink the retained set later.
+    realized_by_parent: dict[str, dict[str, int]] = {}
     root_parent_group_id = f"tree:{tree_id}#root"
 
     def _parent_group_id(parent: dict[str, Any]) -> str:
@@ -110,7 +121,7 @@ def extract_edges_from_tree(
         return f"{parent_group_id}/c{idx}"
 
     def visit(node: dict[str, Any], parent: dict[str, Any] | None = None) -> None:
-        nonlocal trainable_child_count
+        nonlocal trainable_child_count, tree_total_segment_count
         if parent is not None:
             parent_reward = _node_reward(parent)
             child_reward = _node_reward(node)
@@ -213,6 +224,28 @@ def extract_edges_from_tree(
                 **update_values,
             }
             edge["advantage"] = advantage
+            # PLAN.md P0.2: count every realized segment BEFORE zero-advantage
+            # filtering so the segment denominator stays stable even when
+            # ``only_adv_greater_than_zero`` drops rows. Pruned placeholders
+            # remain excluded from both counts.
+            if not is_pruned:
+                tree_total_segment_count += 1
+                queue_released_segment_count[queue_flush_id] = (
+                    queue_released_segment_count.get(queue_flush_id, 0) + 1
+                )
+                # PLAN.md P0.2: per-parent realized-child snapshot so
+                # ``realized_child_count == allocated_k`` can be enforced by
+                # ``_enforce_fresh_iid_invariants`` even after the retained
+                # rows shrink under zero-advantage filtering.
+                slot = realized_by_parent.setdefault(
+                    str(parent_group_id),
+                    {"realized": 0, "allocated_k": int(allocated_k)},
+                )
+                slot["realized"] += 1
+                # allocated_k may only be stamped on some children when a
+                # legacy fixture is used; prefer the max we saw.
+                if int(allocated_k) > slot["allocated_k"]:
+                    slot["allocated_k"] = int(allocated_k)
             if (not is_pruned or emit_pruned_edges) and (
                 not only_adv_greater_than_zero or pav_advantage != 0
             ):
@@ -229,33 +262,75 @@ def extract_edges_from_tree(
         node.pop("children", None)
 
     visit(tree_copy)
-    # PLAN.md P0.N1: tree-level counts. Stamp them on every edge so the
-    # replay/tensorization layer can compute tree_group_ids without another
-    # tree walk. Keep the sets serialisable.
+    # PLAN.md P0.N1 + P0.2: tree-level counts. Stamp them on every edge so
+    # replay / tensorization / actor can index by tree without another tree
+    # walk. ``tree_total_segment_count`` is the canonical N_seg(T) used as the
+    # segment denominator; queue_released_segment_count[q] is the pre-filter
+    # ``n_q`` used only for logging / theoretical validation.
     tree_summary = {
         "tree_id": str(tree_id),
         "expanded_parent_group_count": len(expanded_parent_group_ids),
         "trainable_child_count": int(trainable_child_count),
+        "tree_total_segment_count": int(tree_total_segment_count),
         "queue_to_parent_group_counts": {
             str(k): len(v) for k, v in queue_to_parent_group_counts.items()
+        },
+        "queue_released_segment_count": {
+            str(k): int(v) for k, v in queue_released_segment_count.items()
         },
     }
     for edge in edges:
         edge.setdefault("tree_summary", tree_summary)
+        # Preserve on every row so downstream splits do not lose it.
+        edge["tree_total_segment_count"] = int(tree_total_segment_count)
+        qid = edge.get("queue_flush_id", 0)
+        edge["queue_released_segment_count"] = int(
+            queue_released_segment_count.get(qid, 0)
+        )
 
-    # PLAN.md P0.1: fresh_iid invariants.
+    # PLAN.md P0.2: fresh_iid invariants — realized_child_count == allocated_k
+    # is a construction invariant checked from the pre-filter snapshot; the
+    # retained-row check is done inside ``_enforce_fresh_iid_invariants``.
     if strict_fresh_iid:
+        _enforce_realized_child_count_equals_allocated_k(realized_by_parent)
         _enforce_fresh_iid_invariants(edges)
 
     return json.loads(json.dumps(edges))
 
 
+def _enforce_realized_child_count_equals_allocated_k(
+    realized_by_parent: dict[str, dict[str, int]],
+) -> None:
+    """PLAN.md P0.2 construction invariant: ``realized_child_count == allocated_k``.
+
+    Independent of ``only_adv_greater_than_zero`` — this looks at the
+    pre-filter tree walk snapshot, before any zero-advantage row is dropped.
+    """
+    failures: list[str] = []
+    for pgid, slot in realized_by_parent.items():
+        allocated = int(slot.get("allocated_k", 0))
+        realized = int(slot.get("realized", 0))
+        if allocated > 0 and realized != allocated:
+            failures.append(
+                f"fresh_iid parent_group_id={pgid!r} realized {realized} children "
+                f"but allocated_k={allocated}"
+            )
+    if failures:
+        raise ValueError(
+            "fresh_iid invariants failed (PLAN.md P0.2):\n  " + "\n  ".join(failures)
+        )
+
+
 def _enforce_fresh_iid_invariants(edges: list[dict[str, Any]]) -> None:
-    """PLAN.md P0.1: assert per-parent realized rows == allocated_k and
-    sample_multiplicity == 1 across every realized child.
+    """PLAN.md P0.2: for every fresh_iid parent group, retained rows must
+    obey ``retained_row_count <= realized_child_count == allocated_k`` after
+    zero-advantage filtering, and every retained row must have
+    ``sample_multiplicity == 1``.
 
     Pruned placeholders are excluded from ``edges`` upstream, so this check
-    only looks at realized training rows.
+    only looks at retained training rows. The realized-child count (before
+    the advantage filter) comes from the per-tree summary and is guaranteed
+    to equal ``allocated_k`` by tree construction.
     """
     from collections import defaultdict
 
@@ -276,14 +351,19 @@ def _enforce_fresh_iid_invariants(edges: list[dict[str, Any]]) -> None:
             failures.append(
                 f"fresh_iid parent_group_id={pgid!r} has sample_multiplicity != 1: {mults}"
             )
-        if allocated_k and len(group) != allocated_k:
+        # PLAN.md P0.2: allow retained rows to be a subset of the realized
+        # children (zero-advantage rows may have been filtered out). The
+        # pre-filter equality lives in tree construction and is asserted by
+        # the tree_summary.tree_total_segment_count. Here we just guard
+        # against an over-count.
+        if allocated_k and len(group) > allocated_k:
             failures.append(
-                f"fresh_iid parent_group_id={pgid!r} realized {len(group)} rows "
-                f"but allocated_k={allocated_k}"
+                f"fresh_iid parent_group_id={pgid!r} retained {len(group)} rows "
+                f"which exceeds allocated_k={allocated_k}"
             )
     if failures:
         raise ValueError(
-            "fresh_iid invariants failed (PLAN.md P0.1):\n  " + "\n  ".join(failures)
+            "fresh_iid invariants failed (PLAN.md P0.2):\n  " + "\n  ".join(failures)
         )
 
 
