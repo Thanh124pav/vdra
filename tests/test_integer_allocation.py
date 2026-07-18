@@ -68,9 +68,24 @@ def test_infeasible_lower_sum_fails():
         allocate_branch_factors([_node("a", 1, 1, 1.0), _node("b", 1, 1, 1.0)], total_budget=1, n_min=1)
 
 
-def test_infeasible_upper_sum_fails_without_silent_budget_drop():
+def test_infeasible_upper_sum_reports_slack_by_default():
+    # PLAN.md P0.R3: the default policy 'expand_nonredundant_caps' now
+    # spends min(budget, sum u_p) and reports the residual, so a legal but
+    # tight config no longer aborts. Callers that want the old strict
+    # behaviour must opt into infeasible_upper_policy='error'.
+    out = allocate_branch_factors(
+        [_node("a", 6, 2, 1.0)], total_budget=6, n_min=1
+    )
+    assert out.allocations["a"] == out.upper_bounds["a"]
+    assert out.underallocated_budget == 6 - out.allocated_budget
+    assert out.allocated_budget < 6
     with pytest.raises(ValueError, match="exceeds upper-bound"):
-        allocate_branch_factors([_node("a", 6, 2, 1.0)], total_budget=6, n_min=1)
+        allocate_branch_factors(
+            [_node("a", 6, 2, 1.0)],
+            total_budget=6,
+            n_min=1,
+            infeasible_upper_policy="error",
+        )
 
 
 def test_bruteforce_optimality_small_instances():
