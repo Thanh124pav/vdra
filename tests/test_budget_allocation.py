@@ -33,10 +33,24 @@ def test_dispersion_bound_matches_summary_normalization():
     assert reward_variance_from_pair_tvs(pair_tvs, n=3, gamma=0.5) == pytest.approx(expected)
 
 
-def test_all_redundant_caps_cannot_drop_budget_silently():
+def test_all_redundant_caps_report_slack_instead_of_raising():
+    # PLAN.md P0.R3: hard upper caps that cannot spend the full budget
+    # no longer raise; the allocator spends min(budget, sum u_p) and reports
+    # the residual via underallocated_budget so a queue flush is not aborted
+    # merely because the caps are tight.
     nodes = [_node("a", 6, 2, 0.1), _node("b", 6, 3, 1.0)]
+    out = allocate_branch_factors(nodes, total_budget=12, n_min=1)
+    assert out.allocated_budget == sum(out.upper_bounds.values())
+    assert out.underallocated_budget == 12 - out.allocated_budget
+    assert out.allocated_budget < 12
+    # 'error' mode preserves the old strict behaviour for callers that opt in.
     with pytest.raises(ValueError, match="exceeds upper-bound"):
-        allocate_branch_factors(nodes, total_budget=12, n_min=1)
+        allocate_branch_factors(
+            nodes,
+            total_budget=12,
+            n_min=1,
+            infeasible_upper_policy="error",
+        )
 
 
 def test_unified_solver_expands_high_dispersion_node():
@@ -63,8 +77,22 @@ def test_predicted_cap_applies_only_below_default_by_default():
 
 
 def test_minimum_branch_factor_clamps_nonpositive_prediction():
+    # PLAN.md P0.R3: a non-positive predicted_k caps the node at n_min; the
+    # allocator now reports slack instead of raising when the requested
+    # budget exceeds the resulting upper sum.
+    out = allocate_branch_factors(
+        [_node("a", 6, -2, 0.0)], total_budget=6, n_min=1
+    )
+    assert out.allocations["a"] == out.upper_bounds["a"]
+    assert out.underallocated_budget == 6 - out.allocated_budget
+    # Explicit strict opt-in still raises.
     with pytest.raises(ValueError, match="exceeds upper-bound"):
-        allocate_branch_factors([_node("a", 6, -2, 0.0)], total_budget=6, n_min=1)
+        allocate_branch_factors(
+            [_node("a", 6, -2, 0.0)],
+            total_budget=6,
+            n_min=1,
+            infeasible_upper_policy="error",
+        )
 
 
 def test_integer_solver_is_deterministic():

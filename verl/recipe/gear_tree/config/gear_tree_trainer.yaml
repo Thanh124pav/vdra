@@ -27,18 +27,23 @@ gear_tree:
   # Segment length M (tokens per non-terminal segment). None at the last depth.
   segment_length: 100
 
-  # Advantage variant. treepo_original/treerl_original are style/parity
-  # ablation objectives, not claims of exact official reproduction.
-  # Values: spo | treepo_original | treerl_original.
+  # Advantage variant. treepo_style_ablation / treerl_style_ablation are
+  # scalar-objective ablations, NOT byte-faithful reproductions of the
+  # official TreePO / TreeRL algorithms — the `_original` names have been
+  # renamed to reflect this (see PLAN.md P0.N3). The old ``treepo_original``
+  # and ``treerl_original`` strings are still accepted as deprecated aliases
+  # for vendor parity, but must not appear in main VDRA configs.
+  # Main VDRA runs use `spo`.
+  # Values: spo | treepo_style_ablation | treerl_style_ablation.
   tree_update_mode: spo
 
   # Local advantage baseline: rloo (child-parent) | grpo (normalized).
   adv_method: rloo
 
-  # TreePO-style global-advantage mixing weight (only used by treepo_original).
+  # TreePO-style global-advantage mixing weight (only used by treepo_style_ablation).
   treepo_global_weight: 0.5
 
-  # TreeRL-style discount (only used by treerl_original).
+  # TreeRL-style discount (only used by treerl_style_ablation).
   treerl_gamma: 0.9
 
   # Drop edges whose pav_advantage == 0 (treetune default).
@@ -200,6 +205,28 @@ gear_tree:
 
     scorer_max_concurrency: 64
 
+# --- VDRA tree-policy contract (PLAN.md §4, §5 P0.N7) -----------------------
+tree_policy:
+  # advantage_mode selects HOW child advantages are computed inside
+  # extract_edges_from_tree. Main VDRA is `spo_local` (== gear_tree.tree_update_mode=spo).
+  # Values: spo_local | configured_ablation.
+  advantage_mode: spo_local
+
+  # policy_aggregation selects the actor loss reduction.
+  # - vdra_node_balanced: hierarchical token -> child -> parent group -> tree.
+  #   Requires actor_rollout_ref.actor.policy_loss.loss_mode=vdra_node_balanced_ppo
+  #   and the row-level group tensors emitted by tree_data.edges_to_dataproto.
+  # - legacy_token_mean: single masked mean over active tokens. Retained ONLY
+  #   as an SPO baseline / ablation; do NOT use for main VDRA main runs.
+  policy_aggregation: vdra_node_balanced
+
+  # If true (canonical), root-generated child segments participate in the
+  # tree average as an explicit root parent group.
+  include_root_parent_group: true
+
+  # Strict main runs must abort on any parent-group integrity failure.
+  strict_group_integrity: true
+
 # --- overrides on the verl base ---------------------------------------------
 algorithm:
 
@@ -230,10 +257,12 @@ actor_rollout_ref:
 
   actor:
 
-    # treetune-faithful PPO-clip loss (prob-mask, +-10 clamp, ratio-threshold).
+    # Main VDRA runs use the node-balanced hierarchical loss (PLAN.md §4.3,
+    # P0.N5). Switch to loss_mode=treetune_ppo only for the SPO/legacy baseline
+    # (paired with tree_policy.policy_aggregation=legacy_token_mean).
     policy_loss:
 
-      loss_mode: treetune_ppo
+      loss_mode: vdra_node_balanced_ppo
 
     # No KL-in-loss by default (matches tree-family configs). KL coef = 0.
     use_kl_loss: false

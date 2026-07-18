@@ -1,0 +1,42 @@
+# PLAN.md §8 Smoke D — Full VDRA (main canonical run).
+#
+# Matrix cell:
+#   allocation           = VDRA
+#   policy_aggregation   = vdra_node_balanced
+#   pilot_execution_mode = fresh_iid
+#
+# Acceptance (per PLAN.md §8 Smoke D):
+#   * at least five successful actor updates;
+#   * finite loss & gradients;
+#   * no parent / tree split;
+#   * exact parent and tree normalization;
+#   * rollout / scorer weights verified;
+#   * stored old log probabilities used;
+#   * no silent truncation;
+#   * mixed-depth flushes legal;
+#   * feasible budget accounting;
+#   * exact fresh_iid final-child accounting;
+#   * valid manifest (RunManifest.is_valid_main_run() true).
+
+tree_policy:
+  advantage_mode: spo_local
+  policy_aggregation: vdra_node_balanced
+  include_root_parent_group: true
+  strict_group_integrity: true
+
+gear_tree:
+  gear:
+    enabled: true
+    strict_vdra: true
+    k_algorithm: budget_allocation
+    allocation_runtime: online_timeout
+    pilot_execution_mode: fresh_iid
+    bound_form: linear
+    tail_mode: none
+    eps_tail: 0.0
+  tree_update_mode: spo
+
+actor_rollout_ref:
+  actor:
+    policy_loss:
+      loss_mode: vdra_node_balanced_ppo

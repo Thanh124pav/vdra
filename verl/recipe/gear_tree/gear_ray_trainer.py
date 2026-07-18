@@ -27,6 +27,16 @@ from recipe.gear_tree.context_contract import (
     validate_context_contract,
 )
 from recipe.gear_tree.replay_buffer import GearTreeReplayBuffer
+from recipe.gear_tree.manifest_lifecycle import (
+    build_run_manifest,
+    update_manifest_from_edges,
+)
+from recipe.gear_tree.run_manifest import (
+    POLICY_AGGREGATION_LEGACY,
+    POLICY_AGGREGATION_VDRA,
+    RunManifest,
+    validate_main_run,
+)
 
 
 class RayGearTreeTrainer(RayPPOTrainer):
@@ -152,6 +162,34 @@ class RayGearTreeTrainer(RayPPOTrainer):
             segment_length=int(gt.get("segment_length", 0) or 0),
             model_context_length=model_context,
         )
+        # PLAN.md P1.R7: refuse the deprecated ablation `_original` names in
+        # strict main runs, and refuse to combine the *_style_ablation modes
+        # with the canonical vdra_node_balanced policy aggregation (they are
+        # ablations, not main-paper losses). The gate's own strict checks
+        # cover pilot_execution_mode and allocation_runtime.
+        gear_cfg = gt.get("gear") or {}
+        strict = bool(gear_cfg.get("strict_vdra", True))
+        tree_update_mode = str(gt.get("tree_update_mode", "spo"))
+        tree_policy = self.config.get("tree_policy") or {}
+        policy_agg = str(tree_policy.get("policy_aggregation", "legacy_token_mean"))
+        if strict:
+            if tree_update_mode in {"treepo_original", "treerl_original"}:
+                raise ValueError(
+                    "strict VDRA main runs must not use the deprecated "
+                    "tree_update_mode aliases (PLAN.md P1.R7); rename to "
+                    "'*_style_ablation' or set strict_vdra=false."
+                )
+            if (
+                policy_agg == "vdra_node_balanced"
+                and tree_update_mode
+                in {"treepo_style_ablation", "treerl_style_ablation"}
+            ):
+                raise ValueError(
+                    "The style-ablation tree_update_modes are not main-paper "
+                    "advantage estimators (PLAN.md P1.R7). Use "
+                    "tree_update_mode='spo' with policy_aggregation="
+                    "'vdra_node_balanced' for the main run."
+                )
 
     def _should_postpone_sampled_update(self, sampled_edges: List[Dict[str, Any]]) -> bool:
         replay_cfg = self._replay_config()
@@ -321,6 +359,39 @@ class RayGearTreeTrainer(RayPPOTrainer):
         self.replay_buffer.save(ckpt_dir)
         return {"buffer/checkpoint_saved": 1.0}
 
+    # --- PLAN.md P0.N8: run-manifest lifecycle --------------------------- #
+
+    def _build_run_manifest(self) -> RunManifest:
+        """PLAN.md P0.N8: delegate to :func:`build_run_manifest` so the
+        manifest construction can be unit-tested without importing the full
+        RayPPOTrainer / torchdata / verl-worker stack.
+        """
+        return build_run_manifest(
+            tree_policy=(self.config.get("tree_policy") or {}),
+            gear_tree_cfg=self._gear_tree_config(),
+            actor_loss_mode=str(
+                self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+            ),
+        )
+
+    def _manifest_path(self) -> str:
+        return os.path.join(
+            self.config.trainer.default_local_dir, "vdra_run_manifest.json"
+        )
+
+    def _save_manifest(self, manifest: RunManifest) -> None:
+        os.makedirs(self.config.trainer.default_local_dir, exist_ok=True)
+        manifest.save(self._manifest_path())
+
+    def _update_manifest_from_edges(
+        self,
+        manifest: RunManifest,
+        sampled_edges: List[Dict[str, Any]],
+        *,
+        strict: bool,
+    ) -> Dict[str, Any]:
+        return update_manifest_from_edges(manifest, sampled_edges, strict=strict)
+
     def fit(self):
         from omegaconf import OmegaConf
         from verl.utils.tracking import Tracking
@@ -341,6 +412,15 @@ class RayGearTreeTrainer(RayPPOTrainer):
         self._validate_replay_startup()
         replay_resume_metrics = self._restore_or_init_replay_buffer()
         replay_buffer = self._ensure_replay_buffer()
+
+        # PLAN.md P0.N8: build the run manifest from config; the trainer
+        # updates it as invariants pass/fail and persists it at every step.
+        self.run_manifest = self._build_run_manifest()
+        manifest_strict = bool(
+            (self.config.get("tree_policy") or {}).get(
+                "strict_group_integrity", False
+            )
+        )
 
         os.makedirs(self.config.trainer.default_local_dir, exist_ok=True)
         timing_path = os.path.join(self.config.trainer.default_local_dir, "training_timing.jsonl")
@@ -374,7 +454,17 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     generation_step=self.global_steps,
                     policy_snapshot_id=self._current_policy_snapshot_id(),
                 )
-                reservation = replay_buffer.reserve_for_update(current_step=self.global_steps)
+                # PLAN.md P0.N6: complete-tree replay when
+                # tree_policy.strict_group_integrity=true; otherwise fall back
+                # to the legacy per-edge reserve so SPO baselines keep working.
+                if manifest_strict:
+                    reservation = replay_buffer.reserve_complete_trees_for_update(
+                        current_step=self.global_steps
+                    )
+                else:
+                    reservation = replay_buffer.reserve_for_update(
+                        current_step=self.global_steps
+                    )
                 sampled_edges = [dict(edge) for edge in reservation.edges]
                 sample_stats = reservation.stats
                 metrics.update({k: v for k, v in sample_stats.items() if k != "removed_edge_ids"})
@@ -397,6 +487,13 @@ class RayGearTreeTrainer(RayPPOTrainer):
 
                 edge_batch = self._edges_to_update_batch(sampled_edges, metrics)
 
+                # PLAN.md P0.N7/N8: run group-integrity checks + metrics BEFORE
+                # the actor step so a broken reservation cannot corrupt state.
+                integrity_metrics = self._update_manifest_from_edges(
+                    self.run_manifest, sampled_edges, strict=manifest_strict
+                )
+                metrics.update(integrity_metrics)
+
                 t0 = time.time()
                 # P0.9: RayGearTreeTrainer never trains a critic, so there is
                 # no critic warmup to gate the actor update on. Always update.
@@ -414,6 +511,10 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     metrics["buffer/size_after"] = float(len(replay_buffer))
                     self.successful_actor_updates += 1
                     self.global_steps += 1
+                    # PLAN.md P0.N8: at least one successful update with no
+                    # integrity failures flips the invariants-passed bit on.
+                    if self.run_manifest.group_integrity_failures == 0:
+                        self.run_manifest.record_invariant_pass()
                 t_update = time.time() - t0
 
                 response_tokens = edge_batch.batch["response_mask"].sum().item()
@@ -440,6 +541,20 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 with open(timing_path, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps(timing) + "\n")
                 metrics.update(timing)
+
+                # PLAN.md P0.N8: persist the manifest every optimizer step so
+                # a killed run still leaves a snapshot on disk. Overwrites in
+                # place — the manifest is small and monotonic per step.
+                try:
+                    self._save_manifest(self.run_manifest)
+                except Exception:
+                    # Manifest IO must never break training; log via metrics.
+                    metrics["vdra/manifest_save_failed"] = 1.0
+                # Report the manifest verdict as a boolean metric so runs can
+                # be filtered by validity at analysis time.
+                metrics["vdra/manifest_valid_main_run"] = float(
+                    validate_main_run(self.run_manifest) is None
+                )
                 logger.log(data=metrics, step=self.global_steps)
 
                 is_last_step = self.global_steps >= self.total_training_steps

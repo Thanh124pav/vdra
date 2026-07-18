@@ -33,6 +33,9 @@ def _tree():
     "mode,expected_adv,expected_value",
     [
         ("spo", 0.3, 0.8),
+        ("treepo_style_ablation", 0.3, 0.8),
+        ("treerl_style_ablation", 0.52, 1.02),
+        # PLAN.md P0.N3: legacy aliases stay supported for vendor parity.
         ("treepo_original", 0.3, 0.8),
         ("treerl_original", 0.52, 1.02),
     ],

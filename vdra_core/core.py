@@ -315,10 +315,21 @@ def allocate_branch_factors_integer(
                 upper[key] = repair_cap
                 repair_count += 1
         upper_sum = sum(upper.values())
+    # PLAN.md P0.R3: when hard upper caps genuinely cannot spend the full
+    # requested budget (repair exhausted, or infeasible_upper_policy=='error'
+    # explicitly requested by an ablation), fall back to spending
+    # ``min(requested, upper_sum)`` and report the residual slack via
+    # ``underallocated_budget``. The old behaviour raised ValueError, which
+    # forced legal but tightly-capped configs (e.g. Tree=[8,8,8], pilot=8)
+    # to abort a whole queue flush instead of consuming what was feasible.
+    infeasible_slack = 0
     if requested > upper_sum:
-        raise ValueError(
-            f"Queue budget {requested} exceeds upper-bound allocation {upper_sum}"
-        )
+        if infeasible_upper_policy == "error":
+            raise ValueError(
+                f"Queue budget {requested} exceeds upper-bound allocation {upper_sum}"
+            )
+        infeasible_slack = requested - upper_sum
+        requested = upper_sum
 
     allocation = dict(lower)
     remaining = requested - lower_sum
@@ -329,15 +340,19 @@ def allocate_branch_factors_integer(
 
     for _ in range(remaining):
         if not heap:
-            raise RuntimeError("No feasible allocation capacity for remaining budget")
+            # PLAN.md P0.R3: budget slack, not a hard failure. Break out and
+            # report the underallocated_budget below.
+            break
         _neg_gain, key = heapq.heappop(heap)
         allocation[key] += 1
         if allocation[key] < upper[key]:
             heapq.heappush(heap, (-_marginal_gain(dispersion[key], allocation[key]), key))
 
     allocated = sum(allocation.values())
-    if allocated != requested:
-        raise RuntimeError(f"Integer allocation produced {allocated}, expected {requested}")
+    if allocated > requested:
+        raise RuntimeError(
+            f"Integer allocation produced {allocated}, exceeded requested {requested}"
+        )
     for key, value in allocation.items():
         if value < lower[key] or value > upper[key]:
             raise RuntimeError(f"Allocation for {key!r} violates bounds: {value}")
@@ -382,7 +397,7 @@ def allocate_branch_factors_integer(
         pruned_allocations=pruned,
         expanded_allocations=expanded,
         transferred_budget=transferred,
-        requested_budget=requested,
+        requested_budget=requested + infeasible_slack,
         allocated_budget=allocated,
         objective_before=objective_before,
         objective_after=objective_after,
@@ -391,7 +406,7 @@ def allocate_branch_factors_integer(
         feasibility_repair_count=repair_count,
         weights=weights,
         raw_allocations={key: float(value) for key, value in allocation.items()},
-        underallocated_budget=0,
+        underallocated_budget=infeasible_slack + max(requested - allocated, 0),
         base_allocations=lower,
         cap_allocations=upper,
         saved_allocations=pruned,

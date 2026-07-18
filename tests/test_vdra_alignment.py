@@ -151,16 +151,31 @@ def test_redistribution_trace_transfers_saved_budget_to_unmet_demand():
     assert sum(n["vdra_additional_k"] for n in nodes) == 4
 
 
-def test_infeasible_upper_budget_fails_without_silent_drop():
+def test_infeasible_upper_budget_reports_slack_by_default():
+    # PLAN.md P0.R3: over-request with a tight hard cap must record the
+    # residual via underallocated_budget, not raise. Explicit strict
+    # callers still get the old ValueError via infeasible_upper_policy.
     node = _node("hot", 6, 7, 1e9)
+    summary = allocate_branch_factors([node], total_budget=100, n_min=1)
+    assert summary.allocations["hot"] == summary.upper_bounds["hot"]
+    assert summary.underallocated_budget == 100 - summary.allocated_budget
     with pytest.raises(ValueError, match="exceeds upper-bound"):
-        allocate_branch_factors([node], total_budget=100, n_min=1)
+        allocate_branch_factors(
+            [node], total_budget=100, n_min=1, infeasible_upper_policy="error"
+        )
 
 
 def test_minimum_branch_factor_caps_zero_prediction():
+    # PLAN.md P0.R3: predicted_k=0 caps the node at n_min; the allocator
+    # now records the resulting slack rather than raising.
     node = _node("cold", 6, 0, 0.0)
+    summary = allocate_branch_factors([node], total_budget=6, n_min=1)
+    assert summary.allocations["cold"] == summary.upper_bounds["cold"]
+    assert summary.underallocated_budget == 6 - summary.allocated_budget
     with pytest.raises(ValueError, match="exceeds upper-bound"):
-        allocate_branch_factors([node], total_budget=6, n_min=1)
+        allocate_branch_factors(
+            [node], total_budget=6, n_min=1, infeasible_upper_policy="error"
+        )
 
 
 def test_queue_zero_timeout_does_not_emit_timeout_flush():

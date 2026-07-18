@@ -343,7 +343,10 @@ def test_external_score_proxy_requires_configured_callable():
     assert node["vdra_external_dispersion_C"] == 0.5
 
 
-def test_strict_main_config_rejects_insufficient_pilot_branch_factor():
+def test_strict_main_config_accepts_pilot_equal_to_default_branch_factor():
+    # PLAN.md P1.R6: the "pilot_branch_factor > max_default_branch_factor"
+    # restriction has been dropped. pilot == max_default_bf must now be
+    # accepted; the only lower bound is pilot >= 2 (TV estimator needs it).
     gate = GearGate(
         k_algorithm="budget_allocation",
         scorer=_DispersionScorer(),
@@ -353,12 +356,16 @@ def test_strict_main_config_rejects_insufficient_pilot_branch_factor():
         strict_vdra=True,
         use_residual_budget=True,
     )
-    with pytest.raises(ValueError, match="pilot_branch_factor > max default"):
-        gate.validate_main_config(max_default_branch_factor=6, segment_length=100)
+    # Must not raise.
+    gate.validate_main_config(max_default_branch_factor=6, segment_length=100)
 
 
 def test_strict_main_config_rejects_reused_pilot_longer_than_segment():
-    gate = GearGate(
+    # PLAN.md P1.R7: strict main runs reject weighted_reuse outright. Verify
+    # the specific "weighted_reuse" error surfaces here — the older
+    # "pilot length > segment length" branch is now unreachable in strict
+    # mode. Non-strict callers still see the pilot-length check.
+    gate_strict = GearGate(
         k_algorithm="budget_allocation",
         scorer=_DispersionScorer(),
         pilot_branch_factor=8,
@@ -366,8 +373,8 @@ def test_strict_main_config_rejects_reused_pilot_longer_than_segment():
         strict_vdra=True,
         pilot_execution_mode="weighted_reuse",
     )
-    with pytest.raises(ValueError, match="pilot length"):
-        gate.validate_main_config(max_default_branch_factor=6, segment_length=100)
+    with pytest.raises(ValueError, match="weighted_reuse"):
+        gate_strict.validate_main_config(max_default_branch_factor=6, segment_length=100)
 
 
 def test_fresh_iid_allows_pilot_longer_than_segment():

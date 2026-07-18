@@ -379,6 +379,19 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("rollout_is_weights")
         if "edge_weights" in data.batch.keys():
             select_keys.append("edge_weights")
+        # PLAN.md P0.N4/N5: forward the row-level group tensors emitted by
+        # ``tree_data.edges_to_dataproto`` to the node-balanced PPO loss.
+        # Legacy losses ignore them; the vdra_node_balanced_ppo loss reduces
+        # child -> parent -> tree through them.
+        for key in (
+            "parent_group_ids",
+            "tree_group_ids",
+            "queue_group_ids",
+            "allocated_k",
+            "sample_multiplicity",
+        ):
+            if key in data.batch.keys():
+                select_keys.append(key)
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -474,6 +487,18 @@ class DataParallelPPOActor(BasePPOActor):
                     }
                     if edge_weights is not None and "edge_weights" in policy_loss_fn.__code__.co_varnames:
                         loss_kwargs["edge_weights"] = edge_weights
+                    # PLAN.md P0.N5: pass VDRA group tensors to any loss that
+                    # declares them (currently vdra_node_balanced_ppo).
+                    for group_key in (
+                        "parent_group_ids",
+                        "tree_group_ids",
+                        "queue_group_ids",
+                        "allocated_k",
+                        "sample_multiplicity",
+                    ):
+                        maybe = model_inputs.get(group_key, None)
+                        if maybe is not None and group_key in policy_loss_fn.__code__.co_varnames:
+                            loss_kwargs[group_key] = maybe
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(**loss_kwargs)
 
                     if entropy_coeff != 0:

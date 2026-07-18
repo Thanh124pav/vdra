@@ -1,5 +1,16 @@
 # Legacy SPO-parity protocol overlay for controlled tree-family comparisons.
 # Use with gear_tree_trainer.yaml and keep model/data/eval overrides explicit.
+#
+# PLAN.md §5 P0.N7 / §8 Smoke A: this overlay pins the SPO baseline. It
+# switches the actor loss back to the single masked-mean treetune_ppo and
+# marks tree_policy.policy_aggregation=legacy_token_mean so the run manifest
+# labels this as an SPO/legacy baseline and NOT a canonical VDRA run.
+
+tree_policy:
+  advantage_mode: spo_local
+  policy_aggregation: legacy_token_mean
+  include_root_parent_group: true
+  strict_group_integrity: false
 
 gear_tree:
   tree_shape: [6, 6, 6]
@@ -18,3 +29,5 @@ actor_rollout_ref:
   actor:
     ppo_mini_batch_size: 128
     ppo_epochs: 1
+    policy_loss:
+      loss_mode: treetune_ppo

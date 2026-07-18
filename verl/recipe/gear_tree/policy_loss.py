@@ -1,5 +1,27 @@
-"""Treetune-faithful PPO policy loss, registered into verl's policy-loss registry.
+"""Policy losses for the tree-family algorithms.
 
+Two losses are registered here:
+
+* ``treetune_ppo`` — the byte-faithful port of treetune's
+  ``PPOTrainer._compute_actor_loss`` used by SPO/TreeRL/TreePO/GEAR-*. Kept as
+  the SPO baseline and legacy aggregation; see the module docstring below.
+* ``vdra_node_balanced_ppo`` — the canonical VDRA loss described in PLAN.md
+  Section 4. It uses the same PPO-clipped token surrogate but reduces the
+  contributions hierarchically:
+      token -> child (token mean per row)
+      child -> parent group (mean weighted by sample_multiplicity)
+      parent group -> tree (mean of parent scalars per tree_group_id)
+      tree -> batch (mean of tree scalars)
+  so a parent group's optimization importance does not scale with its branch
+  factor. The loss requires the group tensors emitted by
+  ``tree_data.edges_to_dataproto`` (``parent_group_ids``, ``tree_group_ids``,
+  ``sample_multiplicity`` and ``allocated_k``) — passing an aggregation-time
+  ``edge_weights`` here would double-count against ``sample_multiplicity``.
+
+Both are registered on module import; select via
+``actor_rollout_ref.actor.policy_loss.loss_mode=<name>``.
+
+--- treetune_ppo notes (unchanged) ---
 Ports ``PPOTrainer._compute_actor_loss`` from
 ``treetune/trainers/ppo_trainer.py`` (lines 1069-1166) **exactly**, so that the
 tree-family algorithms (SPO / TreeRL / TreePO / GEAR-*) keep identical PPO
@@ -14,17 +36,6 @@ Differences vs verl's built-in ``vanilla`` loss that this preserves:
     threshold (default 10), the whole batch loss is zeroed (ppo_trainer.py:1155-1160).
   * mean is ``masked_mean`` over the *prob-masked* action mask, i.e. token-mean
     over kept tokens (treetune utils.py:239-245).
-
-KL handling: for the tree-family configs treetune runs the precomputed-advantage
-path, which uses **neither** KL-in-reward (GAE branch only) **nor** KL-in-loss by
-default (``kl_penalty_loss_type=None``, ``forward_kl_penalty_coef=0``). So this
-loss implements only the PPO-clip core. To reproduce the optional KL-in-loss
-ablation, enable verl's actor ``use_kl_loss`` with ``kl_loss_type`` and
-``kl_loss_coef`` (dp_actor adds it separately) and set
-``loss_agg_mode='seq-mean-token-sum'`` to match treetune's ``.sum(1).mean()``.
-
-Register: importing this module runs the decorator. Select with
-``actor_rollout_ref.actor.policy_loss.loss_mode=treetune_ppo``.
 """
 
 from typing import TYPE_CHECKING, Optional
@@ -78,6 +89,42 @@ def _weighted_masked_mean(
     return numerator / denominator
 
 
+def _ppo_clipped_token_surrogate(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    *,
+    cliprange: float,
+    use_prob_mask: bool,
+    rollout_is_weights: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute the per-token PPO-clip surrogate loss and diagnostics.
+
+    Returns ``(pg_losses, action_mask, ratio, pg_losses1, pg_losses2)``. The
+    caller decides how to reduce ``pg_losses`` over ``action_mask``.
+    """
+
+    action_mask = response_mask
+    if use_prob_mask:
+        prob_mask = torch.exp(old_log_prob) < 0.9
+        action_mask = action_mask.bool() & prob_mask
+    action_mask = action_mask.to(dtype=advantages.dtype)
+
+    log_ratio = (log_prob - old_log_prob) * action_mask
+    log_ratio_clamped = torch.clamp(log_ratio, -10.0, 10.0)
+    ratio = torch.exp(log_ratio_clamped)
+
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
+    pg_losses = torch.max(pg_losses1, pg_losses2)
+
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    return pg_losses, action_mask, ratio, pg_losses1, pg_losses2
+
+
 @register_policy_loss("treetune_ppo")
 def compute_policy_loss_treetune(
     old_log_prob: torch.Tensor,
@@ -101,24 +148,11 @@ def compute_policy_loss_treetune(
     use_prob_mask = bool(config.get("use_prob_mask", True))
     ratio_threshold = float(config.get("ratio_threshold", 10.0))
 
-    # --- action mask (optionally prob-masked) : ppo_trainer.py:1070-1074 ---
-    action_mask = response_mask
-    if use_prob_mask:
-        prob_mask = torch.exp(old_log_prob) < 0.9
-        action_mask = action_mask.bool() & prob_mask
-    action_mask = action_mask.to(dtype=advantages.dtype)
-
-    # --- PPO-clip loss : ppo_trainer.py:1113-1126 ---
-    log_ratio = (log_prob - old_log_prob) * action_mask
-    log_ratio_clamped = torch.clamp(log_ratio, -10.0, 10.0)
-    ratio = torch.exp(log_ratio_clamped)
-
-    pg_losses1 = -advantages * ratio
-    pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
-    pg_losses = torch.max(pg_losses1, pg_losses2)
-
-    if rollout_is_weights is not None:
-        pg_losses = pg_losses * rollout_is_weights
+    pg_losses, action_mask, ratio, pg_losses1, pg_losses2 = _ppo_clipped_token_surrogate(
+        old_log_prob, log_prob, advantages, response_mask,
+        cliprange=cliprange, use_prob_mask=use_prob_mask,
+        rollout_is_weights=rollout_is_weights,
+    )
 
     pg_loss = _weighted_masked_mean(pg_losses, action_mask, edge_weights=edge_weights)
 
@@ -136,5 +170,187 @@ def compute_policy_loss_treetune(
 
     _ = policy_kl
     _ = is_skipped
+    pg_clipfrac_lower = torch.zeros((), dtype=pg_loss.dtype, device=pg_loss.device)
+    return pg_loss, pg_clipfrac, approx_kl, pg_clipfrac_lower
+
+
+def _reduce_child_to_parent(
+    child_losses: torch.Tensor,
+    parent_ids: torch.Tensor,
+    multiplicities: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Weighted mean of child losses per unique parent id.
+
+    Returns ``(parent_losses, unique_parent_ids)``. Both fresh_iid (all
+    multiplicities == 1) and weighted_reuse groups reduce through the same
+    formula: L_p = sum_j m_{p,j} L_{p,j} / sum_j m_{p,j}. Under fresh_iid this
+    collapses to a plain arithmetic mean over the group's realised children.
+    """
+    unique_parents, inverse = torch.unique(parent_ids, return_inverse=True)
+    num_parents = int(unique_parents.numel())
+    parent_num = torch.zeros(num_parents, dtype=child_losses.dtype, device=child_losses.device)
+    parent_den = torch.zeros(num_parents, dtype=child_losses.dtype, device=child_losses.device)
+    parent_num.index_add_(0, inverse, child_losses * multiplicities)
+    parent_den.index_add_(0, inverse, multiplicities)
+    # Guard against a zero-weight parent group (shouldn't happen for valid
+    # groups; still, keep it differentiable).
+    safe_den = torch.where(
+        parent_den > 0, parent_den, torch.ones_like(parent_den)
+    )
+    parent_losses = parent_num / safe_den
+    return parent_losses, unique_parents
+
+
+def _reduce_parent_to_tree(
+    parent_losses: torch.Tensor,
+    parent_tree_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Arithmetic mean of parent losses per unique tree id."""
+    unique_trees, inverse = torch.unique(parent_tree_ids, return_inverse=True)
+    num_trees = int(unique_trees.numel())
+    tree_sum = torch.zeros(num_trees, dtype=parent_losses.dtype, device=parent_losses.device)
+    tree_count = torch.zeros(num_trees, dtype=parent_losses.dtype, device=parent_losses.device)
+    tree_sum.index_add_(0, inverse, parent_losses)
+    tree_count.index_add_(0, inverse, torch.ones_like(parent_losses))
+    safe_count = torch.where(
+        tree_count > 0, tree_count, torch.ones_like(tree_count)
+    )
+    return tree_sum / safe_count, unique_trees
+
+
+def hierarchical_reference_reduction(
+    child_losses: torch.Tensor,
+    parent_ids: torch.Tensor,
+    tree_ids: torch.Tensor,
+    multiplicities: torch.Tensor,
+) -> torch.Tensor:
+    """PLAN.md Section 4.3 reference reduction (used by tests).
+
+    Computes ``mean_T ( mean_p in T ( sum_j m L_{p,j} / sum_j m ) )``. The
+    production loss below must match this on the same inputs.
+    """
+    parent_losses, unique_parents = _reduce_child_to_parent(
+        child_losses, parent_ids, multiplicities
+    )
+    # Each unique parent belongs to exactly one tree by group integrity.
+    parent_to_tree = torch.zeros(
+        unique_parents.numel(), dtype=tree_ids.dtype, device=tree_ids.device
+    )
+    for i, pid in enumerate(unique_parents.tolist()):
+        matches = (parent_ids == pid).nonzero(as_tuple=True)[0]
+        parent_to_tree[i] = tree_ids[matches[0]]
+    tree_losses, _ = _reduce_parent_to_tree(parent_losses, parent_to_tree)
+    return tree_losses.mean()
+
+
+@register_policy_loss("vdra_node_balanced_ppo")
+def compute_policy_loss_vdra_node_balanced(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: "Optional[ActorConfig]" = None,
+    rollout_is_weights: torch.Tensor | None = None,
+    edge_weights: torch.Tensor | None = None,
+    parent_group_ids: torch.Tensor | None = None,
+    tree_group_ids: torch.Tensor | None = None,
+    sample_multiplicity: torch.Tensor | None = None,
+    allocated_k: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """PLAN.md Section 4.3 hierarchical policy loss.
+
+    Requires the row-level group tensors emitted by
+    ``tree_data.edges_to_dataproto``. Reduces:
+
+        token surrogate ell_{p,j,t} ──token-mean──► child L_{p,j}
+        L_{p,j}                     ──weighted mean over j (sample_multiplicity)──► L_p
+        L_p                         ──arithmetic mean over p per tree──► L_T
+        L_T                         ──arithmetic mean over trees──► L_VDRA
+
+    Passing ``edge_weights`` here is a configuration error: multiplicity is
+    captured explicitly via ``sample_multiplicity`` and the aggregation rule
+    itself. The parameter is accepted only to keep the registry signature
+    uniform; a non-``None`` value raises.
+    """
+    assert config is not None
+    if parent_group_ids is None or tree_group_ids is None:
+        raise ValueError(
+            "vdra_node_balanced_ppo requires parent_group_ids and tree_group_ids "
+            "tensors (PLAN.md P0.N5). Wire them via tree_data.edges_to_dataproto "
+            "and add them to model_inputs in dp_actor."
+        )
+    if edge_weights is not None:
+        raise ValueError(
+            "vdra_node_balanced_ppo does not accept edge_weights; use "
+            "sample_multiplicity (PLAN.md Section 4.3). Passing edge_weights "
+            "here would double-count against the hierarchical reduction."
+        )
+
+    cliprange = float(config.clip_ratio)
+    use_prob_mask = bool(config.get("use_prob_mask", True))
+    ratio_threshold = float(config.get("ratio_threshold", 10.0))
+
+    pg_losses, action_mask, ratio, pg_losses1, pg_losses2 = _ppo_clipped_token_surrogate(
+        old_log_prob, log_prob, advantages, response_mask,
+        cliprange=cliprange, use_prob_mask=use_prob_mask,
+        rollout_is_weights=rollout_is_weights,
+    )
+
+    # Stage 1: token mean per child segment (one row per child).
+    # Empty-mask children contribute a finite zero and stay in the parent
+    # denominator so the group weight does not silently shift (PLAN.md 4.3).
+    token_num = (pg_losses * action_mask).sum(dim=-1)
+    token_den = action_mask.sum(dim=-1)
+    empty_child_mask = token_den <= 0
+    child_losses = token_num / torch.where(
+        empty_child_mask, torch.ones_like(token_den), token_den
+    )
+    child_losses = torch.where(
+        empty_child_mask, torch.zeros_like(child_losses), child_losses
+    )
+
+    # Multiplicities: default to 1 when not provided (== fresh_iid).
+    if sample_multiplicity is None:
+        multiplicities = torch.ones_like(child_losses)
+    else:
+        multiplicities = sample_multiplicity.to(
+            dtype=child_losses.dtype, device=child_losses.device
+        )
+        if multiplicities.shape != child_losses.shape:
+            raise ValueError(
+                "sample_multiplicity must be a 1-D tensor of shape [batch]; got "
+                f"{tuple(multiplicities.shape)}"
+            )
+
+    parent_ids = parent_group_ids.to(dtype=torch.long, device=child_losses.device)
+    tree_ids = tree_group_ids.to(dtype=torch.long, device=child_losses.device)
+
+    # Stage 2: child -> parent group.
+    parent_losses, unique_parents = _reduce_child_to_parent(
+        child_losses, parent_ids, multiplicities
+    )
+
+    # Map each parent group to its tree. Group integrity guarantees a single
+    # tree per parent, so pick the first row of each unique parent.
+    parent_tree_ids = torch.zeros_like(unique_parents)
+    for i in range(unique_parents.numel()):
+        row = (parent_ids == unique_parents[i]).nonzero(as_tuple=True)[0][0]
+        parent_tree_ids[i] = tree_ids[row]
+
+    # Stage 3: parent -> tree.
+    tree_losses, _ = _reduce_parent_to_tree(parent_losses, parent_tree_ids)
+
+    # Stage 4: tree -> batch.
+    pg_loss = tree_losses.mean()
+
+    # Ratio-threshold safety valve; identical spirit to treetune_ppo.
+    avg_ratio = _masked_mean(ratio, action_mask)
+    if avg_ratio.item() > ratio_threshold:
+        pg_loss = pg_loss * 0.0
+
+    # Diagnostics.
+    pg_clipfrac = _masked_mean(torch.gt(pg_losses2, pg_losses1).float(), action_mask)
+    approx_kl = 0.5 * _masked_mean((log_prob - old_log_prob) ** 2, action_mask)
     pg_clipfrac_lower = torch.zeros((), dtype=pg_loss.dtype, device=pg_loss.device)
     return pg_loss, pg_clipfrac, approx_kl, pg_clipfrac_lower

@@ -25,9 +25,17 @@ def test_flexible_scheduler_marks_queue_ids_and_preserves_budget():
     assert sum(summary.allocated_budget for summary in summaries) == 9
 
 
-def test_flexible_scheduler_does_not_silently_drop_infeasible_budget():
+def test_flexible_scheduler_reports_slack_on_infeasible_budget():
+    # PLAN.md P0.R3: the underlying allocator now spends
+    # min(budget, sum u_p) and reports the residual via
+    # underallocated_budget; the scheduler must surface that slack instead
+    # of aborting the queue.
     nodes = [_node("a", 4, 1, 0.0), _node("b", 4, 2, 0.0)]
-    with pytest.raises(ValueError, match="exceeds upper-bound"):
-        FlexibleBudgetScheduler(queue_count=1, n_min=1).allocate(
-            nodes, total_depth_budget=8
-        )
+    summaries = FlexibleBudgetScheduler(queue_count=1, n_min=1).allocate(
+        nodes, total_depth_budget=8
+    )
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert summary.allocated_budget == sum(summary.upper_bounds.values())
+    assert summary.underallocated_budget == 8 - summary.allocated_budget
+    assert summary.allocated_budget < 8

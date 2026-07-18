@@ -66,8 +66,37 @@ def extract_edges_from_tree(
         or data_instance.get("policy_snapshot_id")
         or data_instance.get("current_rollout_snapshot_id")
     )
+    # PLAN.md P0.N1: every tree has one stable tree_id. Prefer explicit tree
+    # metadata, then a dataset/rollout-provided value, and finally derive a
+    # stable id from question_id + snapshot so replay/tensorization keep the
+    # same group boundary across steps.
+    tree_id = (
+        tree_copy.get("tree_id")
+        or data_instance.get("tree_id")
+        or f"{policy_snapshot_id}:{question_id}"
+    )
+
+    # PLAN.md P0.N1: aggregate tree-level counts as we walk the tree so the
+    # trainer can assert group integrity without a second pass.
+    expanded_parent_group_ids: set[str] = set()
+    trainable_child_count = 0
+    queue_to_parent_group_counts: dict[Any, set[str]] = {}
+    root_parent_group_id = f"tree:{tree_id}#root"
+
+    def _parent_group_id(parent: dict[str, Any]) -> str:
+        parent_seg = parent.get("gear_segment_id")
+        if parent_seg is None or parent_seg == "root":
+            return root_parent_group_id
+        return f"tree:{tree_id}#pg:{parent_seg}"
+
+    def _child_segment_id(node: dict[str, Any], parent_group_id: str, idx: int) -> str:
+        seg = node.get("gear_segment_id")
+        if seg:
+            return str(seg)
+        return f"{parent_group_id}/c{idx}"
 
     def visit(node: dict[str, Any], parent: dict[str, Any] | None = None) -> None:
+        nonlocal trainable_child_count
         if parent is not None:
             parent_reward = _node_reward(parent)
             child_reward = _node_reward(node)
@@ -88,6 +117,46 @@ def extract_edges_from_tree(
             prover_advantage = _bok(child_reward) - _bok(parent_reward)
             pav_advantage = advantage + prover_advantage
 
+            parent_group_id = _parent_group_id(parent)
+            # child_index: prefer explicit stamp, else use position within
+            # parent's realized children list. Position is deterministic in
+            # DFS/BFS since siblings share one asyncio.gather.
+            siblings = list(parent.get("children", []))
+            try:
+                idx = siblings.index(node)
+            except ValueError:
+                idx = int(node.get("child_index", 0) or 0)
+            child_segment_id = _child_segment_id(node, parent_group_id, idx)
+            parent_segment_id = parent.get("gear_segment_id") or "root"
+            # PLAN.md P0.N1: allocated_k must equal the number of realized
+            # trainable children for fresh_iid. The tree builder stamps
+            # vdra_allocated_k on the parent; otherwise fall back to the
+            # length of the child list (all realized siblings).
+            allocated_k = int(
+                parent.get("vdra_allocated_k", len(siblings)) or len(siblings)
+            )
+            # sample_multiplicity (P0.N2): must be separate from any
+            # optimization coefficient. Under fresh_iid it is 1; under
+            # weighted_reuse it is the cluster multiplicity.
+            raw_multiplicity = node.get(
+                "vdra_cluster_multiplicity",
+                node.get("sample_multiplicity"),
+            )
+            if raw_multiplicity is None:
+                sample_multiplicity = 1
+            else:
+                try:
+                    sample_multiplicity = max(int(raw_multiplicity), 1)
+                except (TypeError, ValueError):
+                    sample_multiplicity = 1
+            # queue_flush_id: stamped by the online-alloc path per queue
+            # flush; defaults to 0 for DFS/batch paths where each parent is
+            # its own "flush".
+            queue_flush_id = node.get(
+                "vdra_queue_flush_id",
+                parent.get("vdra_queue_flush_id", 0),
+            )
+
             edge = {
                 "question_id": question_id,
                 "policy_snapshot_id": policy_snapshot_id,
@@ -107,12 +176,20 @@ def extract_edges_from_tree(
                 "leaf": bool(node.get("leaf", not node.get("children"))),
                 "reward": child_reward,
                 "pruned": is_pruned,
-                # P0.5: representative-weight fields must survive tree → edge
-                # → DataProto → actor. tree_rollout writes edge_weight and the
-                # vdra_cluster_* metadata on final children under
-                # weighted_reuse; token_fields_for_edges broadcasts
-                # edge_weight into batch["edge_weights"] and the weighted PPO
-                # loss reads that tensor.
+                # PLAN.md P0.N1/N2: canonical grouping metadata. These must
+                # survive tree -> edge -> replay -> DataProto -> actor.
+                "tree_id": str(tree_id),
+                "parent_group_id": str(parent_group_id),
+                "parent_segment_id": str(parent_segment_id),
+                "child_segment_id": str(child_segment_id),
+                "child_index": int(idx),
+                "allocated_k": int(allocated_k),
+                "sample_multiplicity": int(sample_multiplicity),
+                "queue_flush_id": queue_flush_id,
+                # P0.5 / P0.W3: representative-weight fields must survive
+                # tree → edge → DataProto → actor for the weighted_reuse
+                # ablation. edge_weight is a separate optimization-time
+                # coefficient; sample_multiplicity is the sample count.
                 "edge_weight": node.get(
                     "edge_weight", node.get("vdra_representative_weight")
                 ),
@@ -126,12 +203,31 @@ def extract_edges_from_tree(
                 not only_adv_greater_than_zero or pav_advantage != 0
             ):
                 edges.append(edge)
+                if not is_pruned:
+                    trainable_child_count += 1
+                    expanded_parent_group_ids.add(str(parent_group_id))
+                    queue_to_parent_group_counts.setdefault(
+                        queue_flush_id, set()
+                    ).add(str(parent_group_id))
 
         for child in node.get("children", []):
             visit(child, node)
         node.pop("children", None)
 
     visit(tree_copy)
+    # PLAN.md P0.N1: tree-level counts. Stamp them on every edge so the
+    # replay/tensorization layer can compute tree_group_ids without another
+    # tree walk. Keep the sets serialisable.
+    tree_summary = {
+        "tree_id": str(tree_id),
+        "expanded_parent_group_count": len(expanded_parent_group_ids),
+        "trainable_child_count": int(trainable_child_count),
+        "queue_to_parent_group_counts": {
+            str(k): len(v) for k, v in queue_to_parent_group_counts.items()
+        },
+    }
+    for edge in edges:
+        edge.setdefault("tree_summary", tree_summary)
     return json.loads(json.dumps(edges))
 
 

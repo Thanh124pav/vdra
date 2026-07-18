@@ -1,0 +1,28 @@
+# PLAN.md §8 Smoke C — Optimization-only ablation.
+#
+# Matrix cell:
+#   allocation          = fixed / uniform
+#   policy_aggregation  = vdra_node_balanced
+#
+# This isolates the effect of the node-balanced hierarchical loss without
+# the adaptive allocator.
+
+tree_policy:
+  advantage_mode: spo_local
+  policy_aggregation: vdra_node_balanced
+  include_root_parent_group: true
+  strict_group_integrity: true
+
+gear_tree:
+  gear:
+    enabled: false
+    strict_vdra: false
+    k_algorithm: simple
+    allocation_runtime: online_timeout
+    pilot_execution_mode: fresh_iid
+  tree_update_mode: spo
+
+actor_rollout_ref:
+  actor:
+    policy_loss:
+      loss_mode: vdra_node_balanced_ppo

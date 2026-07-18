@@ -516,6 +516,32 @@ try:  # keep CPU-importable when agent_loop isn't installed
             prompt_ids = await self.apply_chat_template(messages)
             prompt_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
 
+            # PLAN.md P1.R4: honor and log the per-request sampling parameters.
+            # The segment generator was built in __init__ with worker defaults
+            # so a downstream evaluation or ablation caller that passes
+            # sampling_params={"temperature": 0.0, "top_p": 1.0} would have
+            # been silently ignored. Overlay non-None caller values here.
+            request_sp = dict(sampling_params or {})
+            resolved_sp = dict(self._gen.base_sampling_params)
+            for key in ("temperature", "top_p", "top_k", "min_p", "seed"):
+                if key in request_sp and request_sp[key] is not None:
+                    resolved_sp[key] = request_sp[key]
+            # Do not mutate the shared generator: overlay per-call by binding
+            # to a local generator instance if any sampling knob changed.
+            self._resolved_sampling_params = resolved_sp
+            per_call_gen = self._gen
+            if any(
+                resolved_sp.get(k) != self._gen.base_sampling_params.get(k)
+                for k in resolved_sp
+            ):
+                per_call_gen = AsyncServerSegmentGenerator(
+                    self._gen.server_manager,
+                    self._gen.tokenizer,
+                    base_sampling_params=resolved_sp,
+                    free_max_tokens=self._gen.free_max_tokens,
+                )
+                self._node_expander = SegmentNodeExpander(per_call_gen, self.tokenizer)
+
             rm = kwargs.get("reward_model", {}) or {}
             extra = kwargs.get("extra_info", {}) or {}
             # P0.1: prefer per-sample non_tensor_batch kwargs; fall back to the
@@ -574,7 +600,7 @@ try:  # keep CPU-importable when agent_loop isn't installed
 
             edges = await build_tree_edges_async(
                 prompt_text, prompt_ids, data_instance,
-                segment_generator=self._gen, reward_fn=self._reward_fn,
+                segment_generator=per_call_gen, reward_fn=self._reward_fn,
                 tree_shape=self._gt.get("tree_shape", [6, 6, 6]),
                 M=self._gt.get("segment_length", 100), gear_gate=self._gate,
                 tree_update_mode=self._gt.get("tree_update_mode", "spo"),
@@ -604,7 +630,13 @@ try:  # keep CPU-importable when agent_loop isn't installed
                 num_turns=2,
                 reward_score=0.0,
                 metrics=AgentLoopMetrics(),
-                extra_fields={"gear_tree_edges": edges},
+                extra_fields={
+                    "gear_tree_edges": edges,
+                    # PLAN.md P1.R4: emit the resolved sampling params so
+                    # downstream logging can prove which distribution the
+                    # rollout actually used.
+                    "gear_tree_resolved_sampling_params": dict(resolved_sp),
+                },
             )
 
     def _build_gate(gt: dict, tokenizer: Any = None):
