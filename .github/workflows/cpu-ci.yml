@@ -36,11 +36,29 @@ jobs:
           # OmegaConf is used by RayGearTreeTrainer._gear_tree_config; installing
           # it here lets the P0.2 trainer stub tests run when verl is available.
           pip install omegaconf
+          # PLAN.md P0.7: recipe.gear_tree tests exercise policy loss +
+          # tree data helpers that live under verl/. Install the CPU torch
+          # wheel and the small set of gear-tree deps so the correctness
+          # tests can run in CI as well.
+          # ``ray`` is imported at ``verl/__init__.py`` load time (via
+          # ``verl.protocol``), so ``from verl import DataProto`` — used by
+          # every gear_tree tree_data / policy_loss test — fails to collect
+          # without it. Install ``ray[default]==2.35.*`` to keep the CPU
+          # image lean; the tests never call into ray runtime.
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install tensordict transformers codetiming pylatexenc
+          pip install "ray>=2.35,<2.40"
 
       - name: Install the local package
         run: pip install -e .
 
-      - name: Run CPU behavioral tests
+      - name: Compileall vdra_core and gear_tree
+        env:
+          PYTHONPATH: ${{ github.workspace }}/verl
+        run: |
+          python -m compileall vdra_core verl/recipe/gear_tree
+
+      - name: Run CPU behavioral tests (root)
         env:
           # PLAN.md P0.2/P0.5: recipe.gear_tree sits under verl/ and is
           # imported as `from recipe.gear_tree...`; add the verl root so
@@ -71,3 +89,13 @@ jobs:
             --ignore=tests/test_online_gear.py \
             --ignore=tests/test_tree_update_config.py \
             --ignore=tests/test_tree_update_modes.py
+
+      - name: Run gear_tree recipe correctness tests (PLAN.md P0.7)
+        env:
+          PYTHONPATH: ${{ github.workspace }}/verl
+        run: |
+          # trainer_contracts and vendor_parity pull the full verl / ray /
+          # torchdata / wandb stack; they belong to the GPU/full-stack suite.
+          python -m pytest verl/recipe/gear_tree/tests/ -q \
+            --ignore=verl/recipe/gear_tree/tests/test_trainer_contracts.py \
+            --ignore=verl/recipe/gear_tree/tests/test_vendor_parity.py

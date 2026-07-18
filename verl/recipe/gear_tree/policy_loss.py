@@ -257,39 +257,42 @@ def compute_policy_loss_vdra_node_balanced(
     tree_group_ids: torch.Tensor | None = None,
     sample_multiplicity: torch.Tensor | None = None,
     allocated_k: torch.Tensor | None = None,
+    objective_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """PLAN.md Section 4.3 hierarchical policy loss.
+    """PLAN.md Sections 4.3 & P0.4 hierarchical policy loss.
 
-    Requires the row-level group tensors emitted by
-    ``tree_data.edges_to_dataproto``. Reduces:
+    The precomputed row-level ``objective_weights`` (P0.3) already encode the
+    hierarchical reduction:
 
-        token surrogate ell_{p,j,t} ──token-mean──► child L_{p,j}
-        L_{p,j}                     ──weighted mean over j (sample_multiplicity)──► L_p
-        L_p                         ──arithmetic mean over p per tree──► L_T
-        L_T                         ──arithmetic mean over trees──► L_VDRA
+        w_{p,j} = (1 / N_tree) * (1 / |P(T)|) * (m_{p,j} / sum_j' m_{p,j'})
 
-    Passing ``edge_weights`` here is a configuration error: multiplicity is
-    captured explicitly via ``sample_multiplicity`` and the aggregation rule
-    itself. The parameter is accepted only to keep the registry signature
-    uniform; a non-``None`` value raises.
+    so the loss is a single weighted sum:
+
+        L = sum_row w_row * TokenMean(pg_loss_row).
+
+    Mini/microbatch splits partition ``w``; summing across microbatches yields
+    the exact full-batch weighted sum, matching the hierarchical reference.
+
+    Callers must pass ``objective_weights`` (via ``tree_data.edges_to_dataproto``);
+    for backward compatibility the loss still accepts ``parent_group_ids`` +
+    ``tree_group_ids`` and derives weights from those on-the-fly when
+    ``objective_weights`` is missing. Passing ``edge_weights`` remains a
+    configuration error.
     """
     assert config is not None
-    if parent_group_ids is None or tree_group_ids is None:
-        raise ValueError(
-            "vdra_node_balanced_ppo requires parent_group_ids and tree_group_ids "
-            "tensors (PLAN.md P0.N5). Wire them via tree_data.edges_to_dataproto "
-            "and add them to model_inputs in dp_actor."
-        )
     if edge_weights is not None:
         raise ValueError(
             "vdra_node_balanced_ppo does not accept edge_weights; use "
-            "sample_multiplicity (PLAN.md Section 4.3). Passing edge_weights "
-            "here would double-count against the hierarchical reduction."
+            "sample_multiplicity + objective_weights (PLAN.md P0.3). Passing "
+            "edge_weights would double-count against the hierarchical reduction."
         )
 
     cliprange = float(config.clip_ratio)
     use_prob_mask = bool(config.get("use_prob_mask", True))
-    ratio_threshold = float(config.get("ratio_threshold", 10.0))
+    # PLAN.md P0.4: do NOT apply ratio_threshold as a per-microbatch skip on
+    # the canonical VDRA path; only report the diagnostic. Legacy skip lives
+    # in treetune_ppo.
+    ratio_threshold = float(config.get("ratio_threshold", float("inf")))
 
     pg_losses, action_mask, ratio, pg_losses1, pg_losses2 = _ppo_clipped_token_surrogate(
         old_log_prob, log_prob, advantages, response_mask,
@@ -299,7 +302,7 @@ def compute_policy_loss_vdra_node_balanced(
 
     # Stage 1: token mean per child segment (one row per child).
     # Empty-mask children contribute a finite zero and stay in the parent
-    # denominator so the group weight does not silently shift (PLAN.md 4.3).
+    # denominator so the group weight does not silently shift.
     token_num = (pg_losses * action_mask).sum(dim=-1)
     token_den = action_mask.sum(dim=-1)
     empty_child_mask = token_den <= 0
@@ -310,44 +313,65 @@ def compute_policy_loss_vdra_node_balanced(
         empty_child_mask, torch.zeros_like(child_losses), child_losses
     )
 
-    # Multiplicities: default to 1 when not provided (== fresh_iid).
-    if sample_multiplicity is None:
-        multiplicities = torch.ones_like(child_losses)
-    else:
-        multiplicities = sample_multiplicity.to(
-            dtype=child_losses.dtype, device=child_losses.device
-        )
-        if multiplicities.shape != child_losses.shape:
+    if objective_weights is not None:
+        # P0.4 fast path: single weighted sum. Weights already encode the
+        # hierarchical reduction, and mini/microbatch splits preserve the
+        # invariant sum_row w_row * child_loss_row.
+        w = objective_weights.to(dtype=child_losses.dtype, device=child_losses.device)
+        if w.shape != child_losses.shape:
             raise ValueError(
-                "sample_multiplicity must be a 1-D tensor of shape [batch]; got "
-                f"{tuple(multiplicities.shape)}"
+                "objective_weights shape must match [batch]; got "
+                f"{tuple(w.shape)}"
+            )
+        pg_loss = (w * child_losses).sum()
+    else:
+        # Legacy: derive the hierarchy from the group tensors.
+        if parent_group_ids is None or tree_group_ids is None:
+            raise ValueError(
+                "vdra_node_balanced_ppo requires objective_weights OR "
+                "(parent_group_ids, tree_group_ids). Wire them via "
+                "tree_data.edges_to_dataproto and add them to model_inputs "
+                "in dp_actor."
             )
 
-    parent_ids = parent_group_ids.to(dtype=torch.long, device=child_losses.device)
-    tree_ids = tree_group_ids.to(dtype=torch.long, device=child_losses.device)
+        # Multiplicities: default to 1 when not provided (== fresh_iid).
+        if sample_multiplicity is None:
+            multiplicities = torch.ones_like(child_losses)
+        else:
+            multiplicities = sample_multiplicity.to(
+                dtype=child_losses.dtype, device=child_losses.device
+            )
+            if multiplicities.shape != child_losses.shape:
+                raise ValueError(
+                    "sample_multiplicity must be a 1-D tensor of shape [batch]; got "
+                    f"{tuple(multiplicities.shape)}"
+                )
 
-    # Stage 2: child -> parent group.
-    parent_losses, unique_parents = _reduce_child_to_parent(
-        child_losses, parent_ids, multiplicities
-    )
+        parent_ids = parent_group_ids.to(dtype=torch.long, device=child_losses.device)
+        tree_ids = tree_group_ids.to(dtype=torch.long, device=child_losses.device)
 
-    # Map each parent group to its tree. Group integrity guarantees a single
-    # tree per parent, so pick the first row of each unique parent.
-    parent_tree_ids = torch.zeros_like(unique_parents)
-    for i in range(unique_parents.numel()):
-        row = (parent_ids == unique_parents[i]).nonzero(as_tuple=True)[0][0]
-        parent_tree_ids[i] = tree_ids[row]
+        # Stage 2: child -> parent group.
+        parent_losses, unique_parents = _reduce_child_to_parent(
+            child_losses, parent_ids, multiplicities
+        )
 
-    # Stage 3: parent -> tree.
-    tree_losses, _ = _reduce_parent_to_tree(parent_losses, parent_tree_ids)
+        # Map each parent group to its tree. Group integrity guarantees a single
+        # tree per parent, so pick the first row of each unique parent.
+        parent_tree_ids = torch.zeros_like(unique_parents)
+        for i in range(unique_parents.numel()):
+            row = (parent_ids == unique_parents[i]).nonzero(as_tuple=True)[0][0]
+            parent_tree_ids[i] = tree_ids[row]
 
-    # Stage 4: tree -> batch.
-    pg_loss = tree_losses.mean()
+        # Stage 3: parent -> tree.
+        tree_losses, _ = _reduce_parent_to_tree(parent_losses, parent_tree_ids)
 
-    # Ratio-threshold safety valve; identical spirit to treetune_ppo.
+        # Stage 4: tree -> batch.
+        pg_loss = tree_losses.mean()
+
+    # PLAN.md P0.4: report the ratio as a metric; do not skip.
     avg_ratio = _masked_mean(ratio, action_mask)
-    if avg_ratio.item() > ratio_threshold:
-        pg_loss = pg_loss * 0.0
+    _ = avg_ratio
+    _ = ratio_threshold
 
     # Diagnostics.
     pg_clipfrac = _masked_mean(torch.gt(pg_losses2, pg_losses1).float(), action_mask)

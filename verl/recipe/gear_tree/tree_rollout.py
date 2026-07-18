@@ -18,11 +18,54 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import itertools
 import time
+import uuid
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
+
+
+# PLAN.md P0.2: process-local monotonic counter used as the per-tree tiebreaker
+# when the rollout does not supply an explicit tree_instance_uuid. Two trees
+# built for the same (question_id, policy_snapshot_id, rollout_iteration) get
+# distinct IDs because their counter values differ.
+_TREE_INSTANCE_COUNTER = itertools.count(0)
+_TREE_INSTANCE_LOCK = Lock()
+
+
+def make_tree_instance_id(
+    *,
+    policy_snapshot_id: Any,
+    rollout_iteration: Any,
+    stable_question_id: Any,
+    tree_instance_uuid: Optional[str] = None,
+) -> str:
+    """PLAN.md P0.2: build a globally-unique tree_instance_id.
+
+    Every stochastic tree gets one instance id combining:
+      * the policy snapshot the rollout used;
+      * the rollout iteration inside that snapshot;
+      * a stable question id from the dataset;
+      * a per-tree tiebreaker (explicit uuid, or a monotonic counter).
+
+    Two trees for the same (question, snapshot, iteration) tuple are guaranteed
+    to hold different ids so their edges coexist in replay without collision.
+    """
+    if tree_instance_uuid:
+        tiebreaker = str(tree_instance_uuid)
+    else:
+        with _TREE_INSTANCE_LOCK:
+            tiebreaker = f"c{next(_TREE_INSTANCE_COUNTER)}-{uuid.uuid4().hex[:8]}"
+    parts = [
+        str(policy_snapshot_id or "snapshot:unknown"),
+        f"iter:{rollout_iteration if rollout_iteration is not None else 0}",
+        f"q:{stable_question_id if stable_question_id is not None else 'na'}",
+        tiebreaker,
+    ]
+    return "|".join(parts)
 
 # A generated segment sample from the engine.
 @dataclass
@@ -89,6 +132,18 @@ def build_tree(
     if gear_gate is None:
         gear_gate = _NoopGate()
 
+    # PLAN.md P0.2: stamp a globally-unique tree_instance_id at construction
+    # time so every downstream stage (edges, replay, tensorization, manifest)
+    # can safely key by tree_id without merging repeated rollouts.
+    tree_instance_id = make_tree_instance_id(
+        policy_snapshot_id=data_instance.get("policy_snapshot_id")
+        or data_instance.get("current_rollout_snapshot_id"),
+        rollout_iteration=data_instance.get("rollout_iteration"),
+        stable_question_id=data_instance.get("_treetune__idx")
+        or data_instance.get("uid"),
+        tree_instance_uuid=data_instance.get("tree_instance_uuid"),
+    )
+
     tree: Dict[str, Any] = {
         "text": root_prompt_text,
         "depth": 0,
@@ -97,6 +152,8 @@ def build_tree(
         "_request_object": data_instance,
         "leaf": False,
         "full_token_ids": list(root_prompt_token_ids),
+        "tree_id": tree_instance_id,
+        "tree_instance_id": tree_instance_id,
     }
 
     def dfs(node: Dict[str, Any], prefix: str, depth: int) -> None:
@@ -238,10 +295,22 @@ async def async_build_tree(
     if gear_gate is None:
         gear_gate = _NoopGate()
 
+    # PLAN.md P0.2: same globally-unique tree id as the sync builder.
+    tree_instance_id = make_tree_instance_id(
+        policy_snapshot_id=data_instance.get("policy_snapshot_id")
+        or data_instance.get("current_rollout_snapshot_id"),
+        rollout_iteration=data_instance.get("rollout_iteration"),
+        stable_question_id=data_instance.get("_treetune__idx")
+        or data_instance.get("uid"),
+        tree_instance_uuid=data_instance.get("tree_instance_uuid"),
+    )
+
     tree: Dict[str, Any] = {
         "text": root_prompt_text, "depth": 0, "full_text": root_prompt_text,
         "stop_text": "aaa", "_request_object": data_instance, "leaf": False,
         "full_token_ids": list(root_prompt_token_ids),
+        "tree_id": tree_instance_id,
+        "tree_instance_id": tree_instance_id,
     }
 
     async def dfs(node: Dict[str, Any], prefix: str, depth: int) -> None:
@@ -708,7 +777,21 @@ async def async_build_tree_online_alloc(
         or "rollout_step:unknown"
     )
     run_id = str(data_instance.get("run_id", policy_snapshot_id))
-    tree_id = str(data_instance.get("tree_id", policy_snapshot_id))
+    # PLAN.md P0.2: even in the online-alloc path, prefer the caller-supplied
+    # tree_instance_id when present; otherwise mint a globally unique one so
+    # replay/tensorization/manifest never see two independent trees collapse
+    # to the same tree_id.
+    tree_id = str(
+        data_instance.get("tree_instance_id")
+        or data_instance.get("tree_id")
+        or make_tree_instance_id(
+            policy_snapshot_id=policy_snapshot_id,
+            rollout_iteration=data_instance.get("rollout_iteration"),
+            stable_question_id=data_instance.get("_treetune__idx")
+            or data_instance.get("uid"),
+            tree_instance_uuid=data_instance.get("tree_instance_uuid"),
+        )
+    )
     budget_mode = str(getattr(gear_gate, "budget_mode", "fixed_main"))
     token_budget: Optional[Dict[str, Any]] = None
     if budget_mode in {"fixed_total_generated", "uniform_full_tree_token_cap"}:
@@ -765,6 +848,8 @@ async def async_build_tree_online_alloc(
         "gear_segment_id": "root",
         "policy_snapshot_id": policy_snapshot_id,
         "vdra_policy_snapshot_id": policy_snapshot_id,
+        "tree_id": tree_id,
+        "tree_instance_id": tree_id,
     }
 
     def _default_bf(depth: int) -> int:
@@ -1235,10 +1320,22 @@ async def async_build_tree_batch_alloc(
     if max_depth is None:
         max_depth = len(tree_shape)
 
+    # PLAN.md P0.2: same globally-unique tree id as the sync/online builders.
+    tree_instance_id = make_tree_instance_id(
+        policy_snapshot_id=data_instance.get("policy_snapshot_id")
+        or data_instance.get("current_rollout_snapshot_id"),
+        rollout_iteration=data_instance.get("rollout_iteration"),
+        stable_question_id=data_instance.get("_treetune__idx")
+        or data_instance.get("uid"),
+        tree_instance_uuid=data_instance.get("tree_instance_uuid"),
+    )
+
     tree: Dict[str, Any] = {
         "text": root_prompt_text, "depth": 0, "full_text": root_prompt_text,
         "stop_text": "aaa", "_request_object": data_instance, "leaf": False,
         "full_token_ids": list(root_prompt_token_ids),
+        "tree_id": tree_instance_id,
+        "tree_instance_id": tree_instance_id,
     }
 
     frontier: List[Dict[str, Any]] = [tree]

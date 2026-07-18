@@ -57,10 +57,22 @@ def test_extract_edges_matches_vendor_update_modes(mode, expected_adv, expected_
     assert edges[0]["value"] == pytest.approx(expected_value)
 
 
-def test_pruned_edge_is_emitted_with_zero_advantage():
+def test_pruned_edge_is_dropped_by_default():
+    # PLAN.md P0.1: administrative pruned=True placeholder rows must NOT enter
+    # DataProto or the parent denominator. Default emit_pruned_edges=False.
     tree = _tree()
     tree["children"][0]["pruned"] = True
     edges = extract_edges_from_tree(tree, only_adv_greater_than_zero=False)
+    assert edges == []
+
+
+def test_pruned_edge_kept_when_emit_flag_true():
+    # Diagnostics-only: callers can still opt in to inspecting pruned edges.
+    tree = _tree()
+    tree["children"][0]["pruned"] = True
+    edges = extract_edges_from_tree(
+        tree, only_adv_greater_than_zero=False, emit_pruned_edges=True
+    )
     assert len(edges) == 1
     assert edges[0]["pruned"] is True
     assert edges[0]["advantage"] == 0.0
@@ -91,3 +103,59 @@ def test_add_tree_advantage_tensors_mutates_dataproto_batch():
     assert "advantages" in data.batch.keys()
     assert "old_log_probs" in data.batch.keys()
     assert data.batch["advantages"][0, 0].item() == pytest.approx(0.3)
+
+def _tree_with_alloc(k: int, mark_multiplicity: int = 1):
+    """Build a small tree stamped with vdra_allocated_k=k on the root."""
+    root = {
+        "reward": 0.5,
+        "reward_std": 0.25,
+        "full_text": "Q",
+        "_request_object": {"_treetune__idx": 42, "problem": "1+1"},
+        "vdra_allocated_k": k,
+        "children": [
+            {
+                "text": f" seg{i}",
+                "full_text": f"Q seg{i}",
+                "reward": 0.4 + 0.1 * i,
+                "reward_std": 0.0,
+                "leaf": True,
+                "response_token_ids": [10 + i, 11 + i, 12 + i],
+                "actor_shifted_log_probs": [-0.1, -0.2, -0.3],
+                "sample_multiplicity": mark_multiplicity,
+            }
+            for i in range(k)
+        ],
+    }
+    return root
+
+
+def test_zero_advantage_realized_child_remains_in_parent_group():
+    # PLAN.md P0.1 acceptance: a zero-advantage realized child stays in the
+    # parent group (allocated_k rows preserved).
+    tree = _tree_with_alloc(k=3)
+    # Force one child's reward to equal the parent so its advantage is 0.
+    tree["children"][1]["reward"] = 0.5
+    edges = extract_edges_from_tree(
+        tree, only_adv_greater_than_zero=False, tree_update_mode="spo"
+    )
+    assert len(edges) == 3
+    zero_adv_rows = [e for e in edges if float(e["advantage"]) == 0.0]
+    assert len(zero_adv_rows) == 1
+
+
+def test_strict_fresh_iid_rejects_partial_realized_group():
+    # PLAN.md P0.1 acceptance: dropping a realized child breaks the invariant.
+    tree = _tree_with_alloc(k=3)
+    tree["children"].pop()  # only 2 realized rows for allocated_k=3
+    with pytest.raises(ValueError, match="fresh_iid"):
+        extract_edges_from_tree(
+            tree, only_adv_greater_than_zero=False, strict_fresh_iid=True
+        )
+
+
+def test_strict_fresh_iid_rejects_multiplicity_other_than_one():
+    tree = _tree_with_alloc(k=2, mark_multiplicity=3)
+    with pytest.raises(ValueError, match="sample_multiplicity"):
+        extract_edges_from_tree(
+            tree, only_adv_greater_than_zero=False, strict_fresh_iid=True
+        )

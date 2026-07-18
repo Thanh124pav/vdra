@@ -46,8 +46,11 @@ gear_tree:
   # TreeRL-style discount (only used by treerl_style_ablation).
   treerl_gamma: 0.9
 
-  # Drop edges whose pav_advantage == 0 (treetune default).
-  only_adv_greater_than_zero: true
+  # PLAN.md P0.1: main VDRA runs keep every realized child, including
+  # zero-advantage ones, so the parent denominator (|children_of_p|) matches
+  # allocated_k. Legacy treetune default was true (drop pav_advantage == 0);
+  # keep that option for the SPO baseline only.
+  only_adv_greater_than_zero: false
 
   replay_buffer:
     enabled: true
@@ -196,6 +199,19 @@ gear_tree:
     # Import path "module:callable" for allocation_proxy: external_score.
     external_score_module: null
 
+    # PLAN.md P0.5: rollout/scorer weight verification requires exactly one
+    # of the following two explicit modes:
+    #   (A) scorer_uses_rollout_server: true — the scorer replays log-probs
+    #       through the SAME vLLM server the rollout uses; one verified
+    #       weight version is sufficient.
+    #   (B) rollout_api_base + scorer_api_base — two independent endpoints;
+    #       the trainer fetches server-reported versions from each and fails
+    #       (strict_vdra) when they are missing or mismatched.
+    # Do NOT silently fall back from A to B.
+    scorer_uses_rollout_server: false
+    # Rollout endpoint used by the trainer to fetch the rollout replica's
+    # weight version. Leave empty in mode (A); required in mode (B).
+    rollout_api_base: null
     # OpenAI-compatible vLLM endpoint used to score log pi(y|prefix) for the
     # VDRA likelihood scoring. Missing endpoint is a startup error in strict mode.
     scorer_api_base: http://127.0.0.1:8000/v1

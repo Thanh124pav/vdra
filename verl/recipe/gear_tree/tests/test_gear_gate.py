@@ -239,6 +239,7 @@ class _MixedFinishPilotExpander:
 
 
 def test_estimate_node_async_records_shortcut_and_support_accounting():
+    # weighted_reuse is an efficiency ablation (PLAN.md P1.R7); opt into it.
     gate = GearGate(
         k_algorithm="budget_allocation",
         scorer=_DispersionScorer(),
@@ -246,7 +247,10 @@ def test_estimate_node_async_records_shortcut_and_support_accounting():
         pilot_branch_factor=3,
         likelihood_samples_per_distribution=1,
         pilot_execution_mode="weighted_reuse",
+        strict_vdra=False,
     )
+    # PLAN.md P0.4: TV estimator needs a terminal grader for shortcut pilots.
+    gate.set_terminal_reward_fn(lambda node: 1.0)
     node = {"full_text": "hot", "full_token_ids": [1], "gear_segment_id": "n0"}
     asyncio.run(
         gate.estimate_node_async(

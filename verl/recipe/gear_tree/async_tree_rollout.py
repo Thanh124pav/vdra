@@ -219,12 +219,13 @@ async def build_tree_edges_async(
     adv_method: str = "rloo",
     treepo_global_weight: float = 0.5,
     treerl_gamma: float = 0.9,
-    only_adv_greater_than_zero: bool = True,
+    only_adv_greater_than_zero: bool = False,
     vineppo_K: int = 0,
     unfinished_penalty: float = 0.0,
     demo_logger: Any = None,
     gear_node_expander: Any = None,
     policy_snapshot_id: Optional[str] = None,
+    strict_fresh_iid: bool = False,
 ) -> List[Dict[str, Any]]:
     """Build one tree via the async server and return its SPO/GEAR edges."""
 
@@ -259,10 +260,16 @@ async def build_tree_edges_async(
         except Exception:
             pass
 
+    # PLAN.md P0.1: administrative pruned=True rows must never enter DataProto
+    # (emit_pruned_edges=False), and every realized (non-pruned) child must
+    # remain — including zero-advantage ones — so the parent denominator
+    # equals allocated_k.
     edges = extract_edges_from_tree(
         tree, adv_method=adv_method, only_adv_greater_than_zero=only_adv_greater_than_zero,
         tree_update_mode=tree_update_mode, treepo_global_weight=treepo_global_weight,
         treerl_gamma=treerl_gamma,
+        emit_pruned_edges=False,
+        strict_fresh_iid=strict_fresh_iid,
     )
     if policy_snapshot_id is not None:
         for edge in edges:
@@ -561,13 +568,27 @@ try:  # keep CPU-importable when agent_loop isn't installed
                     "before generate_sequences (see PLAN.md P0.1)."
                 )
             snapshot_id = str(snapshot_id)
+            # PLAN.md P0.2: pass rollout_iteration + a per-row uuid so the
+            # tree builder mints a globally-unique tree_instance_id. The
+            # (snapshot, question, iteration) tuple alone would still let two
+            # trees generated for the same prompt in the same iteration
+            # collapse to one id; the extra uuid is the tiebreaker.
+            import uuid as _uuid
+
+            rollout_iteration = kwargs.get("rollout_iteration")
+            tree_instance_uuid = (
+                kwargs.get("tree_instance_uuid") or _uuid.uuid4().hex
+            )
             data_instance = {
                 "problem": extra.get("problem") or rm.get("problem"),
                 "answer": rm.get("ground_truth"),
                 "reward_model": rm,
                 "_treetune__idx": kwargs.get("index"),
+                "uid": kwargs.get("uid"),
                 "policy_snapshot_id": snapshot_id,
                 "current_rollout_snapshot_id": snapshot_id,
+                "rollout_iteration": rollout_iteration,
+                "tree_instance_uuid": tree_instance_uuid,
             }
 
             # P0.2 / P0.3: rebind the gate/scorer to THIS rollout's snapshot
@@ -598,6 +619,9 @@ try:  # keep CPU-importable when agent_loop isn't installed
 
                 self._gate.set_terminal_reward_fn(_terminal_grader)
 
+            # PLAN.md P0.1: default only_adv_greater_than_zero to False so the
+            # parent denominator matches the realized child count. Callers who
+            # need the legacy SPO baseline can still override to True.
             edges = await build_tree_edges_async(
                 prompt_text, prompt_ids, data_instance,
                 segment_generator=per_call_gen, reward_fn=self._reward_fn,
@@ -607,10 +631,19 @@ try:  # keep CPU-importable when agent_loop isn't installed
                 adv_method=self._gt.get("adv_method", "rloo"),
                 treepo_global_weight=self._gt.get("treepo_global_weight", 0.5),
                 treerl_gamma=self._gt.get("treerl_gamma", 0.9),
-                only_adv_greater_than_zero=self._gt.get("only_adv_greater_than_zero", True),
+                only_adv_greater_than_zero=self._gt.get("only_adv_greater_than_zero", False),
                 vineppo_K=self._gt.get("vineppo_K", 0),
                 gear_node_expander=self._node_expander,
                 policy_snapshot_id=snapshot_id,
+                strict_fresh_iid=bool(
+                    (self._gt.get("gear") or {}).get(
+                        "pilot_execution_mode", "fresh_iid"
+                    )
+                    == "fresh_iid"
+                    and bool(
+                        (self._gt.get("gear") or {}).get("strict_vdra", True)
+                    )
+                ),
             )
 
             # Placeholder response (first edge) keeps the AgentLoopOutput schema

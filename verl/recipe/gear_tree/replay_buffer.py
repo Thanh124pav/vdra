@@ -94,7 +94,19 @@ class GearTreeReplayBuffer:
                 raise ValueError(
                     "new edge policy_snapshot_id does not match current rollout snapshot"
                 )
-            self._edges[str(record["edge_id"])] = record
+            edge_id = str(record["edge_id"])
+            # PLAN.md P0.2: duplicate edge_ids indicate that two rollouts
+            # collapsed to the same (question, snapshot, path) tuple — either
+            # tree_instance_id was not made unique or a caller re-sent the
+            # same edge. Silently overwriting a live row would corrupt the
+            # per-parent group and mask a rollout-side bug.
+            if edge_id in self._edges:
+                raise ValueError(
+                    f"Replay edge {edge_id!r} is already in the buffer; "
+                    "duplicate edge_ids indicate the rollout did not assign a "
+                    "unique tree_instance_id (PLAN.md P0.2)."
+                )
+            self._edges[edge_id] = record
             count += 1
         self.metrics["added_edges"] += count
         return count

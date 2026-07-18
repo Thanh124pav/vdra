@@ -25,6 +25,8 @@ tree_policy:
   strict_group_integrity: true
 
 gear_tree:
+  # PLAN.md P0.1: main VDRA keeps every realized child (including zero-adv).
+  only_adv_greater_than_zero: false
   gear:
     enabled: true
     strict_vdra: true

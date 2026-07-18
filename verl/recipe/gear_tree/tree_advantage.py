@@ -32,18 +32,29 @@ def extract_edges_from_tree(
     tree: dict[str, Any],
     *,
     adv_method: str = "rloo",
-    only_adv_greater_than_zero: bool = True,
+    only_adv_greater_than_zero: bool = False,
     tree_update_mode: str = "spo",
     treepo_global_weight: float = 0.5,
     treerl_gamma: float = 0.9,
-    emit_pruned_edges: bool = True,
+    emit_pruned_edges: bool = False,
+    strict_fresh_iid: bool = False,
 ) -> list[dict[str, Any]]:
     """Extract treetune-compatible training edges from a generated tree.
 
     This ports ``TreeEpisodeUtils.extract_edges_from_tree`` while reading both
-    ``reward`` and legacy ``score`` fields. Pruned GEAR edges may be emitted with
-    zero advantage so downstream tensor shapes can remain aligned with rollout
-    rows; set ``emit_pruned_edges=False`` to drop them.
+    ``reward`` and legacy ``score`` fields.
+
+    PLAN.md P0.1: main VDRA runs must keep every realized child (including
+    zero-advantage ones) so the parent denominator ``|children_of_p|`` matches
+    ``allocated_k``. Administrative ``pruned=True`` placeholder rows must NOT
+    enter training nor the parent denominator; ``emit_pruned_edges`` defaults
+    to ``False``. Set to ``True`` only for diagnostic dumps.
+
+    ``strict_fresh_iid`` enforces the fresh_iid invariants right at edge
+    extraction:
+      * every realized (non-pruned) child has ``sample_multiplicity == 1``;
+      * for every parent, the count of realized children equals
+        ``vdra_allocated_k``.
     """
     edges: list[dict[str, Any]] = []
     tree_copy = copy.deepcopy(tree)
@@ -66,12 +77,15 @@ def extract_edges_from_tree(
         or data_instance.get("policy_snapshot_id")
         or data_instance.get("current_rollout_snapshot_id")
     )
-    # PLAN.md P0.N1: every tree has one stable tree_id. Prefer explicit tree
-    # metadata, then a dataset/rollout-provided value, and finally derive a
-    # stable id from question_id + snapshot so replay/tensorization keep the
-    # same group boundary across steps.
+    # PLAN.md P0.2: every stochastic tree has one globally-unique
+    # tree_instance_id stamped by the tree builder. Prefer it; fall back to
+    # legacy tree_id fields only to keep old fixtures working. The
+    # (snapshot, question) tuple must NEVER be used as a tree id in main runs
+    # — two rollouts for the same prompt in the same iteration would collide.
     tree_id = (
-        tree_copy.get("tree_id")
+        tree_copy.get("tree_instance_id")
+        or tree_copy.get("tree_id")
+        or data_instance.get("tree_instance_id")
         or data_instance.get("tree_id")
         or f"{policy_snapshot_id}:{question_id}"
     )
@@ -228,7 +242,49 @@ def extract_edges_from_tree(
     }
     for edge in edges:
         edge.setdefault("tree_summary", tree_summary)
+
+    # PLAN.md P0.1: fresh_iid invariants.
+    if strict_fresh_iid:
+        _enforce_fresh_iid_invariants(edges)
+
     return json.loads(json.dumps(edges))
+
+
+def _enforce_fresh_iid_invariants(edges: list[dict[str, Any]]) -> None:
+    """PLAN.md P0.1: assert per-parent realized rows == allocated_k and
+    sample_multiplicity == 1 across every realized child.
+
+    Pruned placeholders are excluded from ``edges`` upstream, so this check
+    only looks at realized training rows.
+    """
+    from collections import defaultdict
+
+    by_parent: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for edge in edges:
+        by_parent[str(edge.get("parent_group_id", ""))].append(edge)
+    failures: list[str] = []
+    for pgid, group in by_parent.items():
+        alloc_values = {int(e.get("allocated_k", 0) or 0) for e in group}
+        if len(alloc_values) != 1:
+            failures.append(
+                f"parent_group_id={pgid!r} has inconsistent allocated_k={alloc_values}"
+            )
+            continue
+        allocated_k = next(iter(alloc_values), 0)
+        mults = [int(e.get("sample_multiplicity", 1) or 1) for e in group]
+        if any(m != 1 for m in mults):
+            failures.append(
+                f"fresh_iid parent_group_id={pgid!r} has sample_multiplicity != 1: {mults}"
+            )
+        if allocated_k and len(group) != allocated_k:
+            failures.append(
+                f"fresh_iid parent_group_id={pgid!r} realized {len(group)} rows "
+                f"but allocated_k={allocated_k}"
+            )
+    if failures:
+        raise ValueError(
+            "fresh_iid invariants failed (PLAN.md P0.1):\n  " + "\n  ".join(failures)
+        )
 
 
 def token_fields_for_edges(

@@ -107,8 +107,13 @@ def test_manifest_reflects_canonical_vdra_config():
     )
     assert manifest.policy_aggregation == POLICY_AGGREGATION_VDRA
     assert manifest.advantage_mode == "spo_local"
-    assert manifest.complete_tree_replay is True
-    assert manifest.complete_parent_microbatches is True
+    # PLAN.md P0.6: operational bits are set from runtime observation, not
+    # from config. They start False.
+    assert manifest.complete_tree_replay is False
+    assert manifest.complete_parent_microbatches is False
+    assert manifest.fresh_iid_row_count_matches_allocated_k is False
+    assert manifest.node_balanced_invariants_passed is False
+    assert manifest.rollout_scorer_weights_verified is False
     # Startup value: main-run is invalid until fit() flips runtime bits.
     assert not is_valid_main_run(manifest)
     assert manifest.extras["actor_loss_mode"] == "vdra_node_balanced_ppo"
@@ -185,6 +190,8 @@ def test_manifest_persists_across_json_round_trip(tmp_path):
         gear_tree_cfg=cfg["gear_tree"],
         actor_loss_mode=cfg["actor_loss_mode"],
     )
+    # PLAN.md P0.6: flip the runtime bits by observing a clean batch.
+    update_manifest_from_edges(manifest, _fresh_iid_group(), strict=True)
     manifest.record_invariant_pass()
     manifest.rollout_scorer_weights_verified = True
     path = tmp_path / "vdra_run_manifest.json"
