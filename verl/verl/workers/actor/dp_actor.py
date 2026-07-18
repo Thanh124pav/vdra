@@ -379,16 +379,18 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("rollout_is_weights")
         if "edge_weights" in data.batch.keys():
             select_keys.append("edge_weights")
-        # PLAN.md P0.N4/N5: forward the row-level group tensors emitted by
-        # ``tree_data.edges_to_dataproto`` to the node-balanced PPO loss.
+        # PLAN.md P0.N4/N5/P0.3: forward the row-level group tensors emitted
+        # by ``tree_data.edges_to_dataproto`` to the node-balanced PPO loss.
         # Legacy losses ignore them; the vdra_node_balanced_ppo loss reduces
-        # child -> parent -> tree through them.
+        # child -> parent -> tree through them, or uses objective_weights
+        # directly when precomputed.
         for key in (
             "parent_group_ids",
             "tree_group_ids",
             "queue_group_ids",
             "allocated_k",
             "sample_multiplicity",
+            "objective_weights",
         ):
             if key in data.batch.keys():
                 select_keys.append(key)
@@ -440,7 +442,20 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
-                    if self.config.use_dynamic_bsz:
+                    # PLAN.md P0.4: the canonical VDRA loss returns a globally
+                    # weighted sum (sum_row w_row * child_loss_row), so summing
+                    # across microbatches already reproduces the full-batch
+                    # weighted objective. Re-scaling by 1/gradient_accumulation
+                    # (or by response_mask.shape[0]/ppo_mini_batch_size) would
+                    # divide by the microbatch count a second time. Keep the
+                    # legacy scaling for `treetune_ppo` / vanilla losses.
+                    vdra_mode = (
+                        str(self.config.policy_loss.get("loss_mode", "vanilla"))
+                        == "vdra_node_balanced_ppo"
+                    )
+                    if vdra_mode:
+                        loss_scale_factor = 1.0
+                    elif self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
@@ -487,14 +502,16 @@ class DataParallelPPOActor(BasePPOActor):
                     }
                     if edge_weights is not None and "edge_weights" in policy_loss_fn.__code__.co_varnames:
                         loss_kwargs["edge_weights"] = edge_weights
-                    # PLAN.md P0.N5: pass VDRA group tensors to any loss that
-                    # declares them (currently vdra_node_balanced_ppo).
+                    # PLAN.md P0.N5/P0.3: pass VDRA group tensors and the
+                    # precomputed objective_weights to any loss that declares
+                    # them (currently vdra_node_balanced_ppo).
                     for group_key in (
                         "parent_group_ids",
                         "tree_group_ids",
                         "queue_group_ids",
                         "allocated_k",
                         "sample_multiplicity",
+                        "objective_weights",
                     ):
                         maybe = model_inputs.get(group_key, None)
                         if maybe is not None and group_key in policy_loss_fn.__code__.co_varnames:

@@ -205,31 +205,22 @@ class RayGearTreeTrainer(RayPPOTrainer):
         return len(sampled_edges) < target and len(sampled_edges) % ppo_mini != 0
 
     def _fetch_rollout_server_weight_version(self, gear_cfg: Dict[str, Any]) -> str | None:
-        """P0.1: server-reported weight version for the rollout replica.
-
-        The trainer probes the SAME endpoint the scorer probes, so a mismatch
-        between the two fingerprints proves the replicas have diverged. We do
-        not treat a missing server fingerprint as a passing weight-version
-        verification — the return value is either a non-empty string or None.
+        """PLAN.md P0.5: delegate to :func:`scorer_verification.fetch_rollout_weight_version`
+        so the two-mode contract can be unit-tested on CPU.
         """
+        from recipe.gear_tree.scorer_verification import fetch_rollout_weight_version
 
-        api_base = gear_cfg.get("rollout_api_base") or gear_cfg.get("scorer_api_base")
-        if not api_base:
-            return None
         try:
             from recipe.gear_tree.gear_core.gear.vllm_scorer import (
                 fetch_server_weight_version,
             )
         except Exception:
+            if bool(gear_cfg.get("strict_vdra", True)):
+                raise
             return None
-        try:
-            return fetch_server_weight_version(
-                str(api_base),
-                api_key=str(gear_cfg.get("scorer_api_key", "EMPTY")),
-                timeout=float(gear_cfg.get("scorer_version_timeout", 5.0)),
-            )
-        except Exception:
-            return None
+        return fetch_rollout_weight_version(
+            gear_cfg, fetch_fn=fetch_server_weight_version
+        )
 
     def _generate_tree_edges(self, gen_batch: DataProto) -> List[Dict[str, Any]]:
         """Run tree rollout and return raw replayable edge records."""
@@ -240,12 +231,22 @@ class RayGearTreeTrainer(RayPPOTrainer):
         gear_cfg = gt.setdefault("gear", {})
         if isinstance(gear_cfg, dict):
             gear_cfg["policy_snapshot_id"] = snapshot_id
-        # P0.1: fetch the rollout server's own weight version once per
-        # generation. TreeAgentLoop.run reads
+        # PLAN.md P0.5: fetch the rollout server's own weight version once
+        # per generation. TreeAgentLoop.run reads
         # non_tensor_batch['rollout_server_weight_version'] and passes it to
         # gate.bind_snapshot, which lets the strict-mode gate refuse to
-        # continue when the scorer's server fingerprint diverges.
+        # continue when the scorer's server fingerprint diverges. Record the
+        # observed verification result on the manifest.
         rollout_server_version = self._fetch_rollout_server_weight_version(gear_cfg)
+        if getattr(self, "run_manifest", None) is not None:
+            verified = bool(rollout_server_version)
+            self.run_manifest.rollout_scorer_weights_verified = verified
+            self.run_manifest.extras["rollout_server_weight_version"] = (
+                rollout_server_version if rollout_server_version else None
+            )
+            self.run_manifest.extras["scorer_uses_rollout_server"] = bool(
+                gear_cfg.get("scorer_uses_rollout_server", False)
+            )
         gen_batch.meta_info["gear_tree_config"] = gt
         gen_batch.meta_info["global_steps"] = self.global_steps
         gen_batch.meta_info["rollout_iteration"] = getattr(self, "rollout_iteration", 0)
@@ -264,6 +265,19 @@ class RayGearTreeTrainer(RayPPOTrainer):
         gen_batch.non_tensor_batch["current_rollout_snapshot_id"] = snapshot_col
         gen_batch.non_tensor_batch["rollout_server_weight_version"] = np.array(
             [rollout_server_version] * row_count, dtype=object
+        )
+        # PLAN.md P0.2: send the rollout_iteration and a per-row uuid to the
+        # agent loop so each stochastic tree gets a globally-unique
+        # tree_instance_id. The uuid is redundant with the counter fallback in
+        # tree_rollout.make_tree_instance_id but is preferred because it makes
+        # replay/tensorization idempotent regardless of worker scheduling.
+        import uuid as _uuid
+
+        gen_batch.non_tensor_batch["rollout_iteration"] = np.array(
+            [self.rollout_iteration] * row_count, dtype=object
+        )
+        gen_batch.non_tensor_batch["tree_instance_uuid"] = np.array(
+            [_uuid.uuid4().hex for _ in range(row_count)], dtype=object
         )
         backend = gt.get("rollout_backend", "async")
         if backend != "async":
@@ -286,15 +300,27 @@ class RayGearTreeTrainer(RayPPOTrainer):
         normalized: List[Dict[str, Any]] = []
         for idx, edge in enumerate(edges):
             record = dict(edge)
-            # P1.5: deterministic edge id = stable hash of the identifying
-            # tuple, so replay sampling is reproducible across restarts and
-            # across worker processes. Falls back to (snapshot,idx) when
-            # some of the source fields are missing.
-            parent_path = record.get("parent_path") or record.get("gear_parent_segment_id", "")
-            tree_id = record.get("tree_id", record.get("gear_segment_id", ""))
+            # PLAN.md P0.2: derive the edge_id from the unique tree_instance_id
+            # + parent_group_id + child_segment_id so two rollouts for the
+            # same (question, snapshot) tuple never produce the same edge_id.
+            # Falls back to legacy fields to keep old fixtures/tests working.
+            tree_id = (
+                record.get("tree_id")
+                or record.get("tree_instance_id")
+                or record.get("gear_segment_id", "")
+            )
+            parent_group = (
+                record.get("parent_group_id")
+                or record.get("parent_path")
+                or record.get("gear_parent_segment_id", "")
+            )
+            child_seg = (
+                record.get("child_segment_id")
+                or record.get("gear_segment_id")
+                or str(record.get("child_index", idx))
+            )
             qid = record.get("question_id", "")
-            child_index = record.get("child_index", idx)
-            key = f"{snapshot_id}|{qid}|{tree_id}|{parent_path}|{child_index}"
+            key = f"{snapshot_id}|{qid}|{tree_id}|{parent_group}|{child_seg}"
             digest = hashlib.blake2b(key.encode("utf-8"), digest_size=16).hexdigest()
             record.setdefault("edge_id", f"{snapshot_id}:{digest}")
             record.setdefault("policy_snapshot_id", snapshot_id)

@@ -56,10 +56,11 @@ def build_edge_batch(
     adv_method: str = "rloo",
     treepo_global_weight: float = 0.5,
     treerl_gamma: float = 0.9,
-    only_adv_greater_than_zero: bool = True,
+    only_adv_greater_than_zero: bool = False,
     vineppo_K: int = 0,
     unfinished_penalty: float = 0.0,
     demo_logger: Any = None,
+    strict_fresh_iid: bool = False,
 ):
     """Build the flat edge-batch ``DataProto`` for a batch of prompts.
 
@@ -138,6 +139,8 @@ def build_edge_batch(
             except Exception:
                 pass
 
+        # PLAN.md P0.1: exclude pruned placeholders; keep zero-advantage
+        # realized children so the parent denominator matches allocated_k.
         edges = extract_edges_from_tree(
             tree,
             adv_method=adv_method,
@@ -145,6 +148,8 @@ def build_edge_batch(
             tree_update_mode=tree_update_mode,
             treepo_global_weight=treepo_global_weight,
             treerl_gamma=treerl_gamma,
+            emit_pruned_edges=False,
+            strict_fresh_iid=strict_fresh_iid,
         )
         all_edges.extend(edges)
 

@@ -150,3 +150,68 @@ def test_commit_removes_only_reserved_edges():
     assert tuple(removed) == reservation.edge_ids
     assert len(buf) == 1
     assert {edge["edge_id"] for edge in buf.edges()}.isdisjoint(reservation.edge_ids)
+
+
+def test_add_raises_on_duplicate_edge_id():
+    # PLAN.md P0.2: duplicate edge_ids indicate the rollout did not stamp a
+    # unique tree_instance_id. ReplayBuffer.add must raise, never silently
+    # overwrite.
+    import pytest
+
+    buf = _buffer()
+    buf.add([_edge("dup")], generation_step=0, policy_snapshot_id="snap")
+    with pytest.raises(ValueError, match="tree_instance_id"):
+        buf.add([_edge("dup", advantage=2.0)], generation_step=0, policy_snapshot_id="snap")
+
+
+def test_two_trees_for_same_question_and_snapshot_have_distinct_ids():
+    # PLAN.md P0.2 acceptance: two independent trees for the same
+    # (question, snapshot, iteration) tuple must not collapse to one id.
+    from recipe.gear_tree.tree_rollout import make_tree_instance_id
+
+    a = make_tree_instance_id(
+        policy_snapshot_id="snap",
+        rollout_iteration=1,
+        stable_question_id="q42",
+    )
+    b = make_tree_instance_id(
+        policy_snapshot_id="snap",
+        rollout_iteration=1,
+        stable_question_id="q42",
+    )
+    assert a != b
+
+
+def test_tree_instance_id_survives_json_roundtrip():
+    import json
+
+    from recipe.gear_tree.tree_rollout import make_tree_instance_id
+
+    tid = make_tree_instance_id(
+        policy_snapshot_id="global_step:7",
+        rollout_iteration=3,
+        stable_question_id="q99",
+        tree_instance_uuid="abc123",
+    )
+    dumped = json.dumps({"tree_id": tid})
+    loaded = json.loads(dumped)
+    assert loaded["tree_id"] == tid
+
+
+def test_two_trees_edges_coexist_in_replay():
+    # PLAN.md P0.2 acceptance: their edges coexist in replay without collision.
+    from recipe.gear_tree.tree_rollout import make_tree_instance_id
+    import hashlib
+
+    buf = _buffer()
+    edges = []
+    for _ in range(2):
+        tid = make_tree_instance_id(
+            policy_snapshot_id="snap",
+            rollout_iteration=0,
+            stable_question_id="q42",
+        )
+        digest = hashlib.blake2b(tid.encode("utf-8"), digest_size=8).hexdigest()
+        edges.append(_edge(f"e:{digest}", question_id="q42"))
+    buf.add(edges, generation_step=0, policy_snapshot_id="snap")
+    assert len(buf) == 2

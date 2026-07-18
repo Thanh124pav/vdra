@@ -71,6 +71,125 @@ def group_tensors_for_edges(edges: Sequence[Dict[str, Any]]) -> Dict[str, torch.
     }
 
 
+def compute_objective_weights(edges: Sequence[Dict[str, Any]]) -> List[float]:
+    """PLAN.md P0.3: precompute the exact objective weight for every row.
+
+    For every realized child ``j`` of parent ``p`` in tree ``T``:
+
+        w_{p,j} = (1 / N_tree) * (1 / |P(T)|) * (m_{p,j} / sum_j' m_{p,j'})
+
+    where ``N_tree`` is the number of distinct ``tree_id`` in the batch,
+    ``|P(T)|`` is the number of distinct realized parent groups in tree
+    ``T``, and ``m_{p,j}`` is the child's ``sample_multiplicity`` (``1`` under
+    ``fresh_iid``). The returned list is aligned with ``edges`` row-for-row
+    and sums to ``1`` over the whole batch.
+    """
+    from collections import defaultdict
+
+    if not edges:
+        return []
+
+    # Group edges by tree, then by parent group.
+    trees: Dict[str, Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
+    for row, edge in enumerate(edges):
+        tid = str(edge.get("tree_id", ""))
+        pgid = str(edge.get("parent_group_id", ""))
+        trees[tid][pgid].append(row)
+
+    n_tree = len(trees)
+    weights = [0.0] * len(edges)
+    for tid, parents in trees.items():
+        p_count = len(parents)
+        for pgid, rows in parents.items():
+            mults = [
+                max(int(edges[r].get("sample_multiplicity", 1) or 1), 1)
+                for r in rows
+            ]
+            total_m = float(sum(mults))
+            for r, m in zip(rows, mults):
+                weights[r] = (1.0 / n_tree) * (1.0 / p_count) * (m / total_m)
+    return weights
+
+
+def validate_objective_weights(
+    edges: Sequence[Dict[str, Any]],
+    weights: Sequence[float],
+    *,
+    atol: float = 1e-6,
+) -> Dict[str, Any]:
+    """PLAN.md P0.3: enforce the three normalization invariants.
+
+        sum_j local_child_weight[p, j] == 1 for every parent
+        sum_p parent_weight[T, p]      == 1 for every tree
+        sum_all_rows objective_weights == 1
+
+    Raises ``ValueError`` on any failure. Returns a small diagnostics dict.
+    """
+    from collections import defaultdict
+
+    if len(edges) != len(weights):
+        raise ValueError(
+            f"objective_weights length {len(weights)} != edges length {len(edges)}"
+        )
+    if not edges:
+        return {
+            "vdra/objective_weight_sum": 0.0,
+            "vdra/objective_weight_tree_count": 0,
+        }
+
+    trees: Dict[str, Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
+    for row, edge in enumerate(edges):
+        trees[str(edge.get("tree_id", ""))][str(edge.get("parent_group_id", ""))].append(row)
+
+    n_tree = len(trees)
+    failures: List[str] = []
+    total = 0.0
+    max_parent_err = 0.0
+    max_tree_err = 0.0
+    for tid, parents in trees.items():
+        p_count = len(parents)
+        tree_mass = 0.0
+        for pgid, rows in parents.items():
+            local_sum = sum(weights[r] for r in rows)
+            expected_local = 1.0 / (n_tree * p_count)
+            if abs(local_sum - expected_local) > atol:
+                failures.append(
+                    f"parent {pgid!r} in tree {tid!r}: sum(w) = {local_sum!r}, "
+                    f"expected 1/(N_tree*|P(T)|) = {expected_local!r}"
+                )
+            # Local child fractions must sum to 1 per parent.
+            if local_sum > 0:
+                mults = [max(int(edges[r].get("sample_multiplicity", 1) or 1), 1) for r in rows]
+                total_m = float(sum(mults))
+                for r, m in zip(rows, mults):
+                    local_frac = weights[r] / local_sum
+                    if abs(local_frac - (m / total_m)) > atol:
+                        max_parent_err = max(
+                            max_parent_err, abs(local_frac - (m / total_m))
+                        )
+            tree_mass += local_sum
+        expected_tree = 1.0 / n_tree
+        if abs(tree_mass - expected_tree) > atol:
+            failures.append(
+                f"tree {tid!r}: sum(w) = {tree_mass!r}, expected 1/N_tree = {expected_tree!r}"
+            )
+        max_tree_err = max(max_tree_err, abs(tree_mass - expected_tree))
+        total += tree_mass
+    if abs(total - 1.0) > atol:
+        failures.append(f"batch sum(w) = {total!r} != 1")
+    if failures:
+        raise ValueError(
+            "objective_weights normalization failed (PLAN.md P0.3):\n  "
+            + "\n  ".join(failures)
+        )
+    return {
+        "vdra/objective_weight_sum": float(total),
+        "vdra/objective_weight_tree_count": int(n_tree),
+        "vdra/objective_weight_parent_max_err": float(max_parent_err),
+        "vdra/objective_weight_tree_max_err": float(max_tree_err),
+    }
+
+
 def compute_group_metrics(edges: Sequence[Dict[str, Any]]) -> Dict[str, float]:
     """PLAN.md P0.N7 runtime metrics.
 
@@ -365,6 +484,14 @@ def edges_to_dataproto(
     # without a second pass over non-tensor metadata.
     for key, value in group_tensors_for_edges(edges).items():
         batch[key] = value
+
+    # PLAN.md P0.3: precompute exact objective weights on the full batch and
+    # attach them as a row-level tensor. The actor loss (P0.4) reduces
+    # sum(objective_weights * child_loss), so mini/microbatch splits give
+    # gradients exactly equal to the full-batch weighted sum.
+    obj_weights = compute_objective_weights(edges)
+    validate_objective_weights(edges, obj_weights)
+    batch["objective_weights"] = torch.tensor(obj_weights, dtype=torch.float32)
 
     non_tensor_batch = {
         "uid": np.array(uids, dtype=object),
