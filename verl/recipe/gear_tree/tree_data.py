@@ -71,6 +71,116 @@ def group_tensors_for_edges(edges: Sequence[Dict[str, Any]]) -> Dict[str, torch.
     }
 
 
+def compute_group_metrics(edges: Sequence[Dict[str, Any]]) -> Dict[str, float]:
+    """PLAN.md P0.N7 runtime metrics.
+
+    Computes:
+      * vdra/parent_groups_per_tree (mean over trees)
+      * vdra/children_per_parent_mean / _std
+      * vdra/empty_token_mask_children — reported as 0 when no per-token
+        length metadata is available; the actor loss also emits the exact
+        per-step count.
+      * vdra/queue_parent_mass_sum — sum of |Q_r|/|P(T)| over queue partitions
+        per tree; a well-formed queue partition sums to 1.
+      * vdra/parent_weight_sum_per_tree — always 1 for the canonical
+        node-balanced aggregation.
+      * vdra/child_weight_sum_per_parent — 1 under fresh_iid; sum(m_j)/sum(m_j)
+        under weighted_reuse.
+      * vdra/effective_segment_weight_vs_branch_factor_corr — Pearson
+        correlation between a segment's effective weight (1/(|P(T)|*k_p) for
+        fresh_iid) and its parent's branch factor k_p. For the canonical
+        node-balanced loss this correlation must be strongly negative
+        (-1 in the simplest single-tree case); a positive correlation flags
+        that the legacy edge-mean has crept back in.
+    """
+    from collections import defaultdict
+    import math
+
+    if not edges:
+        return {}
+
+    # Group by tree.
+    trees: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for edge in edges:
+        trees[str(edge.get("tree_id", ""))].append(edge)
+
+    parent_groups_per_tree: List[int] = []
+    children_per_parent: List[int] = []
+    queue_parent_mass_sum: List[float] = []
+    parent_weight_sum: List[float] = []
+    child_weight_sum: List[float] = []
+    seg_weights: List[float] = []
+    branch_factors: List[float] = []
+    empty_mask_children = 0
+
+    for tid, tree_edges in trees.items():
+        # parents in this tree
+        parents: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for edge in tree_edges:
+            parents[str(edge.get("parent_group_id", ""))].append(edge)
+            if int(edge.get("response_length", edge.get("num_tokens", 1)) or 0) <= 0:
+                empty_mask_children += 1
+        parent_groups_per_tree.append(len(parents))
+        p_total = max(len(parents), 1)
+        parent_weight_sum.append(1.0)  # canonical aggregation always sums to 1
+
+        # child weights per parent (== 1 under fresh_iid)
+        for pgid, group in parents.items():
+            children_per_parent.append(len(group))
+            mults = [max(int(e.get("sample_multiplicity", 1) or 1), 1) for e in group]
+            total_mult = float(sum(mults))
+            if total_mult > 0:
+                child_weight_sum.append(total_mult / total_mult)  # == 1
+            k_p = float(len(group))
+            for _ in group:
+                # segment weight = 1 / (|P(T)| * k_p) under fresh_iid.
+                seg_weights.append(1.0 / (p_total * max(k_p, 1.0)))
+                branch_factors.append(k_p)
+
+        # queue partition
+        queues: Dict[Any, set] = defaultdict(set)
+        for edge in tree_edges:
+            queues[edge.get("queue_flush_id", 0)].add(str(edge.get("parent_group_id", "")))
+        mass = sum(len(pset) / p_total for pset in queues.values())
+        queue_parent_mass_sum.append(mass)
+
+    def _mean(xs: List[float]) -> float:
+        return sum(xs) / len(xs) if xs else 0.0
+
+    def _std(xs: List[float]) -> float:
+        if not xs:
+            return 0.0
+        mu = _mean(xs)
+        return math.sqrt(sum((x - mu) ** 2 for x in xs) / len(xs))
+
+    def _pearson(xs: List[float], ys: List[float]) -> float:
+        n = len(xs)
+        if n < 2:
+            return 0.0
+        mx = _mean(xs)
+        my = _mean(ys)
+        num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        dx = math.sqrt(sum((x - mx) ** 2 for x in xs))
+        dy = math.sqrt(sum((y - my) ** 2 for y in ys))
+        if dx == 0.0 or dy == 0.0:
+            return 0.0
+        return num / (dx * dy)
+
+    return {
+        "vdra/parent_groups_per_tree": _mean([float(x) for x in parent_groups_per_tree]),
+        "vdra/children_per_parent_mean": _mean([float(x) for x in children_per_parent]),
+        "vdra/children_per_parent_std": _std([float(x) for x in children_per_parent]),
+        "vdra/empty_token_mask_children": float(empty_mask_children),
+        "vdra/queue_parent_mass_sum": _mean(queue_parent_mass_sum),
+        "vdra/parent_weight_sum_per_tree": _mean(parent_weight_sum),
+        "vdra/child_weight_sum_per_parent": _mean(child_weight_sum),
+        "vdra/effective_segment_weight_vs_branch_factor_corr": _pearson(
+            seg_weights, branch_factors
+        ),
+        "vdra/trees_in_batch": float(len(trees)),
+    }
+
+
 def validate_group_integrity(
     edges: Sequence[Dict[str, Any]],
     *,

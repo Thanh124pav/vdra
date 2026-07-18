@@ -152,6 +152,34 @@ class RayGearTreeTrainer(RayPPOTrainer):
             segment_length=int(gt.get("segment_length", 0) or 0),
             model_context_length=model_context,
         )
+        # PLAN.md P1.R7: refuse the deprecated ablation `_original` names in
+        # strict main runs, and refuse to combine the *_style_ablation modes
+        # with the canonical vdra_node_balanced policy aggregation (they are
+        # ablations, not main-paper losses). The gate's own strict checks
+        # cover pilot_execution_mode and allocation_runtime.
+        gear_cfg = gt.get("gear") or {}
+        strict = bool(gear_cfg.get("strict_vdra", True))
+        tree_update_mode = str(gt.get("tree_update_mode", "spo"))
+        tree_policy = self.config.get("tree_policy") or {}
+        policy_agg = str(tree_policy.get("policy_aggregation", "legacy_token_mean"))
+        if strict:
+            if tree_update_mode in {"treepo_original", "treerl_original"}:
+                raise ValueError(
+                    "strict VDRA main runs must not use the deprecated "
+                    "tree_update_mode aliases (PLAN.md P1.R7); rename to "
+                    "'*_style_ablation' or set strict_vdra=false."
+                )
+            if (
+                policy_agg == "vdra_node_balanced"
+                and tree_update_mode
+                in {"treepo_style_ablation", "treerl_style_ablation"}
+            ):
+                raise ValueError(
+                    "The style-ablation tree_update_modes are not main-paper "
+                    "advantage estimators (PLAN.md P1.R7). Use "
+                    "tree_update_mode='spo' with policy_aggregation="
+                    "'vdra_node_balanced' for the main run."
+                )
 
     def _should_postpone_sampled_update(self, sampled_edges: List[Dict[str, Any]]) -> bool:
         replay_cfg = self._replay_config()

@@ -278,6 +278,36 @@ class GearGate:
     def validate_main_config(self, *, max_default_branch_factor: int, segment_length: Optional[int]) -> None:
         if not self.strict_vdra:
             return
+        # PLAN.md P1.R5: the legacy `simulation_lemma` bound_form is not paper-
+        # safe under `tail_mode: none`. Refuse to start a strict main run that
+        # combines the two; explicit ablation experiments can lower
+        # strict_vdra=false or set bound_form=linear.
+        if getattr(self.cfg, "bound_form", "linear") == "simulation_lemma" and (
+            float(getattr(self.cfg, "eps_tail", 0.0) or 0.0) == 0.0
+            and not getattr(self.cfg, "eps_tail_by_depth", None)
+        ):
+            raise ValueError(
+                "strict VDRA refuses bound_form='simulation_lemma' without a "
+                "calibrated eps_tail (PLAN.md P1.R5). Use bound_form='linear' "
+                "for the main run, or set gear.tail_mode='calibrated' with an "
+                "explicit eps_tail source for the ablation."
+            )
+        # PLAN.md P1.R7: freeze unsupported paths from main claims.
+        # weighted_reuse, depth_batch, treerl_style_ablation, treepo_style_ablation
+        # remain runnable ablations but must be opted into with strict_vdra=false.
+        if self.pilot_execution_mode == "weighted_reuse":
+            raise ValueError(
+                "strict VDRA main runs do not use weighted_reuse "
+                "(PLAN.md P1.R7); it is an efficiency ablation. Either set "
+                "pilot_execution_mode='fresh_iid' or set strict_vdra=false."
+            )
+        if self.allocation_runtime == "depth_batch":
+            raise ValueError(
+                "strict VDRA main runs use the online timeout allocator "
+                "(PLAN.md P1.R7). depth_batch is a legacy ablation runtime. "
+                "Either set allocation_runtime='online_timeout' or "
+                "strict_vdra=false."
+            )
         if (
             self.pilot_execution_mode == "weighted_reuse"
             and self.tv_first_phase_tokens > int(segment_length or self.tv_first_phase_tokens)
@@ -308,15 +338,20 @@ class GearGate:
                 "strict VDRA requires rollout temperature=1.0 and top_p=1.0 "
                 "unless scorer likelihoods implement the same transformed distribution."
             )
+        # PLAN.md P1.R6: the previous "pilot_branch_factor > max_default_branch_factor"
+        # rejection is dropped. The residual-budget allocator does not require
+        # k0 > max_default_bf: predicted_k can equal or exceed the default
+        # branch factor via the tail correction, and configurations such as
+        # tree_shape=[8,8,8] with pilot_branch_factor=8 must be accepted so
+        # long as the budget solver reports a feasible allocation. Keep the
+        # config check for a coarse lower bound only (pilot must be >= 2).
         if (
             self.k_algorithm == "budget_allocation"
-            and self.use_residual_budget
-            and self.pilot_branch_factor_for(max_default_branch_factor) <= int(max_default_branch_factor)
+            and self.pilot_branch_factor_for(max_default_branch_factor) < 2
         ):
             raise ValueError(
-                "The current cluster-count k predictor requires "
-                "pilot_branch_factor > max default branch factor "
-                "for positive unmet demand and residual redistribution."
+                "pilot_branch_factor must be >= 2 for the VDRA cluster/TV "
+                "estimator (PLAN.md P1.R6)."
             )
 
     def pilot_branch_factor_for(self, branch_factor: int) -> int:
