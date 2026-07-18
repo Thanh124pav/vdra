@@ -40,8 +40,14 @@ jobs:
           # tree data helpers that live under verl/. Install the CPU torch
           # wheel and the small set of gear-tree deps so the correctness
           # tests can run in CI as well.
+          # ``ray`` is imported at ``verl/__init__.py`` load time (via
+          # ``verl.protocol``), so ``from verl import DataProto`` — used by
+          # every gear_tree tree_data / policy_loss test — fails to collect
+          # without it. Install ``ray[default]==2.35.*`` to keep the CPU
+          # image lean; the tests never call into ray runtime.
           pip install --index-url https://download.pytorch.org/whl/cpu torch
           pip install tensordict transformers codetiming pylatexenc
+          pip install "ray>=2.35,<2.40"
 
       - name: Install the local package
         run: pip install -e .
