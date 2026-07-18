@@ -2,57 +2,157 @@
 
 ## Goal
 
-Complete every task below before launching a GPU smoke run. After the checklist passes, no known algorithmic, batching, replay, metadata, config, or CPU-integration blocker should remain. GPU smoke may still expose CUDA, Ray, vLLM, FSDP, memory, or distributed-runtime issues.
+Complete every task below before launching a GPU smoke run. After this checklist passes, no known algorithmic, batching, replay, metadata, config, or CPU-integration blocker should remain. GPU smoke may still expose CUDA, Ray, vLLM, FSDP, memory, or distributed-runtime issues.
 
 Canonical main path:
 
 ```text
 fixed-length SPO-style segments
-+ VDRA online allocation
++ VDRA online rollout allocation
 + fresh_iid final children
 + SPO local segment advantage
-+ allocation-invariant node-balanced PPO
++ GRPO-style global segment-average PPO update
 ```
+
+Canonical tree update:
+
+\[
+\widehat g_T
+=
+\frac{1}{N_{\mathrm{seg}}(T)}
+\sum_{s\in\mathcal S(T)} A_s H_s
+=
+\sum_q
+\frac{n_q}{N_{\mathrm{seg}}(T)}
+\left(
+\frac{1}{n_q}
+\sum_{s\in\mathcal S_q} A_s H_s
+\right),
+\]
+
+where:
+
+```text
+S(T)       = all realized, non-placeholder training segments in tree T
+N_seg(T)   = |S(T)|
+S_q        = segments released from queue flush q
+n_q        = |S_q|
+H_s        = sum of active token log-probability gradients in segment s
+```
+
+The queue expression is only a regrouping of the same global segment average. It must not introduce parent-balanced weights, queue-specific optimization weights, or a new optimizer.
 
 Do not launch a long training run until `scripts/pre_gpu_check.sh` and CPU CI both pass.
 
 ---
 
-## P0.1 — Preserve the correct child sample set
+## P0.1 — Remove the incorrect node-balanced main objective
 
 **Targets**
 
 ```text
 verl/recipe/gear_tree/config/gear_tree_trainer.yaml
-verl/recipe/gear_tree/tree_advantage.py
+verl/recipe/gear_tree/policy_loss.py
+verl/verl/workers/actor/dp_actor.py
+verl/recipe/gear_tree/run_manifest.py
+verl/recipe/gear_tree/manifest_lifecycle.py
 ```
 
 **Required changes**
 
-- Set the main VDRA config to:
-
-```yaml
-only_adv_greater_than_zero: false
-```
-
-- Keep every realized child, including children whose final advantage is zero.
-- Exclude administrative `pruned=True` placeholder rows from training and from the parent denominator.
-- In `fresh_iid`, require:
+- Main VDRA must use a segment-average loss, for example:
 
 ```text
-number of realized training rows for parent p == allocated_k[p]
-sample_multiplicity == 1 for every realized child
+loss_mode = vdra_segment_mean_ppo
+policy_aggregation = global_segment_mean
+```
+
+- `vdra_node_balanced_ppo` must not be selected by the main config.
+- It may be removed or retained only as a clearly labeled ablation.
+- Remove `objective_weights` and all parent-balanced normalization requirements from the main path.
+- `parent_group_id`, `allocated_k`, and `sample_multiplicity` may remain as rollout/integrity metadata, but must not determine main-policy importance.
+- Queue ratios must not be passed as optimization weights.
+- Keep `treetune_ppo` unchanged as the legacy SPO baseline.
+
+**Acceptance tests**
+
+- Main config selects `global_segment_mean`.
+- Main loss is unchanged when the same segments are regrouped into different parent groups.
+- Main loss is unchanged when queue labels are permuted.
+- Main loss differs from the parent-balanced objective on a non-uniform tree.
+
+---
+
+## P0.2 — Count the correct segment set while allowing zero-advantage filtering
+
+**Targets**
+
+```text
+verl/recipe/gear_tree/tree_rollout.py
+verl/recipe/gear_tree/async_tree_rollout.py
+verl/recipe/gear_tree/tree_advantage.py
+verl/recipe/gear_tree/tree_data.py
+```
+
+**Required changes**
+
+- `only_adv_greater_than_zero` may remain enabled for compute efficiency.
+- A realized segment with `A_s = 0` may be omitted from `DataProto`, because its contribution is zero.
+- The denominator must still count that segment.
+- For every tree, compute before advantage filtering:
+
+```text
+tree_total_segment_count = N_seg(T)
+```
+
+- For every queue flush, compute before advantage filtering:
+
+```text
+queue_released_segment_count[q] = n_q
+```
+
+- Count only realized segment samples.
+- Exclude administrative `pruned=True` placeholders from both numerator and denominator.
+- Preserve `tree_total_segment_count` on every retained edge from that tree.
+- Preserve `queue_flush_id` and queue counts for logging/theoretical validation only.
+- In `fresh_iid`, preserve:
+
+```text
+allocated_k
+realized_child_count
+sample_multiplicity == 1
+```
+
+- Do not require retained-row count to equal `allocated_k` after zero-advantage filtering.
+- Instead require:
+
+```text
+retained_row_count <= realized_child_count == allocated_k
 ```
 
 **Acceptance tests**
 
-- A zero-advantage realized child remains in the parent group.
-- A pruned placeholder does not enter `DataProto` or the loss.
-- Removing either behavior causes `validate_group_integrity` to fail.
+For one tree with four realized segments and contributions `[2, 0, 0, 0]`:
+
+```text
+retained rows may contain only the first segment
+tree_total_segment_count == 4
+final tree contribution == 2 / 4
+```
+
+Also verify:
+
+- zero-advantage filtering does not change the loss;
+- a pruned placeholder does not change `N_seg(T)`;
+- queue counts sum to the tree count:
+
+```text
+sum_q n_q == N_seg(T)
+```
 
 ---
 
-## P0.2 — Make every tree instance globally unique
+## P0.3 — Make every stochastic tree instance globally unique
 
 **Targets**
 
@@ -66,8 +166,8 @@ verl/recipe/gear_tree/replay_buffer.py
 
 **Required changes**
 
-- Create one `tree_instance_id` when a stochastic tree is started.
-- The ID must distinguish repeated trees for the same question and policy snapshot. Include at least:
+- Create one `tree_instance_id` when each stochastic tree starts.
+- The ID must distinguish repeated trees for the same question and policy snapshot. Include:
 
 ```text
 policy_snapshot_id
@@ -76,94 +176,110 @@ stable_question_id
 per-tree UUID or monotonic counter
 ```
 
-- Use `tree_instance_id` as `tree_id` throughout tree generation, edge extraction, replay, tensorization, and manifest logging.
-- Derive `parent_group_id` and `edge_id` from this unique tree ID.
-- `ReplayBuffer.add` must raise on a duplicate `edge_id`; never overwrite silently.
+- Use this value as `tree_id` through generation, edge extraction, replay, tensorization, and manifest logging.
+- Derive `edge_id` from the unique tree ID and child identity.
+- `ReplayBuffer.add` must raise on duplicate `edge_id`; never overwrite silently.
 
 **Acceptance tests**
 
 - Two trees for the same question and snapshot have different IDs.
-- Their edges coexist in replay without collision.
+- Both trees coexist in replay.
 - IDs survive JSON checkpoint save/load unchanged.
 
 ---
 
-## P0.3 — Precompute exact objective weights on the full update batch
+## P0.4 — Implement the exact segment-average loss
 
 **Targets**
 
 ```text
 verl/recipe/gear_tree/tree_data.py
-verl/recipe/gear_tree/gear_ray_trainer.py
 verl/recipe/gear_tree/policy_loss.py
+verl/verl/workers/actor/dp_actor.py
 ```
 
 **Required changes**
 
-For every realized child `j` of parent `p` in tree `T`, compute before actor batching:
+For each retained segment row `s`:
+
+1. Compute the PPO-clipped token surrogate using stored old log-probabilities.
+2. Apply response and probability masks.
+3. Sum active token losses inside the segment:
 
 \[
-w_{p,j}
-=
-\frac{1}{N_{\mathrm{tree}}}
-\frac{1}{|P(T)|}
-\frac{m_{p,j}}{\sum_{j'}m_{p,j'}}.
+L_s = \sum_t M_{s,t}\,\ell_{s,t}.
 \]
 
-- Add row-level tensor:
+This matches the paper definition:
 
-```text
-objective_weights: float32 [batch]
-```
+\[
+H_s = \sum_t \nabla_\theta \log \pi_\theta(a_{s,t}\mid\cdot).
+\]
 
-- In `fresh_iid`, `m_{p,j}=1`, so siblings receive equal weight inside their parent.
-- Validate:
+For one tree:
 
-```text
-sum_j local_child_weight[p,j] == 1 for every parent
-sum_p parent_weight[T,p] == 1 for every tree
-sum_all_rows objective_weights == 1 for the full update batch
-```
+\[
+L_T
+=
+\frac{1}{N_{\mathrm{seg}}(T)}
+\sum_{s\in\text{retained}(T)} L_s.
+\]
 
-- `allocated_k` remains an integrity field; it must not be used as an extra optimization multiplier.
+Zero-advantage segments may be absent from the numerator but remain in `N_seg(T)`.
+
+For an actor update containing multiple trees, preserve the repository's intended outer prompt/tree averaging explicitly. Do not replace it with parent averaging or token averaging.
+
+Implementation requirements:
+
+- Store counts as integer metadata/tensors (`int32` or `int64`).
+- Do not add a stored float `objective_weights` tensor.
+- Convert integer denominators to the loss accumulation dtype inside the actor.
+- Mixed-precision forward/backward may remain BF16/FP16.
+- Loss reduction may accumulate in FP32 for numerical stability.
+- `ratio_threshold` must not independently skip arbitrary microbatches in the canonical path.
 
 **Acceptance tests**
 
-- Non-uniform branch factors do not change parent importance.
-- Variable segment lengths do not change child importance after token averaging.
-- Uniform trees match the explicit hierarchical reference objective.
+- Variable segment length does not alter the segment denominator.
+- Token duplication changes the segment contribution consistently with token-sum `H_s`.
+- Zero-advantage sparse filtering preserves the exact loss.
+- Queue regrouping reproduces the direct global segment sum.
 
 ---
 
-## P0.4 — Make mini/microbatch gradients exactly match the full-batch objective
+## P0.5 — Preserve the exact objective through replay, minibatching, and distributed training
 
 **Targets**
 
 ```text
+verl/recipe/gear_tree/replay_buffer.py
+verl/recipe/gear_tree/gear_ray_trainer.py
 verl/verl/workers/actor/dp_actor.py
-verl/recipe/gear_tree/policy_loss.py
 ```
 
 **Required changes**
 
-- `vdra_node_balanced_ppo` must:
+- Replay must reserve complete selected trees; it must not drop nonzero retained segments from a selected tree.
+- `target_edges_per_update` is a soft packing target.
+- Preserve on every row:
 
 ```text
-1. compute PPO-clipped token losses;
-2. take a token mean for each child row;
-3. return sum(objective_weights * child_loss).
+tree_id
+tree_total_segment_count
+queue_flush_id
+stored old_log_probs
 ```
 
-- Do not recompute parent/tree means inside each microbatch.
-- Preserve `objective_weights` through row reordering, mini-batch splitting, dynamic batching, and microbatch splitting.
-- Do not apply the legacy `1 / gradient_accumulation` scaling again to an already globally weighted VDRA loss.
-- Account for data-parallel gradient averaging so the final distributed gradient equals the full-batch weighted sum.
-- Do not apply `ratio_threshold` as a per-microbatch skip on the canonical VDRA path. Keep clipping and report the ratio metric; retain legacy skip behavior only for `treetune_ppo`.
-- `treetune_ppo` must remain unchanged for the SPO baseline.
+- Compute full-update tree counts before mini/microbatch splitting.
+- A microbatch must contribute a partial numerator using the original full-tree denominator.
+- Do not recompute a local segment mean inside each microbatch.
+- Do not divide again by `gradient_accumulation` when the partial loss already uses the full-update normalization.
+- Handle dynamic batching and row permutation without changing metadata alignment.
+- Account for data-parallel gradient averaging so the multi-rank gradient equals the single-rank reference.
 
 **Acceptance tests**
 
-Compare loss and gradients for the same examples under:
+Compare loss and parameter gradients for the same examples under:
 
 ```text
 full batch
@@ -171,14 +287,14 @@ multiple mini-batches
 multiple microbatches
 permuted row order
 dynamic batching
-simulated two-rank partition + averaged gradients
+simulated two-rank sharding + gradient averaging
 ```
 
-All results must match the explicit full-batch reference within tolerance.
+All results must match the explicit direct reference within tolerance.
 
 ---
 
-## P0.5 — Verify rollout/scorer weights using real runtime evidence
+## P0.6 — Verify the remaining runtime contracts
 
 **Targets**
 
@@ -187,74 +303,54 @@ verl/recipe/gear_tree/async_tree_rollout.py
 verl/recipe/gear_tree/gear_ray_trainer.py
 verl/recipe/gear_tree/gear_core/gear/vllm_scorer.py
 verl/recipe/gear_tree/config/gear_tree_trainer.yaml
-```
-
-**Required changes**
-
-- Do not silently use `scorer_api_base` as `rollout_api_base`.
-- Support exactly two explicit modes:
-
-```text
-scorer_uses_rollout_server: true
-```
-
-or
-
-```text
-rollout_api_base: <rollout endpoint>
-scorer_api_base: <independent scorer endpoint>
-```
-
-- Fetch the server-reported weight version from every configured endpoint.
-- In strict VDRA, fail before allocation when a version is missing or mismatched.
-- Propagate the verified versions and boolean result to the run manifest.
-
-**Acceptance tests**
-
-- Same-server explicit mode passes with one verified version.
-- Two-server matching versions pass.
-- Missing, stale, or mismatched versions fail strict mode.
-
----
-
-## P0.6 — Make the manifest report observed facts only
-
-**Targets**
-
-```text
-verl/recipe/gear_tree/manifest_lifecycle.py
 verl/recipe/gear_tree/run_manifest.py
-verl/recipe/gear_tree/gear_ray_trainer.py
+verl/recipe/gear_tree/manifest_lifecycle.py
 ```
 
 **Required changes**
 
-- Do not infer `complete_parent_microbatches`, scorer verification, or normalization success from config values.
-- Set fields only from runtime checks:
+Main config must use:
 
 ```text
-unique tree IDs verified
-complete parent groups verified
-fresh_iid row count == allocated_k
-objective_weights globally sum to 1
-full-batch vs split-gradient invariant enabled
-rollout/scorer versions verified
-no truncation
-stored old log-probs used
+pilot_execution_mode = fresh_iid
+bound_form = linear
+tail_mode = none
+eps_tail = 0
+allocation_runtime = online_timeout
+allocation_scope = per_queue_flush_within_tree
+policy_aggregation = global_segment_mean
 ```
 
-- A canonical main manifest is invalid until at least one successful actor update passes all checks.
-- Any later failure keeps the run invalid.
+Runtime checks must verify:
+
+```text
+stored generation-time old log-probs are used
+no silent prompt/response truncation
+actual request sampling parameters are honored
+mixed-depth queue flushes remain legal
+allocated_k respects lower/upper bounds and feasible budget slack
+pilots are discarded before fresh_iid final generation
+rollout and scorer use verified matching weights
+```
+
+For scorer/rollout versions:
+
+- require an explicit same-server mode or two explicit endpoints;
+- fetch server-reported versions;
+- fail strict mode on missing or mismatched versions.
+
+Manifest fields must be set from observed runtime checks, not inferred from config. A main manifest remains invalid until one successful actor update passes all checks.
 
 **Acceptance tests**
 
-- A clean synthetic update produces a valid manifest.
-- Each individual invariant failure makes it invalid.
-- Save/load preserves all fields and counters.
+- clean synthetic update produces a valid manifest;
+- each failed invariant makes it invalid;
+- manifest save/load preserves fields;
+- stale/missing scorer version fails strict mode.
 
 ---
 
-## P0.7 — Put all correctness tests in CPU CI
+## P0.7 — Put all correctness tests behind one pre-GPU gate
 
 **Targets**
 
@@ -262,70 +358,39 @@ stored old log-probs used
 .github/workflows/cpu-ci.yml
 verl/recipe/gear_tree/tests/
 tests/
+scripts/pre_gpu_check.sh
 ```
 
 **Required changes**
 
-CPU CI must run the relevant tests from both test roots, including:
+CPU CI and `scripts/pre_gpu_check.sh` must run:
 
 ```text
-node-balanced loss and gradient parity
-group metadata and zero-advantage handling
-unique tree/edge IDs
-complete-tree replay
-objective-weight normalization
-manifest lifecycle
-bounded allocation slack semantics
-Smoke A-D config composition
-```
-
-Also run:
-
-```bash
 python -m compileall vdra_core verl/recipe/gear_tree
+segment-average loss reference tests
+zero-advantage sparse-filter tests
+queue regrouping/Jensen-identity tests
+unique tree/edge ID tests
+complete-tree replay tests
+full-vs-split gradient parity tests
+manifest lifecycle tests
+bounded-allocation slack tests
+Hydra composition for main and Smoke A-D configs
 ```
 
-- Do not exclude a new correctness test merely because it imports the tree recipe.
-- Install the minimum CPU dependencies needed by the targeted tests.
-- Python 3.10 and 3.12 jobs must both pass.
-
-**Acceptance criteria**
+Main pre-GPU config assertions:
 
 ```text
-0 failed tests
-0 collection errors
-0 import errors
-GitHub Actions status == success
+fresh_iid
+linear bound
+global_segment_mean
+no parent-balanced main loss
+strict runtime checks enabled
 ```
 
----
+Do not skip or xfail a known correctness blocker. Python 3.10 and 3.12 CI jobs must pass.
 
-## P0.8 — Add one pre-GPU gate command
-
-**Target**
-
-```text
-scripts/pre_gpu_check.sh
-```
-
-**Required behavior**
-
-The script must fail fast and return non-zero unless all of the following pass:
-
-```text
-compileall
-all targeted CPU tests
-main Hydra config composition
-Smoke A-D config composition
-main config uses fresh_iid + linear bound + node-balanced loss
-only_adv_greater_than_zero == false
-strict group integrity enabled
-unique tree-ID test passes
-full-vs-split gradient parity passes
-manifest synthetic lifecycle passes
-```
-
-Print one final line only after success:
+Print only after all checks succeed:
 
 ```text
 PRE_GPU_CHECK=PASS
@@ -338,13 +403,16 @@ PRE_GPU_CHECK=PASS
 The repository is ready for a GPU smoke run only when:
 
 ```text
-[ ] P0.1–P0.8 are complete
+[ ] P0.1-P0.7 are complete
 [ ] scripts/pre_gpu_check.sh prints PRE_GPU_CHECK=PASS
 [ ] CPU CI is green on Python 3.10 and 3.12
-[ ] no known test is xfailed/skipped for a correctness blocker
-[ ] Smoke D config composes without fallback or deprecated modes
+[ ] no known correctness blocker is skipped or xfailed
+[ ] main config uses global segment mean, not node balancing
+[ ] direct and queue-regrouped updates are numerically identical
+[ ] full-batch and split/distributed gradients are numerically identical
+[ ] Smoke D config composes without fallback or deprecated main modes
 ```
 
-Then run **Smoke D only** for at least five successful actor updates. Do not start long experiments until Smoke D confirms finite loss/gradients, valid manifest, no group-integrity failure, and correct scorer/rollout versions.
+Then run Smoke D for at least five successful actor updates. Do not start long experiments until Smoke D confirms finite loss/gradients, valid manifest, no replay/count mismatch, and verified scorer/rollout versions.
 
-The synthetic RQ3/RQ4 scripts are scaffolding, not pre-GPU blockers and not paper evidence. Do not expand them until the canonical GPU smoke path is stable.
+The synthetic RQ3/RQ4 scripts are not pre-GPU blockers and are not paper evidence.
