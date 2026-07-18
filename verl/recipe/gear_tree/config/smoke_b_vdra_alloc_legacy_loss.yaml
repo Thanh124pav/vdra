@@ -1,0 +1,29 @@
+# PLAN.md §8 Smoke B — Construction-only ablation.
+#
+# Matrix cell:
+#   allocation          = VDRA
+#   policy_aggregation  = legacy_token_mean
+#
+# This isolates the effect of adaptive tree construction under the old
+# token-mean optimizer. It is an ablation, not a canonical VDRA run — the
+# manifest labels it as such (policy_aggregation != vdra_node_balanced).
+
+tree_policy:
+  advantage_mode: spo_local
+  policy_aggregation: legacy_token_mean
+  include_root_parent_group: true
+  strict_group_integrity: false
+
+gear_tree:
+  gear:
+    enabled: true
+    strict_vdra: true
+    k_algorithm: budget_allocation
+    allocation_runtime: online_timeout
+    pilot_execution_mode: fresh_iid
+  tree_update_mode: spo
+
+actor_rollout_ref:
+  actor:
+    policy_loss:
+      loss_mode: treetune_ppo

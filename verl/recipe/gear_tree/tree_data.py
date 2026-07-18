@@ -219,8 +219,10 @@ def validate_group_integrity(
         mults = [int(e.get("sample_multiplicity", 1) or 1) for e in group]
         if all(m == 1 for m in mults):
             fresh_iid_group_count += 1
+            # PLAN.md P0.N4: always detect a partial fresh_iid parent group;
+            # ``strict_fresh_iid`` only decides whether to raise.
             expected = next(iter(allocated_values), 0)
-            if strict_fresh_iid and expected and len(group) != expected:
+            if expected and len(group) != expected:
                 failures.append(
                     f"fresh_iid parent_group_id={pgid!r} has {len(group)} rows "
                     f"but allocated_k={expected}"
