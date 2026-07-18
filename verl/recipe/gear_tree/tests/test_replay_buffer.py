@@ -199,7 +199,7 @@ def test_tree_instance_id_survives_json_roundtrip():
 
 
 def test_two_trees_edges_coexist_in_replay():
-    # PLAN.md P0.2 acceptance: their edges coexist in replay without collision.
+    # PLAN.md P0.3 acceptance: their edges coexist in replay without collision.
     from recipe.gear_tree.tree_rollout import make_tree_instance_id
     import hashlib
 
@@ -215,3 +215,39 @@ def test_two_trees_edges_coexist_in_replay():
         edges.append(_edge(f"e:{digest}", question_id="q42"))
     buf.add(edges, generation_step=0, policy_snapshot_id="snap")
     assert len(buf) == 2
+
+
+def test_transactional_add_rolls_back_on_duplicate():
+    # PLAN.md P0.3 acceptance: a duplicate in the middle of an insertion
+    # batch leaves the replay buffer unchanged.
+    import pytest
+
+    buf = _buffer()
+    buf.add([_edge("existing")], generation_step=0, policy_snapshot_id="snap")
+    assert set(e["edge_id"] for e in buf.edges()) == {"existing"}
+
+    incoming = [
+        _edge("new-a"),
+        _edge("new-b"),
+        _edge("existing", advantage=2.0),  # duplicate against buffer
+        _edge("new-c"),
+    ]
+    with pytest.raises(ValueError, match="tree_instance_id"):
+        buf.add(incoming, generation_step=0, policy_snapshot_id="snap")
+    # Buffer must be unchanged — no partial insertion.
+    assert set(e["edge_id"] for e in buf.edges()) == {"existing"}
+
+
+def test_transactional_add_rejects_intra_batch_duplicate():
+    # A duplicate WITHIN the incoming batch must also roll everything back.
+    import pytest
+
+    buf = _buffer()
+    incoming = [
+        _edge("a"),
+        _edge("b"),
+        _edge("a", advantage=2.0),  # dup within batch
+    ]
+    with pytest.raises(ValueError, match="tree_instance_id"):
+        buf.add(incoming, generation_step=0, policy_snapshot_id="snap")
+    assert len(buf) == 0

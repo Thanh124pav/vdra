@@ -164,14 +164,26 @@ class RayGearTreeTrainer(RayPPOTrainer):
         )
         # PLAN.md P1.R7: refuse the deprecated ablation `_original` names in
         # strict main runs, and refuse to combine the *_style_ablation modes
-        # with the canonical vdra_node_balanced policy aggregation (they are
-        # ablations, not main-paper losses). The gate's own strict checks
-        # cover pilot_execution_mode and allocation_runtime.
+        # with the canonical policy aggregation (they are ablations, not
+        # main-paper losses). The gate's own strict checks cover
+        # pilot_execution_mode and allocation_runtime.
         gear_cfg = gt.get("gear") or {}
         strict = bool(gear_cfg.get("strict_vdra", True))
         tree_update_mode = str(gt.get("tree_update_mode", "spo"))
         tree_policy = self.config.get("tree_policy") or {}
         policy_agg = str(tree_policy.get("policy_aggregation", "legacy_token_mean"))
+        actor_loss_mode = str(
+            self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+        )
+        segment_reduction = str(
+            tree_policy.get("segment_token_reduction", "mean")
+        ).strip().lower()
+        # PLAN.md P0.1: segment_token_reduction must be exactly `mean` or `sum`.
+        if segment_reduction not in ("mean", "sum"):
+            raise ValueError(
+                "tree_policy.segment_token_reduction must be exactly 'mean' or "
+                f"'sum' (PLAN.md P0.1); got {segment_reduction!r}."
+            )
         if strict:
             if tree_update_mode in {"treepo_original", "treerl_original"}:
                 raise ValueError(
@@ -186,9 +198,23 @@ class RayGearTreeTrainer(RayPPOTrainer):
             ):
                 raise ValueError(
                     "The style-ablation tree_update_modes are not main-paper "
-                    "advantage estimators (PLAN.md P1.R7). Use "
-                    "tree_update_mode='spo' with policy_aggregation="
-                    "'vdra_node_balanced' for the main run."
+                    "advantage estimators (PLAN.md P1.R7)."
+                )
+            # PLAN.md P0.1: the canonical main policy_aggregation is
+            # global_segment_mean, which requires vdra_segment_mean_ppo. The
+            # legacy vdra_node_balanced_ppo must not appear in the strict main
+            # config; keep it available only when strict_vdra=false (ablation).
+            if policy_agg == "global_segment_mean" and actor_loss_mode != "vdra_segment_mean_ppo":
+                raise ValueError(
+                    "tree_policy.policy_aggregation=global_segment_mean requires "
+                    "actor_rollout_ref.actor.policy_loss.loss_mode=vdra_segment_mean_ppo "
+                    f"(PLAN.md P0.1); got {actor_loss_mode!r}."
+                )
+            if actor_loss_mode == "vdra_node_balanced_ppo" and policy_agg != "vdra_node_balanced":
+                raise ValueError(
+                    "loss_mode=vdra_node_balanced_ppo is only valid when "
+                    "tree_policy.policy_aggregation=vdra_node_balanced "
+                    "(labeled ablation, PLAN.md P0.1)."
                 )
 
     def _should_postpone_sampled_update(self, sampled_edges: List[Dict[str, Any]]) -> bool:
@@ -361,6 +387,13 @@ class RayGearTreeTrainer(RayPPOTrainer):
         # the update as on-policy and overwrites old_log_prob with the
         # current policy's log_prob.
         edge_batch.meta_info["force_stored_old_log_probs"] = True
+        # PLAN.md P0.5: forward the selected segment_token_reduction alongside
+        # the edge batch so the actor's loss reads the same value the trainer
+        # / manifest recorded.
+        tree_policy = self.config.get("tree_policy") or {}
+        edge_batch.meta_info["segment_token_reduction"] = str(
+            tree_policy.get("segment_token_reduction", "mean")
+        )
         if "old_log_probs" not in edge_batch.batch:
             raise AssertionError("edge_batch is missing stored old_log_probs")
         if edge_batch.batch["old_log_probs"].shape != edge_batch.batch["responses"].shape:

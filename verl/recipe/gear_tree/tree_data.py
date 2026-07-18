@@ -41,14 +41,15 @@ def _stable_int_id(value: Any) -> int:
 
 
 def group_tensors_for_edges(edges: Sequence[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-    """PLAN.md P0.N4: build row-level group tensors from tree edges.
+    """PLAN.md P0.N4 + P0.2: build row-level group tensors from tree edges.
 
     Returns int64 tensors ``tree_group_ids``, ``parent_group_ids``,
-    ``queue_group_ids``, ``allocated_k`` and float32 ``sample_multiplicity``,
-    all shaped ``[batch]``. Missing metadata falls back to safe defaults
-    (id 0, allocated_k = 1, multiplicity = 1) so legacy edges that were
-    generated before this migration still tensorize; strict main runs must
-    additionally check the group-integrity invariants below.
+    ``queue_group_ids``, ``allocated_k``, ``tree_total_segment_count`` and
+    float32 ``sample_multiplicity``, all shaped ``[batch]``. Missing metadata
+    falls back to safe defaults (id 0, allocated_k = 1, multiplicity = 1,
+    tree_total_segment_count = 1) so legacy edges that were generated before
+    this migration still tensorize; strict main runs must additionally check
+    the group-integrity invariants below.
     """
     bsz = len(edges)
     tree_ids = torch.empty(bsz, dtype=torch.int64)
@@ -56,18 +57,137 @@ def group_tensors_for_edges(edges: Sequence[Dict[str, Any]]) -> Dict[str, torch.
     queue_ids = torch.empty(bsz, dtype=torch.int64)
     allocated = torch.empty(bsz, dtype=torch.int64)
     multiplicities = torch.empty(bsz, dtype=torch.float32)
+    tree_total = torch.empty(bsz, dtype=torch.int64)
     for row, edge in enumerate(edges):
         tree_ids[row] = _stable_int_id(edge.get("tree_id"))
         parent_ids[row] = _stable_int_id(edge.get("parent_group_id"))
         queue_ids[row] = _stable_int_id(edge.get("queue_flush_id", 0))
         allocated[row] = int(edge.get("allocated_k", 1) or 1)
         multiplicities[row] = float(edge.get("sample_multiplicity", 1) or 1)
+        # PLAN.md P0.2: read the pre-filter N_seg(T) stamped by
+        # extract_edges_from_tree. Fall back to the tree_summary or the
+        # retained row count so legacy edges keep loading.
+        raw_total = edge.get("tree_total_segment_count")
+        if raw_total is None:
+            summary = edge.get("tree_summary") or {}
+            raw_total = summary.get("tree_total_segment_count")
+        try:
+            total_int = int(raw_total) if raw_total is not None else 0
+        except (TypeError, ValueError):
+            total_int = 0
+        tree_total[row] = max(total_int, 1)
     return {
         "tree_group_ids": tree_ids,
         "parent_group_ids": parent_ids,
         "queue_group_ids": queue_ids,
         "allocated_k": allocated,
         "sample_multiplicity": multiplicities,
+        "tree_total_segment_count": tree_total,
+    }
+
+
+def compute_segment_objective_weights(edges: Sequence[Dict[str, Any]]) -> List[float]:
+    """PLAN.md P0.4: precompute the segment-average weight for every row.
+
+    For every retained segment ``s`` in tree ``T`` in a batch of ``N_T`` trees::
+
+        w_s = 1 / (N_T * N_seg(T))
+
+    where ``N_seg(T)`` is the pre-filter ``tree_total_segment_count`` stamped
+    by ``extract_edges_from_tree``. The full loss is then::
+
+        L = sum_row w_row * L_row
+
+    which reproduces exactly ``(1/N_T) sum_T (1/N_seg(T)) sum_s L_s`` and is
+    invariant under mini/microbatch splits (the weights partition, not the
+    denominator). Passing ``segment_token_reduction`` changes only how ``L_row``
+    is computed inside the loss; the weight is the same for both modes.
+    """
+    if not edges:
+        return []
+    tree_ids: set[str] = set()
+    for edge in edges:
+        tree_ids.add(str(edge.get("tree_id", "")))
+    n_tree = max(len(tree_ids), 1)
+    weights: List[float] = []
+    for edge in edges:
+        raw_total = edge.get("tree_total_segment_count")
+        if raw_total is None:
+            summary = edge.get("tree_summary") or {}
+            raw_total = summary.get("tree_total_segment_count")
+        try:
+            total_int = int(raw_total) if raw_total is not None else 0
+        except (TypeError, ValueError):
+            total_int = 0
+        n_seg = max(total_int, 1)
+        weights.append(1.0 / (n_tree * n_seg))
+    return weights
+
+
+def validate_segment_objective_weights(
+    edges: Sequence[Dict[str, Any]],
+    weights: Sequence[float],
+    *,
+    atol: float = 1e-6,
+) -> Dict[str, Any]:
+    """PLAN.md P0.4: enforce the two normalization invariants for the
+    segment-average objective:
+
+        sum_{row in tree T} w_row == (retained_in_T / N_seg(T)) / N_T
+        sum_all_rows w_row <= 1
+
+    (Equality holds when every realized segment is retained. Zero-advantage
+    filtering strictly shrinks the total mass.) Raises ``ValueError`` on any
+    failure and returns a small diagnostics dict.
+    """
+    from collections import defaultdict
+
+    if len(edges) != len(weights):
+        raise ValueError(
+            f"segment objective_weights length {len(weights)} != edges length {len(edges)}"
+        )
+    if not edges:
+        return {
+            "vdra/segment_weight_sum": 0.0,
+            "vdra/segment_weight_tree_count": 0,
+        }
+
+    trees: Dict[str, List[int]] = defaultdict(list)
+    for row, edge in enumerate(edges):
+        trees[str(edge.get("tree_id", ""))].append(row)
+    n_tree = len(trees)
+    failures: List[str] = []
+    total = 0.0
+    max_per_tree_err = 0.0
+    for tid, rows in trees.items():
+        raw_total = edges[rows[0]].get("tree_total_segment_count")
+        if raw_total is None:
+            summary = edges[rows[0]].get("tree_summary") or {}
+            raw_total = summary.get("tree_total_segment_count")
+        try:
+            total_int = int(raw_total) if raw_total is not None else 0
+        except (TypeError, ValueError):
+            total_int = 0
+        n_seg = max(total_int, 1)
+        expected = len(rows) / (n_tree * n_seg)
+        got = sum(weights[r] for r in rows)
+        if abs(got - expected) > atol:
+            failures.append(
+                f"tree {tid!r}: sum(w) = {got!r}, expected retained/({n_tree}*{n_seg}) = {expected!r}"
+            )
+        max_per_tree_err = max(max_per_tree_err, abs(got - expected))
+        total += got
+    if total - 1.0 > atol:
+        failures.append(f"batch sum(w) = {total!r} > 1")
+    if failures:
+        raise ValueError(
+            "segment objective_weights normalization failed (PLAN.md P0.4):\n  "
+            + "\n  ".join(failures)
+        )
+    return {
+        "vdra/segment_weight_sum": float(total),
+        "vdra/segment_weight_tree_count": int(n_tree),
+        "vdra/segment_weight_per_tree_max_err": float(max_per_tree_err),
     }
 
 
@@ -485,13 +605,22 @@ def edges_to_dataproto(
     for key, value in group_tensors_for_edges(edges).items():
         batch[key] = value
 
-    # PLAN.md P0.3: precompute exact objective weights on the full batch and
-    # attach them as a row-level tensor. The actor loss (P0.4) reduces
-    # sum(objective_weights * child_loss), so mini/microbatch splits give
-    # gradients exactly equal to the full-batch weighted sum.
+    # PLAN.md P0.3 (legacy node-balanced path): precompute exact
+    # node-balanced weights and attach them as a row-level tensor. Kept for
+    # the ablation ``vdra_node_balanced_ppo`` loss. The main VDRA path uses
+    # ``segment_objective_weights`` below instead.
     obj_weights = compute_objective_weights(edges)
     validate_objective_weights(edges, obj_weights)
     batch["objective_weights"] = torch.tensor(obj_weights, dtype=torch.float32)
+
+    # PLAN.md P0.4: precompute the segment-average weights on the full batch.
+    # The main VDRA loss reduces sum(segment_objective_weights * L_row), so
+    # mini/microbatch splits give gradients exactly equal to the full-batch
+    # weighted sum. Depends only on ``tree_id`` and ``tree_total_segment_count``
+    # — not on parent groups or queue labels.
+    seg_weights = compute_segment_objective_weights(edges)
+    validate_segment_objective_weights(edges, seg_weights)
+    batch["segment_objective_weights"] = torch.tensor(seg_weights, dtype=torch.float32)
 
     non_tensor_batch = {
         "uid": np.array(uids, dtype=object),
@@ -508,6 +637,12 @@ def edges_to_dataproto(
         ),
         "queue_flush_id": np.array(
             [str(e.get("queue_flush_id", "0")) for e in edges], dtype=object
+        ),
+        # PLAN.md P0.2: keep the pre-filter counts as string metadata for
+        # manifests / logging in addition to the int64 tensor above.
+        "tree_total_segment_count_str": np.array(
+            [str(int(e.get("tree_total_segment_count", 0) or 0)) for e in edges],
+            dtype=object,
         ),
     }
     return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)

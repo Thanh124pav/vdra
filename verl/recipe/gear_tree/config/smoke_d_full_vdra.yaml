@@ -1,15 +1,16 @@
-# PLAN.md §8 Smoke D — Full VDRA (main canonical run).
+# PLAN.md P0.6 / P0.7 Smoke D — Full VDRA (main canonical run).
 #
 # Matrix cell:
-#   allocation           = VDRA
-#   policy_aggregation   = vdra_node_balanced
-#   pilot_execution_mode = fresh_iid
+#   allocation                  = VDRA
+#   policy_aggregation          = global_segment_mean
+#   segment_token_reduction     = mean  (canonical / default)
+#   pilot_execution_mode        = fresh_iid
 #
-# Acceptance (per PLAN.md §8 Smoke D):
+# Acceptance (per PLAN.md P0.6):
 #   * at least five successful actor updates;
 #   * finite loss & gradients;
-#   * no parent / tree split;
-#   * exact parent and tree normalization;
+#   * complete-tree replay held every update;
+#   * exact segment-count normalization (sum_q n_q == N_seg(T));
 #   * rollout / scorer weights verified;
 #   * stored old log probabilities used;
 #   * no silent truncation;
@@ -17,21 +18,25 @@
 #   * feasible budget accounting;
 #   * exact fresh_iid final-child accounting;
 #   * valid manifest (RunManifest.is_valid_main_run() true).
+#
+# PLAN.md P0.1: `only_adv_greater_than_zero: true` may remain enabled for
+# compute efficiency; the segment denominator ignores the filter.
 
 tree_policy:
   advantage_mode: spo_local
-  policy_aggregation: vdra_node_balanced
+  policy_aggregation: global_segment_mean
+  segment_token_reduction: mean
   include_root_parent_group: true
   strict_group_integrity: true
 
 gear_tree:
-  # PLAN.md P0.1: main VDRA keeps every realized child (including zero-adv).
   only_adv_greater_than_zero: false
   gear:
     enabled: true
     strict_vdra: true
     k_algorithm: budget_allocation
     allocation_runtime: online_timeout
+    allocation_scope: per_queue_flush_within_tree
     pilot_execution_mode: fresh_iid
     bound_form: linear
     tail_mode: none
@@ -41,4 +46,5 @@ gear_tree:
 actor_rollout_ref:
   actor:
     policy_loss:
-      loss_mode: vdra_node_balanced_ppo
+      loss_mode: vdra_segment_mean_ppo
+      segment_token_reduction: mean

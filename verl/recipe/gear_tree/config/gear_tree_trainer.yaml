@@ -221,26 +221,44 @@ gear_tree:
 
     scorer_max_concurrency: 64
 
-# --- VDRA tree-policy contract (PLAN.md §4, §5 P0.N7) -----------------------
+# --- VDRA tree-policy contract (PLAN.md P0.1 / P0.4 / P0.6) -----------------
 tree_policy:
   # advantage_mode selects HOW child advantages are computed inside
   # extract_edges_from_tree. Main VDRA is `spo_local` (== gear_tree.tree_update_mode=spo).
   # Values: spo_local | configured_ablation.
   advantage_mode: spo_local
 
-  # policy_aggregation selects the actor loss reduction.
-  # - vdra_node_balanced: hierarchical token -> child -> parent group -> tree.
-  #   Requires actor_rollout_ref.actor.policy_loss.loss_mode=vdra_node_balanced_ppo
-  #   and the row-level group tensors emitted by tree_data.edges_to_dataproto.
-  # - legacy_token_mean: single masked mean over active tokens. Retained ONLY
-  #   as an SPO baseline / ablation; do NOT use for main VDRA main runs.
-  policy_aggregation: vdra_node_balanced
+  # policy_aggregation selects the actor loss reduction. Main VDRA is
+  # `global_segment_mean` (PLAN.md P0.1):
+  #
+  #     L = (1/N_T) * sum_T (1/N_seg(T)) * sum_s L_s^r,
+  #
+  # where the within-segment reduction ``r`` is set by
+  # `segment_token_reduction` below. The main path REQUIRES the actor loss
+  # `vdra_segment_mean_ppo` and the row tensors produced by
+  # ``tree_data.edges_to_dataproto`` (``segment_objective_weights``,
+  # ``tree_total_segment_count``).
+  #
+  # Values:
+  #   * global_segment_mean  — canonical main-run (PLAN.md P0.1).
+  #   * vdra_node_balanced   — legacy parent-balanced ablation. Do NOT use
+  #                             for main runs; kept for controlled ablations.
+  #   * legacy_token_mean    — SPO baseline / ablation.
+  policy_aggregation: global_segment_mean
+
+  # PLAN.md P0.1: within-segment token reduction. Must be exactly `mean` or
+  # `sum`. `mean` is the canonical/default main setting; `sum` is a supported
+  # first-class ablation of the score-function convention. The two modes
+  # share exactly one rollout / advantage / segment-denominator / replay /
+  # batching path — only the per-row `L_s` differs.
+  segment_token_reduction: mean
 
   # If true (canonical), root-generated child segments participate in the
-  # tree average as an explicit root parent group.
+  # tree average as segments in their own right — every realized segment is
+  # counted.
   include_root_parent_group: true
 
-  # Strict main runs must abort on any parent-group integrity failure.
+  # Strict main runs must abort on any group integrity failure.
   strict_group_integrity: true
 
 # --- overrides on the verl base ---------------------------------------------
@@ -273,12 +291,21 @@ actor_rollout_ref:
 
   actor:
 
-    # Main VDRA runs use the node-balanced hierarchical loss (PLAN.md §4.3,
-    # P0.N5). Switch to loss_mode=treetune_ppo only for the SPO/legacy baseline
-    # (paired with tree_policy.policy_aggregation=legacy_token_mean).
+    # PLAN.md P0.1 / P0.4: main VDRA runs use the segment-average loss.
+    # Values:
+    #   * vdra_segment_mean_ppo   — main VDRA (default). Uses
+    #                                tree_policy.segment_token_reduction to
+    #                                pick mean|sum within a segment.
+    #   * vdra_node_balanced_ppo  — legacy parent-balanced ablation.
+    #   * treetune_ppo            — SPO baseline / ablation.
     policy_loss:
 
-      loss_mode: vdra_node_balanced_ppo
+      loss_mode: vdra_segment_mean_ppo
+
+      # PLAN.md P0.1: the same key must be visible on `actor.policy_loss`
+      # because the loss function reads it via `config` (ActorConfig). Keep it
+      # in sync with `tree_policy.segment_token_reduction`.
+      segment_token_reduction: mean
 
     # No KL-in-loss by default (matches tree-family configs). KL coef = 0.
     use_kl_loss: false

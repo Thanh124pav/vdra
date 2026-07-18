@@ -391,6 +391,11 @@ class DataParallelPPOActor(BasePPOActor):
             "allocated_k",
             "sample_multiplicity",
             "objective_weights",
+            # PLAN.md P0.4: segment-average VDRA main loss forwards
+            # per-row segment weights + tree_total_segment_count so
+            # microbatch splits preserve the pre-filter denominator.
+            "segment_objective_weights",
+            "tree_total_segment_count",
         ):
             if key in data.batch.keys():
                 select_keys.append(key)
@@ -442,16 +447,17 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
-                    # PLAN.md P0.4: the canonical VDRA loss returns a globally
-                    # weighted sum (sum_row w_row * child_loss_row), so summing
-                    # across microbatches already reproduces the full-batch
-                    # weighted objective. Re-scaling by 1/gradient_accumulation
-                    # (or by response_mask.shape[0]/ppo_mini_batch_size) would
-                    # divide by the microbatch count a second time. Keep the
-                    # legacy scaling for `treetune_ppo` / vanilla losses.
-                    vdra_mode = (
-                        str(self.config.policy_loss.get("loss_mode", "vanilla"))
-                        == "vdra_node_balanced_ppo"
+                    # PLAN.md P0.4/P0.5: the canonical VDRA losses
+                    # (``vdra_segment_mean_ppo`` main, ``vdra_node_balanced_ppo``
+                    # ablation) return a globally weighted sum
+                    # (``sum_row w_row * L_row``), so summing across
+                    # microbatches already reproduces the full-batch weighted
+                    # objective. Re-scaling by 1/gradient_accumulation would
+                    # divide the partial numerator a second time.
+                    _loss_mode = str(self.config.policy_loss.get("loss_mode", "vanilla"))
+                    vdra_mode = _loss_mode in (
+                        "vdra_node_balanced_ppo",
+                        "vdra_segment_mean_ppo",
                     )
                     if vdra_mode:
                         loss_scale_factor = 1.0
@@ -512,6 +518,8 @@ class DataParallelPPOActor(BasePPOActor):
                         "allocated_k",
                         "sample_multiplicity",
                         "objective_weights",
+                        "segment_objective_weights",
+                        "tree_total_segment_count",
                     ):
                         maybe = model_inputs.get(group_key, None)
                         if maybe is not None and group_key in policy_loss_fn.__code__.co_varnames:
