@@ -263,3 +263,121 @@ def test_queue_identity_failure_flags_segment_count():
     edges[1]["queue_released_segment_count"] = 2
     update_manifest_from_edges(manifest, edges, strict=False)
     assert manifest.segment_count_failures > 0
+
+
+class TestM4ObservedAccountingGate:
+    """PLAN.md M4: the canonical segment-count gate rides on observed
+    construction accounting facts only, never on objective-weight
+    normalization helpers.
+    """
+
+    def _manifest(self, actor_loss_mode="vdra_segment_mean_ppo"):
+        tree_policy, gear_tree_cfg = _cfg()
+        return build_run_manifest(
+            tree_policy=tree_policy,
+            gear_tree_cfg=gear_tree_cfg,
+            actor_loss_mode=actor_loss_mode,
+        )
+
+    def test_canonical_path_calls_no_objective_weight_helpers(self):
+        import inspect
+
+        from recipe.gear_tree import manifest_lifecycle
+
+        source = inspect.getsource(
+            manifest_lifecycle.update_manifest_from_generated_edges
+        )
+        assert "compute_segment_objective_weights" not in source
+        assert "validate_segment_objective_weights" not in source
+        # compute/validate_objective_weights appear only inside the
+        # node-balanced ablation branch.
+        pre_ablation = source.split("vdra_node_balanced_ppo")[0]
+        assert "compute_objective_weights" not in pre_ablation
+        assert "validate_objective_weights" not in pre_ablation
+        module_source = inspect.getsource(manifest_lifecycle)
+        assert "compute_segment_objective_weights" not in module_source
+        assert "validate_segment_objective_weights" not in module_source
+
+    def test_zero_filtered_batch_passes_gate_via_pre_filter_counts(self):
+        # PLAN.md M4 fact (a): a batch whose exact-zero-advantage siblings
+        # were dropped after construction counts were stamped must still
+        # pass — realized_child_count (pre-filter) matches allocated_k even
+        # though the retained row count does not.
+        manifest = self._manifest()
+        edges = _clean_edges()
+        for edge in edges:
+            edge["allocated_k"] = 3
+            edge["realized_child_count"] = 3
+        # Retained 2 of 3 realized children; queue counts keep the
+        # pre-filter construction snapshot.
+        for edge in edges:
+            edge["tree_total_segment_count"] = 3
+            edge["queue_released_segment_count"] = 3
+        update_manifest_from_edges(manifest, edges, strict=False)
+        assert manifest.segment_count_invariants_passed is True
+        assert manifest.segment_count_failures == 0
+
+    def test_pre_filter_allocation_mismatch_fails_gate(self):
+        # realized_child_count != allocated_k must keep the gate off even
+        # when the retained row count happens to equal allocated_k.
+        manifest = self._manifest()
+        edges = _clean_edges()
+        for edge in edges:
+            edge["realized_child_count"] = 3  # allocated_k stays 2
+        update_manifest_from_edges(manifest, edges, strict=False)
+        assert manifest.segment_count_invariants_passed is False
+
+    def test_duplicate_edge_id_fails_gate(self):
+        manifest = self._manifest()
+        edges = _clean_edges()
+        edges[1]["edge_id"] = edges[0]["edge_id"]
+        update_manifest_from_edges(manifest, edges, strict=False)
+        assert manifest.segment_count_invariants_passed is False
+
+    def test_missing_edge_id_fails_gate(self):
+        manifest = self._manifest()
+        edges = _clean_edges()
+        edges[1]["edge_id"] = ""
+        update_manifest_from_edges(manifest, edges, strict=False)
+        assert manifest.segment_count_invariants_passed is False
+
+    def test_pruned_placeholder_fails_gate(self):
+        manifest = self._manifest()
+        edges = _clean_edges()
+        edges[1]["pruned"] = True
+        update_manifest_from_edges(manifest, edges, strict=False)
+        assert manifest.segment_count_invariants_passed is False
+
+    def test_node_balanced_ablation_still_validates_weights(self):
+        # The ablation path keeps computing and validating its own float
+        # weights; a broken weight layout records an integrity failure.
+        manifest = self._manifest(actor_loss_mode="vdra_node_balanced_ppo")
+        edges = _clean_edges()
+        # Remove the fields the objective-weight helpers need so the
+        # validation inside the ablation branch fails.
+        for edge in edges:
+            edge.pop("sample_multiplicity", None)
+            edge["sample_multiplicity"] = 0
+        update_manifest_from_edges(manifest, edges, strict=False)
+        assert (
+            manifest.extras.get("objective_weight_normalization_passes")
+            is not None
+        )
+
+    def test_historical_segment_count_failure_is_not_healed(self):
+        # A queue-identity failure followed by a clean batch: the gate bit
+        # may flip on for the clean batch, but the monotonic failure counter
+        # keeps the RUN invalid.
+        manifest = self._manifest()
+        broken = _clean_edges()
+        broken[1]["queue_flush_id"] = "q1"
+        broken[1]["queue_released_segment_count"] = 2
+        update_manifest_from_edges(manifest, broken, strict=False)
+        assert manifest.segment_count_failures > 0
+        update_manifest_from_edges(manifest, _clean_edges(), strict=False)
+        assert manifest.segment_count_failures > 0
+        manifest.rollout_scorer_weights_verified = True
+        manifest.record_invariant_pass()
+        manifest.optimizer_step_accounting_valid = True
+        manifest.num_optimizer_steps_total = 4
+        assert validate_main_run(manifest) is not None

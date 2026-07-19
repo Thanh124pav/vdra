@@ -22,11 +22,9 @@ from recipe.gear_tree.run_manifest import (
 from recipe.gear_tree.tree_data import (
     compute_group_metrics,
     compute_objective_weights,
-    compute_segment_objective_weights,
     validate_group_integrity,
     validate_objective_weights,
     validate_replay_batch,
-    validate_segment_objective_weights,
     validate_tree_construction,
     verify_tree_instance_id_uniqueness,
 )
@@ -98,8 +96,10 @@ def update_manifest_from_generated_edges(
 
     Runs on the complete batch of edges extracted from freshly generated
     trees, before replay insertion. This is the only stage allowed to
-    require complete parent groups, full-tree queue identities, and
-    tree/parent weight normalization.
+    require complete parent groups and full-tree queue identities. The
+    canonical path validates observed accounting facts only; objective
+    weights are computed/validated solely for the node-balanced ablation
+    (PLAN.md M4).
     """
     integrity_metrics: Dict[str, Any] = {}
     raised: Exception | None = None
@@ -131,23 +131,6 @@ def update_manifest_from_generated_edges(
     if raised is not None and strict:
         raise raised
     integrity_metrics.update(compute_group_metrics(generated_edges))
-
-    # Legacy segment-weight diagnostic over the complete generated batch.
-    # M4 removes this as a canonical manifest dependency; replay samples must
-    # never run tree-normalization checks.
-    try:
-        seg_weights = compute_segment_objective_weights(generated_edges)
-        integrity_metrics.update(
-            validate_segment_objective_weights(generated_edges, seg_weights)
-        )
-        manifest.extras["segment_weight_normalization_passes"] = True
-    except ValueError as exc:
-        manifest.record_segment_count_failure(1)
-        manifest.extras["segment_weight_normalization_passes"] = False
-        manifest.extras["segment_weight_normalization_error"] = str(exc)
-        integrity_metrics["vdra/segment_weight_normalization_failed"] = 1.0
-        if strict:
-            raise
 
     # PLAN.md P0.C: parent-/tree-normalized node-balanced weights are an
     # ablation concept. Compute and validate them ONLY when the run actually
@@ -191,14 +174,78 @@ def update_manifest_from_generated_edges(
                 + "\n  ".join(id_failures)
             )
 
-    # PLAN.md P0.6: only when the full-tree queue identity holds and the
-    # segment weights normalize does the segment-count invariants bit flip on.
-    if queue_failures == 0 and manifest.extras.get(
-        "segment_weight_normalization_passes", False
+    # PLAN.md M4: the canonical segment-count claim rides on OBSERVED
+    # construction accounting facts only — objective-weight normalization is
+    # NOT a canonical dependency:
+    #   (a) every parent realized its allocation BEFORE zero-advantage
+    #       filtering (pre-filter realized_child_count == allocated_k;
+    #       never the retained row count, which zero-filtering may shrink);
+    #   (b) full-tree queue identity: per tree, the sum of unique
+    #       queue_released_segment_count values equals
+    #       tree_total_segment_count;
+    #   (c) no missing or duplicate edge IDs in the generated batch;
+    #   (d) no pruned placeholder counted as a trainable segment.
+    duplicate_edge_ids = int(
+        float(integrity_metrics.get("vdra/generated_duplicate_edge_ids", 0) or 0)
+    )
+    missing_edge_ids = sum(
+        1 for e in generated_edges if not str(e.get("edge_id", ""))
+    )
+    pruned_rows = int(
+        float(integrity_metrics.get("vdra/generated_pruned_rows", 0) or 0)
+    )
+    allocation_failures = _pre_filter_allocation_failures(generated_edges)
+    integrity_metrics["vdra/generated_missing_edge_ids"] = float(missing_edge_ids)
+    integrity_metrics["vdra/pre_filter_allocation_failures"] = float(
+        allocation_failures
+    )
+    if (
+        queue_failures == 0
+        and allocation_failures == 0
+        and duplicate_edge_ids == 0
+        and missing_edge_ids == 0
+        and pruned_rows == 0
     ):
         manifest.segment_count_invariants_passed = True
 
     return integrity_metrics
+
+
+def _pre_filter_allocation_failures(edges: List[Dict[str, Any]]) -> int:
+    """PLAN.md M4 fact (a): per parent group, the PRE-FILTER realized child
+    count must equal ``allocated_k``.
+
+    Uses the ``realized_child_count`` stamped on every edge at extraction
+    time (unaffected by zero-advantage filtering). Edges without the stamp
+    (legacy fixtures that predate zero-filtering) fall back to the retained
+    row count, where retained == realized by construction.
+    """
+    from collections import defaultdict
+
+    by_parent: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for edge in edges:
+        by_parent[str(edge.get("parent_group_id", ""))].append(edge)
+    failures = 0
+    for group in by_parent.values():
+        allocated_values = {int(e.get("allocated_k", 0) or 0) for e in group}
+        if len(allocated_values) != 1:
+            failures += 1
+            continue
+        allocated = next(iter(allocated_values))
+        if not allocated:
+            continue
+        realized_values = {
+            int(e["realized_child_count"])
+            for e in group
+            if e.get("realized_child_count") is not None
+        }
+        if len(realized_values) > 1:
+            failures += 1
+            continue
+        realized = next(iter(realized_values), len(group))
+        if realized != allocated:
+            failures += 1
+    return failures
 
 
 def update_manifest_from_replay_batch(
