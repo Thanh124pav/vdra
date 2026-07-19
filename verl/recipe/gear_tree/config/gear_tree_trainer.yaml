@@ -25,7 +25,7 @@ gear_tree:
   tree_shape: [6, 6, 6]
 
   # Segment length M (tokens per non-terminal segment). None at the last depth.
-  segment_length: 100
+  segment_length: 600
 
   # Advantage variant. treepo_style_ablation / treerl_style_ablation are
   # scalar-objective ablations, NOT byte-faithful reproductions of the
@@ -46,27 +46,13 @@ gear_tree:
   # TreeRL-style discount (only used by treerl_style_ablation).
   treerl_gamma: 0.9
 
-  # PLAN.md P0.1: main VDRA runs keep every realized child, including
-  # zero-advantage ones, so the parent denominator (|children_of_p|) matches
-  # allocated_k. Legacy treetune default was true (drop pav_advantage == 0);
-  # keep that option for the SPO baseline only.
-  only_adv_greater_than_zero: false
+  only_adv_greater_than_zero: true
 
   replay_buffer:
     enabled: true
-    # PLAN.md P0.2 canonical names. The old aliases
-    # (target_edges_per_update / max_edges_per_question / max_edge_age)
-    # remain accepted for one release but must not appear in main configs.
     target_edges_per_iteration: 512
     max_edge_age_iterations: 8
-    # 'auto' resolves to ceil(R * (sum_d prod_{l<=d} b_l) / max_edge_age_iterations)
-    # from `tree_shape` and `actor_rollout_ref.rollout.n`. Numeric overrides
-    # are legal only for controlled compatibility/ablation runs.
     max_edges_per_question_per_iteration: auto
-    # PLAN.md P0.A: `edge` is the canonical sampling unit and the ONLY thing
-    # that selects the reservation path. `tree_policy.strict_group_integrity`
-    # controls validation strictness and never changes the sampling unit.
-    # `complete_tree` is an explicit non-canonical ablation value.
     replay_sampling_unit: edge
     underfill_policy: use_available
     underfilled_update_policy: postpone_until_divisible
@@ -120,12 +106,12 @@ gear_tree:
 
 
     # k0 pilot children and r likelihood samples per child.
-    pilot_branch_factor: 8
+    pilot_branch_factor: 6
     likelihood_samples_per_distribution: 2
 
     # Current verl runtime owns one queue manager per tree; do not claim
     # cross-root minibatch allocation until that shared context is implemented.
-    root_allocation: false
+    root_allocation: true
     # P1.3 canonical value: runtime solver acts per queue flush within one tree
     # (see PLAN.md §2.1).
     allocation_scope: per_queue_flush_within_tree
@@ -165,7 +151,7 @@ gear_tree:
 
     # Online queues flush on capacity or timeout; final drain only at rollout end.
     queue_count: 4
-    queue_capacity: 8
+    queue_capacity: 16
 
     queue_timeout_seconds: 1.0
 
