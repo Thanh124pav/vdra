@@ -90,7 +90,7 @@ jobs:
             --ignore=tests/test_tree_update_config.py \
             --ignore=tests/test_tree_update_modes.py
 
-      - name: Run gear_tree recipe correctness tests (PLAN.md P0.7)
+      - name: Run gear_tree recipe correctness tests (PLAN.md P0.1-P0.8)
         env:
           PYTHONPATH: ${{ github.workspace }}/verl
         run: |
@@ -100,12 +100,16 @@ jobs:
             --ignore=verl/recipe/gear_tree/tests/test_trainer_contracts.py \
             --ignore=verl/recipe/gear_tree/tests/test_vendor_parity.py
 
-      - name: Pre-GPU gate (PLAN.md P0.7)
+      - name: Pre-GPU gate (PLAN.md P0.8)
         env:
           PYTHONPATH: ${{ github.workspace }}/verl
         run: |
-          # The pre-GPU gate runs the same tests as above plus explicit
-          # config-invariant checks. It prints exactly PRE_GPU_CHECK=PASS on
-          # success and non-zero-exits on any failure. CI must observe that
-          # line before an experiment is launched (PLAN.md P0.7).
+          # PLAN.md P0.8: the pre-GPU gate runs Hydra-free config assertions,
+          # real dataclass instantiation for PolicyLossConfig/ActorConfig,
+          # and the new P0.1-P0.7 acceptance tests (auto per-question cap,
+          # 512/128 = 4 optimizer steps, batch-slot N_B normalization,
+          # zero-advantage dense/sparse parity, distributed grad scaling,
+          # scorer topology contract, and the manifest lifecycle). Prints
+          # exactly PRE_GPU_CHECK=PASS on success; any failure exits non-zero
+          # and CI must observe the PASS line before an experiment launches.
           bash scripts/pre_gpu_check.sh

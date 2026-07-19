@@ -11,11 +11,13 @@ is included, and reserved rows never straddle a parent group. Legacy
 from __future__ import annotations
 
 import json
+import math
 import random
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
 
 
 _REQUIRED_EDGE_FIELDS = (
@@ -28,6 +30,47 @@ _REQUIRED_EDGE_FIELDS = (
     "value",
     "reward",
 )
+
+
+def compute_max_edges_per_question(
+    tree_shape: Sequence[int],
+    *,
+    trees_per_question: int = 1,
+    max_edge_age_iterations: int,
+) -> int:
+    """PLAN.md P0.2 auto per-question cap.
+
+    Given a per-depth branch factor ``tree_shape = [b_1, ..., b_D]``, the
+    maximum number of non-root edges in one full tree is
+
+        E_max = sum_{d=1..D} prod_{l=1..d} b_l.
+
+    With ``R`` stochastic trees per question per rollout iteration,
+
+        E_max^{q/iter} = R * E_max,
+        C_question    = ceil(E_max^{q/iter} / max_edge_age_iterations).
+
+    Examples (R=1, age=8):
+        [6,6,6]  → E_max=258  → cap=33
+        [8,8,8]  → E_max=584  → cap=73
+    """
+
+    if max_edge_age_iterations <= 0:
+        raise ValueError(
+            "max_edge_age_iterations must be > 0 to resolve auto per-question cap"
+        )
+    if trees_per_question <= 0:
+        raise ValueError("trees_per_question must be > 0")
+    shape = [int(b) for b in tree_shape if int(b) > 0]
+    if not shape:
+        raise ValueError("tree_shape must contain at least one positive branch")
+    e_max = 0
+    prod = 1
+    for b in shape:
+        prod *= b
+        e_max += prod
+    e_max *= int(trees_per_question)
+    return max(1, math.ceil(e_max / int(max_edge_age_iterations)))
 
 
 @dataclass(frozen=True)
@@ -46,15 +89,81 @@ class GearTreeReplayBuffer:
     def __init__(
         self,
         *,
-        target_edges_per_update: int = 512,
-        max_edges_per_question: int = 32,
-        max_edge_age: int = 8,
+        # PLAN.md P0.2 canonical names
+        target_edges_per_iteration: Optional[int] = None,
+        max_edge_age_iterations: Optional[int] = None,
+        max_edges_per_question_per_iteration: Union[int, str, None] = None,
+        replay_sampling_unit: str = "edge",
+        tree_shape: Optional[Sequence[int]] = None,
+        trees_per_question: int = 1,
+        # PLAN.md P0.2 deprecated aliases — kept for one release for migration.
+        target_edges_per_update: Optional[int] = None,
+        max_edge_age: Optional[int] = None,
+        max_edges_per_question: Union[int, str, None] = None,
         underfill_policy: str = "use_available",
         sampling_seed: int = 0,
     ) -> None:
-        self.target_edges_per_update = max(int(target_edges_per_update), 1)
-        self.max_edges_per_question = max(int(max_edges_per_question), 1)
-        self.max_edge_age = max(int(max_edge_age), 1)
+        # PLAN.md P0.2: accept both the new canonical names and the deprecated
+        # aliases. Prefer the new name if both are set to a non-default value.
+        resolved_target = self._resolve_alias(
+            new=target_edges_per_iteration,
+            old=target_edges_per_update,
+            new_name="target_edges_per_iteration",
+            old_name="target_edges_per_update",
+            default=512,
+        )
+        resolved_age = self._resolve_alias(
+            new=max_edge_age_iterations,
+            old=max_edge_age,
+            new_name="max_edge_age_iterations",
+            old_name="max_edge_age",
+            default=8,
+        )
+        resolved_cap_raw = self._resolve_alias(
+            new=max_edges_per_question_per_iteration,
+            old=max_edges_per_question,
+            new_name="max_edges_per_question_per_iteration",
+            old_name="max_edges_per_question",
+            default="auto",
+        )
+
+        self.target_edges_per_iteration = max(int(resolved_target), 1)
+        self.max_edge_age_iterations = max(int(resolved_age), 1)
+        self.replay_sampling_unit = str(replay_sampling_unit)
+        if self.replay_sampling_unit != "edge":
+            raise ValueError(
+                "Only replay_sampling_unit='edge' is supported on the canonical "
+                "main path (PLAN.md P0.2)."
+            )
+        self.tree_shape: Tuple[int, ...] = tuple(int(b) for b in (tree_shape or ()))
+        self.trees_per_question = max(int(trees_per_question), 1)
+        # Resolve auto/int for per-question cap.
+        if isinstance(resolved_cap_raw, str) and str(resolved_cap_raw).strip().lower() == "auto":
+            if not self.tree_shape:
+                raise ValueError(
+                    "max_edges_per_question_per_iteration='auto' requires "
+                    "tree_shape to be passed to GearTreeReplayBuffer "
+                    "(PLAN.md P0.2)."
+                )
+            self.max_edges_per_question_per_iteration = compute_max_edges_per_question(
+                self.tree_shape,
+                trees_per_question=self.trees_per_question,
+                max_edge_age_iterations=self.max_edge_age_iterations,
+            )
+            self.max_edges_per_question_cap_source = "auto"
+        else:
+            self.max_edges_per_question_per_iteration = max(int(resolved_cap_raw), 1)
+            self.max_edges_per_question_cap_source = "override"
+        self.resolved_max_edges_per_question_per_iteration = (
+            self.max_edges_per_question_per_iteration
+        )
+
+        # Backward-compat attribute aliases so old callers (and JSON meta) still
+        # read the same value under the old name.
+        self.target_edges_per_update = self.target_edges_per_iteration
+        self.max_edge_age = self.max_edge_age_iterations
+        self.max_edges_per_question = self.max_edges_per_question_per_iteration
+
         self.underfill_policy = str(underfill_policy)
         if self.underfill_policy != "use_available":
             raise ValueError("Only underfill_policy='use_available' is currently supported")
@@ -71,6 +180,32 @@ class GearTreeReplayBuffer:
             "rolled_back_edges": 0,
         }
 
+    @staticmethod
+    def _resolve_alias(
+        *,
+        new: Any,
+        old: Any,
+        new_name: str,
+        old_name: str,
+        default: Any,
+    ) -> Any:
+        """Prefer the new PLAN.md P0.2 name; accept the deprecated one with a warning."""
+        if new is not None and old is not None and new != old:
+            raise ValueError(
+                f"{new_name}={new!r} conflicts with deprecated alias "
+                f"{old_name}={old!r}; drop {old_name} and use {new_name} only."
+            )
+        if new is not None:
+            return new
+        if old is not None:
+            warnings.warn(
+                f"{old_name} is deprecated; use {new_name} (PLAN.md P0.2).",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            return old
+        return default
+
     def __len__(self) -> int:
         return len(self._edges)
 
@@ -81,21 +216,54 @@ class GearTreeReplayBuffer:
         self,
         edges: Iterable[Mapping[str, Any]],
         *,
-        generation_step: int,
+        generation_rollout_iteration: Optional[int] = None,
+        generation_step: Optional[int] = None,  # deprecated alias
         policy_snapshot_id: str,
     ) -> int:
-        # PLAN.md P0.3: replay insertion must be TRANSACTIONAL — a duplicate
-        # edge_id anywhere in the incoming batch (against existing rows or
-        # against another row in the same batch) must leave the buffer
-        # unchanged. Validate every incoming edge first; only mutate on
-        # success.
+        """PLAN.md P0.2/P0.3: add a batch of edges to the replay buffer.
+
+        ``generation_rollout_iteration`` stamps replay-age semantics on every
+        new edge; ``generation_step`` is kept as a deprecated alias so callers
+        that still pass ``self.global_steps`` continue to work while they
+        migrate. The buffer stores BOTH keys on each record: the canonical
+        ``generation_rollout_iteration`` (used for age) and the legacy
+        ``generation_step`` (kept for JSON round-trip stability).
+        """
+        if generation_rollout_iteration is None and generation_step is None:
+            raise ValueError(
+                "GearTreeReplayBuffer.add requires generation_rollout_iteration "
+                "(PLAN.md P0.2)."
+            )
+        if generation_rollout_iteration is None:
+            warnings.warn(
+                "generation_step is deprecated; pass generation_rollout_iteration "
+                "instead (PLAN.md P0.2).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            generation_rollout_iteration = generation_step
+        gri = int(generation_rollout_iteration)
+
         prepared: List[Dict[str, Any]] = []
         seen_ids: set[str] = set()
         for edge in edges:
             record = dict(edge)
             self._validate_edge(record)
+            # Canonical name (PLAN.md P0.2) — used for age. Fall back to the
+            # deprecated per-edge ``generation_step`` alias when the edge did
+            # not stamp the new key itself, so pre-migration record producers
+            # keep working during the alias window.
+            if "generation_rollout_iteration" in record:
+                record["generation_rollout_iteration"] = int(
+                    record["generation_rollout_iteration"]
+                )
+            elif "generation_step" in record:
+                record["generation_rollout_iteration"] = int(record["generation_step"])
+            else:
+                record["generation_rollout_iteration"] = gri
+            # Legacy alias kept for JSON round-trip stability.
             record["generation_step"] = int(
-                record.get("generation_step", generation_step)
+                record.get("generation_step", record["generation_rollout_iteration"])
             )
             record["policy_snapshot_id"] = str(
                 record.get("policy_snapshot_id", policy_snapshot_id)
@@ -124,11 +292,48 @@ class GearTreeReplayBuffer:
         self.metrics["added_edges"] += len(prepared)
         return len(prepared)
 
-    def expire(self, *, current_step: int) -> List[str]:
+    @staticmethod
+    def _edge_generation_iteration(edge: Mapping[str, Any], default: int) -> int:
+        """Return the edge's generation rollout iteration.
+
+        Prefers the canonical ``generation_rollout_iteration`` field
+        (PLAN.md P0.2); falls back to the deprecated ``generation_step`` alias
+        for JSON round-trips of pre-migration checkpoints.
+        """
+        value = edge.get("generation_rollout_iteration")
+        if value is None:
+            value = edge.get("generation_step", default)
+        return int(value)
+
+    def expire(
+        self,
+        *,
+        current_rollout_iteration: Optional[int] = None,
+        current_step: Optional[int] = None,  # deprecated alias
+    ) -> List[str]:
+        """PLAN.md P0.2/P0.3: expire an edge when its age (in rollout
+        iterations) reaches ``max_edge_age_iterations``. Age is measured in
+        rollout iterations only — never in ``global_step``.
+        """
+        if current_rollout_iteration is None and current_step is None:
+            raise ValueError(
+                "GearTreeReplayBuffer.expire requires current_rollout_iteration "
+                "(PLAN.md P0.2)."
+            )
+        if current_rollout_iteration is None:
+            warnings.warn(
+                "current_step is deprecated; pass current_rollout_iteration "
+                "instead (PLAN.md P0.2).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            current_rollout_iteration = current_step
+        cri = int(current_rollout_iteration)
         expired = [
             edge_id
             for edge_id, edge in self._edges.items()
-            if int(current_step) - int(edge.get("generation_step", current_step)) >= self.max_edge_age
+            if cri - self._edge_generation_iteration(edge, cri)
+            >= self.max_edge_age_iterations
             and edge_id not in self._reserved
         ]
         for edge_id in expired:
@@ -137,30 +342,49 @@ class GearTreeReplayBuffer:
         return sorted(expired)
 
     def sample_for_update(
-        self, *, current_step: int, remove: bool = True
+        self,
+        *,
+        current_rollout_iteration: Optional[int] = None,
+        current_step: Optional[int] = None,  # deprecated alias
+        remove: bool = True,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        if current_rollout_iteration is None and current_step is None:
+            raise ValueError(
+                "sample_for_update requires current_rollout_iteration "
+                "(PLAN.md P0.2)."
+            )
+        if current_rollout_iteration is None:
+            warnings.warn(
+                "current_step is deprecated; pass current_rollout_iteration "
+                "instead (PLAN.md P0.2).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            current_rollout_iteration = current_step
+        cri = int(current_rollout_iteration)
         size_before = len(self._edges)
-        expired_ids = self.expire(current_step=current_step)
+        expired_ids = self.expire(current_rollout_iteration=cri)
         grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for edge_id, edge in self._edges.items():
             if edge_id in self._reserved:
                 continue
             grouped[str(edge["question_id"])].append(edge)
 
-        rng = random.Random(self.sampling_seed + int(current_step))
+        rng = random.Random(self.sampling_seed + cri)
         candidates: List[Dict[str, Any]] = []
         edges_per_question: List[int] = []
+        cap = self.max_edges_per_question_per_iteration
         for question_id in sorted(grouped):
             group = sorted(grouped[question_id], key=lambda item: str(item["edge_id"]))
-            if len(group) > self.max_edges_per_question:
-                group = rng.sample(group, self.max_edges_per_question)
+            if len(group) > cap:
+                group = rng.sample(group, cap)
                 group = sorted(group, key=lambda item: str(item["edge_id"]))
             candidates.extend(group)
             edges_per_question.append(len(group))
 
         candidates = sorted(candidates, key=lambda item: str(item["edge_id"]))
-        if len(candidates) > self.target_edges_per_update:
-            sampled = rng.sample(candidates, self.target_edges_per_update)
+        if len(candidates) > self.target_edges_per_iteration:
+            sampled = rng.sample(candidates, self.target_edges_per_iteration)
             sampled = sorted(sampled, key=lambda item: str(item["edge_id"]))
         else:
             sampled = candidates
@@ -170,7 +394,14 @@ class GearTreeReplayBuffer:
             self.remove(sampled_ids)
         self.metrics["sampled_edges"] += len(sampled)
 
-        ages = [int(current_step) - int(edge.get("generation_step", current_step)) for edge in sampled]
+        ages = [
+            cri - self._edge_generation_iteration(edge, cri) for edge in sampled
+        ]
+        # PLAN.md P0.7: log the observed age histogram instead of asserting a
+        # uniform 1/8 composition upstream.
+        age_hist: Dict[int, int] = defaultdict(int)
+        for a in ages:
+            age_hist[int(a)] += 1
         stats = {
             "buffer/size_before": size_before,
             "buffer/expired_edges": len(expired_ids),
@@ -178,7 +409,7 @@ class GearTreeReplayBuffer:
             "buffer/sampled_edges": len(sampled),
             "buffer/size_after": len(self._edges),
             "buffer/reserved_edges": len(self._reserved),
-            "buffer/underfilled": float(len(sampled) < self.target_edges_per_update),
+            "buffer/underfilled": float(len(sampled) < self.target_edges_per_iteration),
             "buffer/unique_questions": len({edge["question_id"] for edge in sampled}),
             "buffer/mean_edge_age": sum(ages) / len(ages) if ages else 0.0,
             "buffer/max_edge_age": max(ages) if ages else 0,
@@ -186,6 +417,8 @@ class GearTreeReplayBuffer:
                 sum(edges_per_question) / len(edges_per_question) if edges_per_question else 0.0
             ),
             "buffer/edges_per_question_max": max(edges_per_question) if edges_per_question else 0,
+            "buffer/edge_age_histogram": dict(age_hist),
+            "buffer/resolved_max_edges_per_question_per_iteration": cap,
             "removed_edge_ids": sorted(sampled_ids),
         }
         for depth in (0, 1, 2):
@@ -194,8 +427,28 @@ class GearTreeReplayBuffer:
             )
         return [dict(edge) for edge in sampled], stats
 
-    def reserve_for_update(self, *, current_step: int) -> ReplayReservation:
-        sampled, stats = self.sample_for_update(current_step=current_step, remove=False)
+    def reserve_for_update(
+        self,
+        *,
+        current_rollout_iteration: Optional[int] = None,
+        current_step: Optional[int] = None,  # deprecated alias
+    ) -> ReplayReservation:
+        if current_rollout_iteration is None and current_step is None:
+            raise ValueError(
+                "reserve_for_update requires current_rollout_iteration "
+                "(PLAN.md P0.2)."
+            )
+        if current_rollout_iteration is None:
+            warnings.warn(
+                "current_step is deprecated; pass current_rollout_iteration "
+                "instead (PLAN.md P0.2).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            current_rollout_iteration = current_step
+        sampled, stats = self.sample_for_update(
+            current_rollout_iteration=int(current_rollout_iteration), remove=False
+        )
         reservation_id = self._next_reservation_id
         self._next_reservation_id += 1
         edge_ids = tuple(str(edge["edge_id"]) for edge in sampled)
@@ -215,20 +468,37 @@ class GearTreeReplayBuffer:
         )
 
     def reserve_complete_trees_for_update(
-        self, *, current_step: int
+        self,
+        *,
+        current_rollout_iteration: Optional[int] = None,
+        current_step: Optional[int] = None,  # deprecated alias
     ) -> ReplayReservation:
         """PLAN.md P0.N6: reserve one or more COMPLETE trees.
 
         Trees are added whole (all edges sharing a ``tree_id``) until the
-        cumulative edge count meets or exceeds ``target_edges_per_update``.
-        ``max_edges_per_question`` is applied per question by picking a subset
-        of that question's trees, never by dropping an individual edge from
-        one of its trees. A tree is never split across two reservations, and
-        no partial parent group is ever returned.
+        cumulative edge count meets or exceeds ``target_edges_per_iteration``.
+        ``max_edges_per_question_per_iteration`` is applied per question by
+        picking a subset of that question's trees, never by dropping an
+        individual edge from one of its trees. A tree is never split across
+        two reservations, and no partial parent group is ever returned.
         """
+        if current_rollout_iteration is None and current_step is None:
+            raise ValueError(
+                "reserve_complete_trees_for_update requires "
+                "current_rollout_iteration (PLAN.md P0.2)."
+            )
+        if current_rollout_iteration is None:
+            warnings.warn(
+                "current_step is deprecated; pass current_rollout_iteration "
+                "instead (PLAN.md P0.2).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            current_rollout_iteration = current_step
+        cri = int(current_rollout_iteration)
         size_before = len(self._edges)
-        expired_ids = self.expire(current_step=current_step)
-        rng = random.Random(self.sampling_seed + int(current_step))
+        expired_ids = self.expire(current_rollout_iteration=cri)
+        rng = random.Random(self.sampling_seed + cri)
 
         # Group available (non-reserved) edges by (question_id, tree_id).
         by_question: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(
@@ -252,9 +522,11 @@ class GearTreeReplayBuffer:
             trees = by_question[qid]
             # Deterministic ordering within a question by tree_id.
             tree_ids = sorted(trees)
-            # Pack whole trees until we exceed max_edges_per_question, keeping
-            # the last one added if it's the first one for this question so we
-            # never starve a question that only has one large tree.
+            # Pack whole trees until we exceed the resolved per-question cap,
+            # keeping the last one added if it's the first one for this
+            # question so we never starve a question that only has one large
+            # tree.
+            cap = self.max_edges_per_question_per_iteration
             selected: List[List[Dict[str, Any]]] = []
             cumulative = 0
             for tid in tree_ids:
@@ -265,7 +537,7 @@ class GearTreeReplayBuffer:
                     selected.append(tree_edges)
                     cumulative += len(tree_edges)
                     continue
-                if cumulative + len(tree_edges) > self.max_edges_per_question:
+                if cumulative + len(tree_edges) > cap:
                     continue
                 selected.append(tree_edges)
                 cumulative += len(tree_edges)
@@ -277,7 +549,7 @@ class GearTreeReplayBuffer:
         packed_trees: List[List[Dict[str, Any]]] = []
         cumulative = 0
         for tree_edges in picked_trees:
-            if cumulative >= self.target_edges_per_update and packed_trees:
+            if cumulative >= self.target_edges_per_iteration and packed_trees:
                 break
             packed_trees.append(tree_edges)
             cumulative += len(tree_edges)
@@ -299,9 +571,12 @@ class GearTreeReplayBuffer:
         self.metrics["sampled_edges"] += len(sampled)
 
         ages = [
-            int(current_step) - int(edge.get("generation_step", current_step))
+            cri - self._edge_generation_iteration(edge, cri)
             for edge in sampled
         ]
+        age_hist: Dict[int, int] = defaultdict(int)
+        for a in ages:
+            age_hist[int(a)] += 1
         stats = {
             "buffer/size_before": size_before,
             "buffer/expired_edges": len(expired_ids),
@@ -310,7 +585,11 @@ class GearTreeReplayBuffer:
             "buffer/sampled_edges": len(sampled),
             "buffer/size_after": len(self._edges),
             "buffer/reserved_edges": len(self._reserved),
-            "buffer/underfilled": float(len(sampled) < self.target_edges_per_update),
+            "buffer/underfilled": float(len(sampled) < self.target_edges_per_iteration),
+            "buffer/edge_age_histogram": dict(age_hist),
+            "buffer/resolved_max_edges_per_question_per_iteration": (
+                self.max_edges_per_question_per_iteration
+            ),
             "buffer/unique_questions": len({edge["question_id"] for edge in sampled}),
             "buffer/unique_trees": len(packed_trees),
             "buffer/mean_edge_age": sum(ages) / len(ages) if ages else 0.0,
@@ -380,6 +659,22 @@ class GearTreeReplayBuffer:
             json.dumps(
                 {
                     "schema_version": self.schema_version,
+                    # PLAN.md P0.2 canonical names.
+                    "target_edges_per_iteration": self.target_edges_per_iteration,
+                    "max_edge_age_iterations": self.max_edge_age_iterations,
+                    "max_edges_per_question_per_iteration": (
+                        self.max_edges_per_question_per_iteration
+                    ),
+                    "resolved_max_edges_per_question_per_iteration": (
+                        self.resolved_max_edges_per_question_per_iteration
+                    ),
+                    "max_edges_per_question_cap_source": (
+                        self.max_edges_per_question_cap_source
+                    ),
+                    "tree_shape": list(self.tree_shape),
+                    "trees_per_question": self.trees_per_question,
+                    "replay_sampling_unit": self.replay_sampling_unit,
+                    # Deprecated aliases kept for reader tooling.
                     "target_edges_per_update": self.target_edges_per_update,
                     "max_edges_per_question": self.max_edges_per_question,
                     "max_edge_age": self.max_edge_age,
@@ -401,10 +696,26 @@ class GearTreeReplayBuffer:
     def load(cls, checkpoint_dir: str | Path) -> "GearTreeReplayBuffer":
         source = Path(checkpoint_dir)
         meta = json.loads((source / "gear_tree_replay_buffer_meta.json").read_text(encoding="utf-8"))
+        # PLAN.md P0.2: prefer the new canonical field names when present so
+        # that a resume-after-migration reads the new schema first; fall back
+        # to the deprecated aliases for older checkpoints.
+        target_iter = meta.get(
+            "target_edges_per_iteration", meta.get("target_edges_per_update")
+        )
+        max_age_iter = meta.get(
+            "max_edge_age_iterations", meta.get("max_edge_age")
+        )
+        cap = meta.get(
+            "max_edges_per_question_per_iteration",
+            meta.get("max_edges_per_question"),
+        )
         buffer = cls(
-            target_edges_per_update=meta["target_edges_per_update"],
-            max_edges_per_question=meta["max_edges_per_question"],
-            max_edge_age=meta["max_edge_age"],
+            target_edges_per_iteration=target_iter,
+            max_edge_age_iterations=max_age_iter,
+            max_edges_per_question_per_iteration=cap,
+            replay_sampling_unit=meta.get("replay_sampling_unit", "edge"),
+            tree_shape=meta.get("tree_shape") or None,
+            trees_per_question=int(meta.get("trees_per_question", 1) or 1),
             underfill_policy=meta.get("underfill_policy", "use_available"),
             sampling_seed=meta.get("sampling_seed", 0),
         )

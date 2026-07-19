@@ -88,6 +88,9 @@ def _fresh_iid_group() -> list[dict]:
             "tree_total_segment_count": 2,
             "advantage": 1.0,
             "response_token_ids": [1],
+            # PLAN.md P0.2 canonical age stamp — flips
+            # ``replay_age_uses_rollout_iteration`` on when observed.
+            "generation_rollout_iteration": 0,
         },
         {
             "edge_id": "e1",
@@ -101,6 +104,7 @@ def _fresh_iid_group() -> list[dict]:
             "tree_total_segment_count": 2,
             "advantage": 1.0,
             "response_token_ids": [1],
+            "generation_rollout_iteration": 0,
         },
     ]
 
@@ -162,6 +166,13 @@ def test_update_manifest_from_edges_reports_no_failure_for_valid_group():
     # Still not a valid main run because scorer verification is not set here.
     assert not is_valid_main_run(manifest)
     manifest.rollout_scorer_weights_verified = True
+    # PLAN.md P0.7: optimizer-step accounting flag is set by the trainer
+    # after a successful ``optimizer.step()`` count matches expected. The
+    # helper flips ``replay_age_uses_rollout_iteration`` /
+    # ``unique_tree_ids_verified`` from the observed edges.
+    manifest.optimizer_step_accounting_valid = True
+    assert manifest.replay_age_uses_rollout_iteration is True
+    assert manifest.unique_tree_ids_verified is True
     assert is_valid_main_run(manifest)
 
 
@@ -205,6 +216,7 @@ def test_manifest_persists_across_json_round_trip(tmp_path):
     update_manifest_from_edges(manifest, _fresh_iid_group(), strict=True)
     manifest.record_invariant_pass()
     manifest.rollout_scorer_weights_verified = True
+    manifest.optimizer_step_accounting_valid = True
     path = tmp_path / "vdra_run_manifest.json"
     manifest.save(path)
     from recipe.gear_tree.run_manifest import RunManifest
@@ -215,5 +227,8 @@ def test_manifest_persists_across_json_round_trip(tmp_path):
     assert loaded.segment_count_invariants_passed is True
     assert loaded.stored_old_log_probs_used is True
     assert loaded.no_truncation is True
+    assert loaded.replay_age_uses_rollout_iteration is True
+    assert loaded.optimizer_step_accounting_valid is True
+    assert loaded.unique_tree_ids_verified is True
     assert loaded.extras["actor_loss_mode"] == "vdra_segment_mean_ppo"
     assert is_valid_main_run(loaded)

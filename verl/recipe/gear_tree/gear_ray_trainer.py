@@ -13,7 +13,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
 
 import numpy as np
 
@@ -51,25 +51,73 @@ class RayGearTreeTrainer(RayPPOTrainer):
         return gt
 
     def _replay_config(self) -> Dict[str, Any]:
+        """PLAN.md P0.2: resolve the replay block.
+
+        Accepts both the canonical field names
+        (``target_edges_per_iteration``, ``max_edge_age_iterations``,
+        ``max_edges_per_question_per_iteration``, ``replay_sampling_unit``)
+        and the deprecated aliases (``target_edges_per_update``,
+        ``max_edge_age``, ``max_edges_per_question``). The resolved dict uses
+        the canonical names.
+        """
         gt = self._gear_tree_config()
+        raw = dict(gt.get("replay_buffer") or {})
+
+        def _pick(new_name: str, old_name: str, default):
+            if new_name in raw and raw[new_name] is not None:
+                return raw[new_name]
+            if old_name in raw and raw[old_name] is not None:
+                return raw[old_name]
+            return default
+
         return {
             "enabled": True,
-            "target_edges_per_update": 512,
-            "max_edges_per_question": 32,
-            "max_edge_age": 8,
-            "underfill_policy": "use_available",
-            "sampling_seed": 0,
-            "checkpoint": True,
-            "underfilled_update_policy": "postpone_until_divisible",
-            **dict(gt.get("replay_buffer") or {}),
+            "target_edges_per_iteration": _pick(
+                "target_edges_per_iteration", "target_edges_per_update", 512
+            ),
+            "max_edge_age_iterations": _pick(
+                "max_edge_age_iterations", "max_edge_age", 8
+            ),
+            "max_edges_per_question_per_iteration": _pick(
+                "max_edges_per_question_per_iteration",
+                "max_edges_per_question",
+                "auto",
+            ),
+            "replay_sampling_unit": raw.get("replay_sampling_unit", "edge"),
+            "underfill_policy": raw.get("underfill_policy", "use_available"),
+            "sampling_seed": raw.get("sampling_seed", 0),
+            "checkpoint": raw.get("checkpoint", True),
+            "underfilled_update_policy": raw.get(
+                "underfilled_update_policy", "postpone_until_divisible"
+            ),
         }
+
+    def _resolve_trees_per_question(self) -> int:
+        """PLAN.md P0.2: R = number of stochastic trees per question per
+        rollout iteration. Read from ``actor_rollout_ref.rollout.n`` when set;
+        otherwise assume ``1``.
+        """
+        try:
+            n = int(
+                self.config.actor_rollout_ref.rollout.get("n", 1) or 1
+            )
+        except Exception:
+            n = 1
+        return max(n, 1)
 
     def _new_replay_buffer(self) -> GearTreeReplayBuffer:
         replay_cfg = self._replay_config()
+        gt = self._gear_tree_config()
+        tree_shape = list(gt.get("tree_shape") or [])
         return GearTreeReplayBuffer(
-            target_edges_per_update=replay_cfg["target_edges_per_update"],
-            max_edges_per_question=replay_cfg["max_edges_per_question"],
-            max_edge_age=replay_cfg["max_edge_age"],
+            target_edges_per_iteration=int(replay_cfg["target_edges_per_iteration"]),
+            max_edge_age_iterations=int(replay_cfg["max_edge_age_iterations"]),
+            max_edges_per_question_per_iteration=replay_cfg[
+                "max_edges_per_question_per_iteration"
+            ],
+            replay_sampling_unit=str(replay_cfg.get("replay_sampling_unit", "edge")),
+            tree_shape=tree_shape,
+            trees_per_question=self._resolve_trees_per_question(),
             underfill_policy=replay_cfg.get("underfill_policy", "use_available"),
             sampling_seed=replay_cfg.get("sampling_seed", 0),
         )
@@ -120,12 +168,13 @@ class RayGearTreeTrainer(RayPPOTrainer):
 
     def _validate_replay_startup(self) -> None:
         replay_cfg = self._replay_config()
-        target = int(replay_cfg["target_edges_per_update"])
+        target = int(replay_cfg["target_edges_per_iteration"])
         ppo_mini = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
         if target % ppo_mini != 0:
             raise ValueError(
-                "gear_tree.replay_buffer.target_edges_per_update must be divisible by "
-                "actor_rollout_ref.actor.ppo_mini_batch_size"
+                "gear_tree.replay_buffer.target_edges_per_iteration must be "
+                "divisible by actor_rollout_ref.actor.ppo_mini_batch_size "
+                "(PLAN.md P0.2)."
             )
         # P1.4: `replay_buffer.enabled` is not a real ablation switch — the
         # trainer always routes through the buffer. Reject the field so a
@@ -184,6 +233,28 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 "tree_policy.segment_token_reduction must be exactly 'mean' or "
                 f"'sum' (PLAN.md P0.1); got {segment_reduction!r}."
             )
+        # PLAN.md P0.1: `tree_policy.segment_token_reduction` and
+        # `actor.policy_loss.segment_token_reduction` are duplicates that MUST
+        # agree, otherwise the actor loss silently reads a different reduction
+        # than the manifest/logs advertise.
+        actor_reduction = str(
+            self.config.actor_rollout_ref.actor.policy_loss.get(
+                "segment_token_reduction", "mean"
+            )
+        ).strip().lower()
+        if actor_reduction not in ("mean", "sum"):
+            raise ValueError(
+                "actor_rollout_ref.actor.policy_loss.segment_token_reduction "
+                f"must be exactly 'mean' or 'sum' (PLAN.md P0.1); got "
+                f"{actor_reduction!r}."
+            )
+        if actor_reduction != segment_reduction:
+            raise ValueError(
+                "tree_policy.segment_token_reduction "
+                f"({segment_reduction!r}) must equal "
+                "actor_rollout_ref.actor.policy_loss.segment_token_reduction "
+                f"({actor_reduction!r}) (PLAN.md P0.1)."
+            )
         if strict:
             if tree_update_mode in {"treepo_original", "treerl_original"}:
                 raise ValueError(
@@ -227,7 +298,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
         if not sampled_edges:
             return False
         ppo_mini = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
-        target = int(replay_cfg["target_edges_per_update"])
+        target = int(replay_cfg["target_edges_per_iteration"])
         return len(sampled_edges) < target and len(sampled_edges) % ppo_mini != 0
 
     def _fetch_rollout_server_weight_version(self, gear_cfg: Dict[str, Any]) -> str | None:
@@ -421,17 +492,91 @@ class RayGearTreeTrainer(RayPPOTrainer):
     # --- PLAN.md P0.N8: run-manifest lifecycle --------------------------- #
 
     def _build_run_manifest(self) -> RunManifest:
-        """PLAN.md P0.N8: delegate to :func:`build_run_manifest` so the
-        manifest construction can be unit-tested without importing the full
-        RayPPOTrainer / torchdata / verl-worker stack.
+        """PLAN.md P0.N8 / P0.7: delegate to :func:`build_run_manifest` and
+        stamp the config-derived replay/optimizer knobs so ``validate_main_run``
+        can compare against observed runtime values later.
         """
-        return build_run_manifest(
+        manifest = build_run_manifest(
             tree_policy=(self.config.get("tree_policy") or {}),
             gear_tree_cfg=self._gear_tree_config(),
             actor_loss_mode=str(
                 self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
             ),
         )
+        replay_cfg = self._replay_config()
+        manifest.replay_sampling_unit = str(
+            replay_cfg.get("replay_sampling_unit", "edge")
+        )
+        manifest.target_edges_per_iteration = int(
+            replay_cfg.get("target_edges_per_iteration", 0)
+        )
+        manifest.max_edge_age_iterations = int(
+            replay_cfg.get("max_edge_age_iterations", 0)
+        )
+        manifest.ppo_mini_batch_size = int(
+            self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size", 0)
+        )
+        manifest.ppo_epochs = int(
+            self.config.actor_rollout_ref.actor.get("ppo_epochs", 1)
+        )
+        # The resolved auto cap is populated once the replay buffer is built.
+        if hasattr(self, "replay_buffer") and self.replay_buffer is not None:
+            manifest.resolved_max_edges_per_question_per_iteration = int(
+                self.replay_buffer.resolved_max_edges_per_question_per_iteration
+            )
+        return manifest
+
+    def _record_iteration_on_manifest(
+        self,
+        *,
+        selected_edges: int,
+        sample_stats: Dict[str, Any],
+        actual_optimizer_steps: int,
+    ) -> None:
+        """PLAN.md P0.7: stamp per-iteration observed facts on the manifest.
+
+        The trainer calls this after a successful actor update so the
+        manifest tracks live counters (``rollout_iteration``, ``global_step``,
+        ``optimizer_steps_last_iteration``) and replay diagnostics
+        (observed edge-age histogram, per-question cap max, etc.).
+        """
+        m = self.run_manifest
+        m.rollout_iteration = int(self.rollout_iteration)
+        m.global_step = int(self.global_steps)
+        m.optimizer_steps_last_iteration = int(actual_optimizer_steps)
+        m.num_optimizer_steps_total = int(self.num_optimizer_steps_total)
+        m.selected_edges_last_iteration = int(selected_edges)
+        m.unique_questions_last_iteration = int(
+            sample_stats.get("buffer/unique_questions", 0) or 0
+        )
+        m.mean_edge_age_last_iteration = float(
+            sample_stats.get("buffer/mean_edge_age", 0.0) or 0.0
+        )
+        m.max_edge_age_last_iteration = int(
+            sample_stats.get("buffer/max_edge_age", 0) or 0
+        )
+        m.per_question_selected_count_max_last_iteration = int(
+            sample_stats.get("buffer/edges_per_question_max", 0) or 0
+        )
+        hist = sample_stats.get("buffer/edge_age_histogram") or {}
+        if isinstance(hist, Mapping):
+            m.edge_age_histogram_last_iteration = {
+                int(k): int(v) for k, v in hist.items()
+            }
+        if hasattr(self, "replay_buffer") and self.replay_buffer is not None:
+            m.resolved_max_edges_per_question_per_iteration = int(
+                self.replay_buffer.resolved_max_edges_per_question_per_iteration
+            )
+        # PLAN.md P0.7: `optimizer_step_accounting_valid` iff the observed
+        # step count equals the expected count for this iteration.
+        ppo_mini = int(
+            self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size", 1)
+        )
+        ppo_epochs = int(
+            self.config.actor_rollout_ref.actor.get("ppo_epochs", 1)
+        )
+        expected = (int(selected_edges) // max(ppo_mini, 1)) * max(ppo_epochs, 1)
+        m.optimizer_step_accounting_valid = int(actual_optimizer_steps) == expected
 
     def _manifest_path(self) -> str:
         return os.path.join(
@@ -467,6 +612,11 @@ class RayGearTreeTrainer(RayPPOTrainer):
         self.successful_actor_updates = 0
         self.postponed_updates = 0
         self.failed_updates = 0
+        # PLAN.md P0.3: separate counters for rollout iteration vs true
+        # optimizer.step() calls. `global_steps` is bumped by the actual
+        # optimizer-step count returned by update_actor, never by 1 per call.
+        self.optimizer_steps_this_iteration = 0
+        self.num_optimizer_steps_total = 0
         self._load_checkpoint()
         self._validate_replay_startup()
         replay_resume_metrics = self._restore_or_init_replay_buffer()
@@ -501,6 +651,10 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 if self.global_steps >= self.total_training_steps:
                     break
                 self.rollout_iteration += 1
+                # PLAN.md P0.3: reset per-iteration optimizer-step counter so
+                # postponed / failed iterations do not carry the previous
+                # iteration's count forward.
+                self.optimizer_steps_this_iteration = 0
                 metrics: Dict[str, Any] = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 gen_batch = self._get_gen_batch(batch)
@@ -508,21 +662,23 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 t0 = time.time()
                 new_edges = self._generate_tree_edges(gen_batch)
                 t_gen = time.time() - t0
+                # PLAN.md P0.2: replay age is stamped in rollout iterations,
+                # not optimizer steps. `self.rollout_iteration` has already been
+                # incremented for this iteration above.
                 replay_buffer.add(
                     new_edges,
-                    generation_step=self.global_steps,
+                    generation_rollout_iteration=self.rollout_iteration,
                     policy_snapshot_id=self._current_policy_snapshot_id(),
                 )
-                # PLAN.md P0.N6: complete-tree replay when
-                # tree_policy.strict_group_integrity=true; otherwise fall back
-                # to the legacy per-edge reserve so SPO baselines keep working.
+                # PLAN.md P0.2: edge-level replay is canonical. Complete-tree
+                # replay remains available for the SPO baseline ablation only.
                 if manifest_strict:
                     reservation = replay_buffer.reserve_complete_trees_for_update(
-                        current_step=self.global_steps
+                        current_rollout_iteration=self.rollout_iteration
                     )
                 else:
                     reservation = replay_buffer.reserve_for_update(
-                        current_step=self.global_steps
+                        current_rollout_iteration=self.rollout_iteration
                     )
                 sampled_edges = [dict(edge) for edge in reservation.edges]
                 sample_stats = reservation.stats
@@ -563,22 +719,76 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     self.failed_updates += 1
                     raise
                 actor_updated = True
-                metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+                actor_metrics_meta = actor_output.meta_info["metrics"]
+                # PLAN.md P0.3: extract the true optimizer.step() count BEFORE
+                # `reduce_metrics` mangles the per-worker list. Fall back to 1
+                # for legacy loss modes that still perform one step per call.
+                raw_step_counts = actor_metrics_meta.get(
+                    "actor/num_optimizer_steps", None
+                )
+
+                def _flatten_int_list(x):
+                    out: List[int] = []
+                    if x is None:
+                        return out
+                    if isinstance(x, (list, tuple)):
+                        for item in x:
+                            out.extend(_flatten_int_list(item))
+                    else:
+                        try:
+                            out.append(int(x))
+                        except Exception:
+                            pass
+                    return out
+
+                step_ints = _flatten_int_list(raw_step_counts)
+                n_optim_steps = max(step_ints) if step_ints else 1
+                metrics.update(reduce_metrics(actor_metrics_meta))
                 if actor_updated:
                     removed = replay_buffer.commit(reservation)
                     metrics["buffer/removed_edges"] = float(len(removed))
                     metrics["buffer/size_after"] = float(len(replay_buffer))
                     self.successful_actor_updates += 1
-                    self.global_steps += 1
+                    # PLAN.md P0.3: `global_step` counts real optimizer.step()
+                    # calls; one update_actor may perform several. Bump by the
+                    # returned count so 512 selected edges + mini_batch=128
+                    # advance global_step by 4 in one iteration.
+                    self.optimizer_steps_this_iteration = int(n_optim_steps)
+                    self.global_steps += int(n_optim_steps)
+                    self.num_optimizer_steps_total = self.global_steps
                     # PLAN.md P0.N8: at least one successful update with no
                     # integrity failures flips the invariants-passed bit on.
                     if self.run_manifest.group_integrity_failures == 0:
                         self.run_manifest.record_invariant_pass()
+                    # PLAN.md P0.7: stamp observed counters + replay
+                    # diagnostics on the manifest.
+                    self._record_iteration_on_manifest(
+                        selected_edges=len(sampled_edges),
+                        sample_stats=sample_stats,
+                        actual_optimizer_steps=int(n_optim_steps),
+                    )
                 t_update = time.time() - t0
 
                 response_tokens = edge_batch.batch["response_mask"].sum().item()
-                ages = [self.global_steps - int(edge.get("generation_step", self.global_steps)) for edge in sampled_edges]
+                # PLAN.md P0.2: age uses rollout_iteration (never global_step).
+                ages = [
+                    self.rollout_iteration
+                    - int(
+                        edge.get(
+                            "generation_rollout_iteration",
+                            edge.get(
+                                "generation_step", self.rollout_iteration
+                            ),
+                        )
+                    )
+                    for edge in sampled_edges
+                ]
                 cum_train += t_gen + t_update
+                expected_optim_steps = int(
+                    len(sampled_edges)
+                    // int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
+                    * int(self.config.actor_rollout_ref.actor.get("ppo_epochs", 1))
+                )
                 timing = {
                     "step": self.global_steps,
                     "rollout_iteration": self.rollout_iteration,
@@ -593,6 +803,18 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     "train/unique_questions": float(len({edge.get("question_id") for edge in sampled_edges})),
                     "train/mean_edge_age": float(sum(ages) / len(ages) if ages else 0.0),
                     "train/max_edge_age": float(max(ages) if ages else 0),
+                    "training/rollout_iteration": float(self.rollout_iteration),
+                    "training/global_step": float(self.global_steps),
+                    "training/optimizer_steps_this_iteration": float(
+                        self.optimizer_steps_this_iteration
+                    ),
+                    "training/num_optimizer_steps_total": float(
+                        self.num_optimizer_steps_total
+                    ),
+                    "training/selected_edges_this_iteration": float(len(sampled_edges)),
+                    "training/expected_optimizer_steps_from_selected_edges": float(
+                        expected_optim_steps
+                    ),
                     "training/successful_actor_updates": float(self.successful_actor_updates),
                     "training/postponed_updates": float(self.postponed_updates),
                     "training/failed_updates": float(self.failed_updates),

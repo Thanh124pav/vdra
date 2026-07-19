@@ -185,11 +185,18 @@ def update_manifest_from_edges(
         integrity_metrics["vdra/objective_weight_normalization_failed"] = 1.0
         # Non-fatal for the segment-mean main path.
 
-    # PLAN.md P0.6: verify globally-unique tree ids (observed fact).
+    # PLAN.md P0.6/P0.7: verify globally-unique tree ids (observed fact).
     tree_ids = {str(e.get("tree_id", "")) for e in sampled_edges}
     manifest.extras["unique_tree_ids_verified"] = bool(tree_ids)
     manifest.extras["unique_tree_ids_count"] = len(tree_ids)
+    manifest.unique_tree_ids_verified = bool(tree_ids)
     integrity_metrics["vdra/unique_tree_ids"] = float(len(tree_ids))
+    # PLAN.md P0.7: replay age uses rollout_iteration when at least one
+    # observed edge carries the canonical stamp.
+    if any(
+        "generation_rollout_iteration" in edge for edge in sampled_edges
+    ):
+        manifest.replay_age_uses_rollout_iteration = True
     # PLAN.md P0.6: stored old log-probs are what the trainer forces via
     # meta_info["force_stored_old_log_probs"]; record the observed presence
     # both on the extras (legacy) and on the top-level manifest field.

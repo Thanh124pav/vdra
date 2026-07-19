@@ -54,9 +54,16 @@ gear_tree:
 
   replay_buffer:
     enabled: true
-    target_edges_per_update: 512
-    max_edges_per_question: 32
-    max_edge_age: 8
+    # PLAN.md P0.2 canonical names. The old aliases
+    # (target_edges_per_update / max_edges_per_question / max_edge_age)
+    # remain accepted for one release but must not appear in main configs.
+    target_edges_per_iteration: 512
+    max_edge_age_iterations: 8
+    # 'auto' resolves to ceil(R * (sum_d prod_{l<=d} b_l) / max_edge_age_iterations)
+    # from `tree_shape` and `actor_rollout_ref.rollout.n`. Numeric overrides
+    # are legal only for controlled compatibility/ablation runs.
+    max_edges_per_question_per_iteration: auto
+    replay_sampling_unit: edge
     underfill_policy: use_available
     underfilled_update_policy: postpone_until_divisible
     sampling_seed: 0
@@ -199,8 +206,8 @@ gear_tree:
     # Import path "module:callable" for allocation_proxy: external_score.
     external_score_module: null
 
-    # PLAN.md P0.5: rollout/scorer weight verification requires exactly one
-    # of the following two explicit modes:
+    # PLAN.md P0.5/P0.6: rollout/scorer weight verification requires exactly
+    # one of the following two explicit modes:
     #   (A) scorer_uses_rollout_server: true — the scorer replays log-probs
     #       through the SAME vLLM server the rollout uses; one verified
     #       weight version is sufficient.
@@ -208,12 +215,15 @@ gear_tree:
     #       the trainer fetches server-reported versions from each and fails
     #       (strict_vdra) when they are missing or mismatched.
     # Do NOT silently fall back from A to B.
-    scorer_uses_rollout_server: false
+    # Canonical smoke uses mode (A): scorer piggybacks on the rollout server
+    # so `pre_gpu_check.sh` and CPU CI can resolve one valid topology.
+    scorer_uses_rollout_server: true
     # Rollout endpoint used by the trainer to fetch the rollout replica's
-    # weight version. Leave empty in mode (A); required in mode (B).
+    # weight version. Must be null in mode (A); required in mode (B).
     rollout_api_base: null
     # OpenAI-compatible vLLM endpoint used to score log pi(y|prefix) for the
-    # VDRA likelihood scoring. Missing endpoint is a startup error in strict mode.
+    # VDRA likelihood scoring. In mode (A) this is also the rollout server.
+    # Missing endpoint is a startup error in strict mode.
     scorer_api_base: http://127.0.0.1:8000/v1
 
     # Empty => query <scorer_api_base>/models at startup and fail clearly if no served id is available.
@@ -315,6 +325,11 @@ actor_rollout_ref:
     entropy_coeff: 0.0
 
     clip_ratio: 0.2
+
+    # PLAN.md P0.3: canonical global optimizer batch size. With
+    # target_edges_per_iteration=512 this produces 512/128 = 4 optimizer
+    # steps per rollout iteration.
+    ppo_mini_batch_size: 128
 
     ppo_epochs: 1
 
