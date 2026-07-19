@@ -642,14 +642,19 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 "target_edges_per_iteration": int(
                     replay_buffer.target_edges_per_iteration
                 ),
-                "max_edges_per_question_per_iteration": int(
-                    replay_buffer.resolved_max_edges_per_question_per_iteration
-                ),
                 "max_edge_age_iterations": int(
                     replay_buffer.max_edge_age_iterations
                 ),
                 "current_rollout_iteration": int(self.rollout_iteration),
             }
+            # PLAN.md P0.A/P0.B: the per-question cap is an EDGE-sampler
+            # contract. The complete_tree ablation packs whole trees and may
+            # legitimately exceed it for a single-tree question, so the cap
+            # is only asserted on the canonical edge path.
+            if str(replay_buffer.replay_sampling_unit) == "edge":
+                kwargs["max_edges_per_question_per_iteration"] = int(
+                    replay_buffer.resolved_max_edges_per_question_per_iteration
+                )
         return update_manifest_from_replay_batch(
             manifest, sampled_edges, strict=strict, **kwargs
         )
