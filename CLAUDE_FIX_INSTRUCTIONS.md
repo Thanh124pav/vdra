@@ -1,68 +1,168 @@
-# Claude Fix Instructions — Difficulty Index
+# Claude Fix Instructions — Conflict-Safe Index
 
-This file is now an index only. The old single long guide is obsolete because it mixed local fixes with architecture-level refactors and made completion claims hard to verify.
+Read `PLAN.md` first.
 
-Read `PLAN.md` first, then execute these files in order:
+The previous instruction set allowed local fixes to redefine host-framework
+semantics. That is no longer permitted.
+
+## Mandatory rule
+
+```text
+PRESERVE VERL SEMANTICS BY DEFAULT.
+DO NOT CREATE A NEW CROSS-CUTTING CONTRACT SILENTLY.
+```
+
+Before changing code, prepare an impact map:
+
+```text
+symbol / behavior changed
+current VERL meaning
+all known consumers
+semantics preserved
+compatibility risks
+tests
+```
+
+If a change can affect any of the following, stop and discuss with the user
+before implementation:
+
+```text
+global_step
+total_training_steps
+scheduler cadence
+checkpoint/save/eval units
+policy objective or weights
+replay sampling/age/consumption
+zero-batch handling
+optimizer ownership
+FSDP/DDP scaling
+public config schema
+```
+
+Do not broaden a patch just because a test reveals an unrelated conflict.
+Report the conflict and wait.
+
+---
+
+# Canonical counter contract
+
+```text
+rollout_iteration
+    one generation/replay cycle
+    replay-age unit
+
+global_step
+    one successful outer VERL actor update
+    training loop/checkpoint/save/eval unit
+
+num_optimizer_steps_total
+    separate observational internal PPO-update metric
+    never drives the outer loop or scheduler
+
+scheduler
+    one step per successful update_actor call
+```
+
+For one normal 512/128/1 update:
+
+```text
+rollout_iteration         += 1
+global_step               += 1
+scheduler steps           += 1
+num_optimizer_steps_total += 4
+```
+
+---
+
+# Execution order
 
 ```text
 1. CLAUDE_FIX_EASY.md
 2. CLAUDE_FIX_MEDIUM.md
-3. CLAUDE_FIX_HARD.md
+3. CPU integration gate
+4. short GPU smoke
+5. CLAUDE_FIX_HARD.md verification only
 ```
+
+Hard production changes require explicit user approval.
 
 ## Easy
 
-Use `CLAUDE_FIX_EASY.md` for small, local fixes:
+Use `CLAUDE_FIX_EASY.md` for:
 
 ```text
-replay validation order
-missing-advantage handling
-cross-worker optimizer-step agreement
-pre-commit step verification
-monotonic manifest accounting failures
-stale comments/config claims
+disabling/removing the all-zero shortcut
+replay validation before tensorization
+strict missing-advantage validation
+stale comments/spec corrections
+host-counter regression tests
 ```
 
-These tasks should be implemented as focused commits and must not redesign scheduler or optimizer ownership.
+Easy tasks must not alter scheduler, global-step, total-step, FSDP, replay-unit,
+or objective semantics.
 
 ## Medium
 
-Use `CLAUDE_FIX_MEDIUM.md` for cross-function production changes:
+Use `CLAUDE_FIX_MEDIUM.md` for:
 
 ```text
-reserved-update transaction lifecycle
-strict tree_instance_id and derived edge_id
-canonical manifest invariant cleanup
-real Hydra/dataclass schema validation
+restoring three-counter separation
+pre-actor reservation rollback
+strict tree_instance_id / derived edge_id
+canonical manifest cleanup
+real Hydra/dataclass validation
 ```
 
-These tasks require failure-injection tests on production helpers.
+Medium changes require production success-path and failure-path tests.
 
-## Hard
+## Hard / discussion-gated
 
-Use `CLAUDE_FIX_HARD.md` for architecture-level refactors:
+Use `CLAUDE_FIX_HARD.md` for analysis and verification of:
 
 ```text
-total training-step unit
-global successful optimizer-step semantics
-scheduler placement
-non-finite did_step accounting
-per-optimizer-batch zero-signal skip
-FSDP/FSDP2 production parity
-post-refactor checkpoint and interval semantics
+actual FSDP/FSDP2 parity
+scheduler-per-internal-step proposals
+per-mini-batch zero skipping
+global-step/total-step redesign
+post-actor anomaly policy
+distributed scaling changes
 ```
 
-Do not split the step-unit/scheduler refactor into unrelated one-line patches.
+Except for verification, do not implement these automatically.
 
-## Completion rule
+---
+
+# Completion rule
 
 A task is not complete merely because:
 
 ```text
 a commit has the task name
-a helper unit test passes
-a source-string guard finds the expected function name
-a config file contains the intended value
+a helper test passes
+a source-string guard passes
+a config contains the desired value
 ```
 
-A task is complete only when its production success path and failure path satisfy `PLAN.md` and the corresponding difficulty guide.
+A task is complete only when:
+
+```text
+production success path passes
+production failure path passes
+host-framework semantics were preserved or explicitly approved
+all affected consumers were audited
+no new conflict was introduced
+```
+
+Every completion report must include:
+
+```text
+files changed
+behavior changed
+behavior preserved
+consumers audited
+tests run
+unresolved risks
+whether a conflict discussion is required
+```
+
+If a conflict is discovered, do not guess the user's preferred architecture.
