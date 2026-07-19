@@ -55,6 +55,45 @@ def save_trainer_state(
     return path
 
 
+def initial_next_threshold(global_step: int, freq: int) -> Optional[int]:
+    """PLAN.md P0.E: first save/eval threshold strictly above ``global_step``.
+
+    Derived (not persisted) so resume at ``global_step=400`` with
+    ``freq=10`` waits for 410, never re-fires 400.
+    """
+    freq = int(freq or 0)
+    if freq <= 0:
+        return None
+    return (int(global_step) // freq + 1) * freq
+
+
+def advance_past_thresholds(
+    *,
+    previous_step: int,
+    current_step: int,
+    next_threshold: Optional[int],
+    freq: int,
+) -> tuple[int, Optional[int]]:
+    """PLAN.md P0.E: crossed-threshold trigger semantics.
+
+    ``global_step`` advances by the actual optimizer-step count (e.g.
+    ``8 -> 12``), so a modulo check misses thresholds inside the jump. This
+    returns ``(crossed_count, new_next_threshold)`` where ``crossed_count``
+    is how many thresholds lie in ``(previous_step, current_step]`` — the
+    caller fires its action when the count is positive and the counter has
+    already advanced past every crossed threshold.
+    """
+    freq = int(freq or 0)
+    if freq <= 0 or next_threshold is None:
+        return 0, next_threshold
+    crossed = 0
+    threshold = int(next_threshold)
+    while int(previous_step) < threshold <= int(current_step):
+        crossed += 1
+        threshold += freq
+    return crossed, threshold
+
+
 def load_trainer_state(
     checkpoint_dir: str | Path,
 ) -> Optional[GearTreeTrainerState]:

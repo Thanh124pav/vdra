@@ -45,6 +45,8 @@ from recipe.gear_tree.run_manifest import (
 )
 from recipe.gear_tree.trainer_state import (
     GearTreeTrainerState,
+    advance_past_thresholds,
+    initial_next_threshold,
     load_trainer_state,
     save_trainer_state,
 )
@@ -797,6 +799,12 @@ class RayGearTreeTrainer(RayPPOTrainer):
 
         test_freq = self.config.trainer.get("test_freq", -1)
         save_freq = self.config.trainer.get("save_freq", -1)
+        # PLAN.md P0.E: global_step advances by the actual optimizer-step
+        # count, so save/eval fire on CROSSED thresholds, never on modulo.
+        # Derived from the (possibly restored) global_steps so resume never
+        # re-fires an already-passed threshold.
+        self.next_eval_step = initial_next_threshold(self.global_steps, test_freq)
+        self.next_save_step = initial_next_threshold(self.global_steps, save_freq)
 
         while self.global_steps < self.total_training_steps:
             for batch_dict in self.train_dataloader:
@@ -807,6 +815,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 # postponed / failed iterations do not carry the previous
                 # iteration's count forward.
                 self.optimizer_steps_this_iteration = 0
+                # PLAN.md P0.E: pre-update value for threshold crossing and
+                # unambiguous before/after logging.
+                global_step_before_update = int(self.global_steps)
                 metrics: Dict[str, Any] = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 gen_batch = self._get_gen_batch(batch)
@@ -848,7 +859,12 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 metrics["buffer/new_edges"] = len(new_edges)
                 metrics["buffer/postponed_update"] = 0.0
                 metrics["training/rollout_iteration"] = float(self.rollout_iteration)
-                metrics["training/optimizer_step"] = float(self.global_steps)
+                # PLAN.md P0.E: never log a pre-update value under an
+                # ambiguous name; the final training/global_step is always the
+                # post-update value set in the timing block below.
+                metrics["training/global_step_before_update"] = float(
+                    global_step_before_update
+                )
                 metrics["training/successful_actor_updates"] = float(self.successful_actor_updates)
                 if not sampled_edges:
                     logger.log(data=metrics, step=self.global_steps)
@@ -982,7 +998,6 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 timing = {
                     "step": self.global_steps,
                     "rollout_iteration": self.rollout_iteration,
-                    "optimizer_step": self.global_steps,
                     "timing/generation_seconds": t_gen,
                     "timing/update_seconds": t_update,
                     "timing/train_total_seconds": t_gen + t_update,
@@ -994,6 +1009,12 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     "train/mean_edge_age": float(sum(ages) / len(ages) if ages else 0.0),
                     "train/max_edge_age": float(max(ages) if ages else 0),
                     "training/rollout_iteration": float(self.rollout_iteration),
+                    # PLAN.md P0.E: one unambiguous final global_step (the
+                    # post-update value) plus explicit before/after keys.
+                    "training/global_step_before_update": float(
+                        global_step_before_update
+                    ),
+                    "training/global_step_after_update": float(self.global_steps),
                     "training/global_step": float(self.global_steps),
                     "training/optimizer_steps_this_iteration": float(
                         self.optimizer_steps_this_iteration
@@ -1029,16 +1050,31 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 logger.log(data=metrics, step=self.global_steps)
 
                 is_last_step = self.global_steps >= self.total_training_steps
+                # PLAN.md P0.E: a jump like 8 -> 12 must still fire the
+                # step-10 save/eval. Fire once when any threshold was crossed
+                # and advance the counter past every crossed threshold.
+                eval_crossed, self.next_eval_step = advance_past_thresholds(
+                    previous_step=global_step_before_update,
+                    current_step=self.global_steps,
+                    next_threshold=self.next_eval_step,
+                    freq=test_freq,
+                )
                 if (
                     test_freq > 0
-                    and (self.global_steps % test_freq == 0 or is_last_step)
+                    and (eval_crossed > 0 or is_last_step)
                     and self.val_reward_fn is not None
                 ):
                     val_metrics = self._validate()
                     if val_metrics:
                         logger.log(data=val_metrics, step=self.global_steps)
 
-                if save_freq > 0 and (self.global_steps % save_freq == 0 or is_last_step):
+                save_crossed, self.next_save_step = advance_past_thresholds(
+                    previous_step=global_step_before_update,
+                    current_step=self.global_steps,
+                    next_threshold=self.next_save_step,
+                    freq=save_freq,
+                )
+                if save_freq > 0 and (save_crossed > 0 or is_last_step):
                     self._save_checkpoint()
                     replay_metrics = self._maybe_save_replay_buffer()
                     logger.log(data=replay_metrics, step=self.global_steps)
