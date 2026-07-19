@@ -92,6 +92,10 @@ class RunManifest:
     tree_split_count: int = 0
     group_integrity_failures: int = 0
     segment_count_failures: int = 0
+    # PLAN.md P0.B: row-local failures observed on sampled replay batches
+    # (missing metadata, duplicate edge ids, cap/target violations, bad
+    # ages). Partial trees/parent groups are NOT failures at this stage.
+    replay_batch_failures: int = 0
 
     # PLAN.md P0.7 replay diagnostics from the most recent iteration.
     selected_edges_last_iteration: int = 0
@@ -123,6 +127,9 @@ class RunManifest:
 
     def record_segment_count_failure(self, count: int = 1) -> None:
         self.segment_count_failures += int(count)
+
+    def record_replay_batch_failure(self, count: int = 1) -> None:
+        self.replay_batch_failures += int(count)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -188,6 +195,13 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
     if manifest.group_integrity_failures > 0:
         failures.append(
             f"group_integrity_failures={manifest.group_integrity_failures} > 0"
+        )
+    # PLAN.md P0.B: row-local replay-batch failures (duplicate ids, missing
+    # metadata, cap/target/age violations) also invalidate the run. Partial
+    # trees or parent groups in a sampled batch are NOT counted here.
+    if manifest.replay_batch_failures > 0:
+        failures.append(
+            f"replay_batch_failures={manifest.replay_batch_failures} > 0"
         )
     if not manifest.segment_count_invariants_passed:
         failures.append("segment_count_invariants_passed=False")

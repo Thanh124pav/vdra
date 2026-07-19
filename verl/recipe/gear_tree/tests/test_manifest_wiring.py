@@ -198,7 +198,10 @@ def test_update_manifest_from_edges_raises_on_partial_group_strict():
         actor_loss_mode=cfg["actor_loss_mode"],
     )
     partial = _fresh_iid_group()[:1]
-    with pytest.raises(ValueError, match="Group-integrity"):
+    # PLAN.md P0.B: the deprecated alias treats its input as a COMPLETE
+    # generated batch, so a partial parent group fails construction
+    # validation.
+    with pytest.raises(ValueError, match="Tree-construction"):
         update_manifest_from_edges(manifest, partial, strict=True)
     # Failure is recorded even when we raise, so a killed strict run leaves
     # evidence on disk.

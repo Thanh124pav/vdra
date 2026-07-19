@@ -32,7 +32,8 @@ from recipe.gear_tree.replay_buffer import (
 )
 from recipe.gear_tree.manifest_lifecycle import (
     build_run_manifest,
-    update_manifest_from_edges,
+    update_manifest_from_generated_edges,
+    update_manifest_from_replay_batch,
 )
 from recipe.gear_tree.run_manifest import (
     POLICY_AGGREGATION_LEGACY,
@@ -590,14 +591,46 @@ class RayGearTreeTrainer(RayPPOTrainer):
         os.makedirs(self.config.trainer.default_local_dir, exist_ok=True)
         manifest.save(self._manifest_path())
 
-    def _update_manifest_from_edges(
+    def _update_manifest_from_generated_edges(
+        self,
+        manifest: RunManifest,
+        generated_edges: List[Dict[str, Any]],
+        *,
+        strict: bool,
+    ) -> Dict[str, Any]:
+        """PLAN.md P0.B: construction-stage validation of the COMPLETE
+        generated batch, before replay insertion."""
+        return update_manifest_from_generated_edges(
+            manifest, generated_edges, strict=strict
+        )
+
+    def _update_manifest_from_replay_batch(
         self,
         manifest: RunManifest,
         sampled_edges: List[Dict[str, Any]],
         *,
         strict: bool,
     ) -> Dict[str, Any]:
-        return update_manifest_from_edges(manifest, sampled_edges, strict=strict)
+        """PLAN.md P0.B: row-local validation of the sampled replay batch.
+        Partial trees/parent groups are legal here by design."""
+        replay_buffer = getattr(self, "replay_buffer", None)
+        kwargs: Dict[str, Any] = {}
+        if replay_buffer is not None:
+            kwargs = {
+                "target_edges_per_iteration": int(
+                    replay_buffer.target_edges_per_iteration
+                ),
+                "max_edges_per_question_per_iteration": int(
+                    replay_buffer.resolved_max_edges_per_question_per_iteration
+                ),
+                "max_edge_age_iterations": int(
+                    replay_buffer.max_edge_age_iterations
+                ),
+                "current_rollout_iteration": int(self.rollout_iteration),
+            }
+        return update_manifest_from_replay_batch(
+            manifest, sampled_edges, strict=strict, **kwargs
+        )
 
     def fit(self):
         from omegaconf import OmegaConf
@@ -670,6 +703,17 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 t0 = time.time()
                 new_edges = self._generate_tree_edges(gen_batch)
                 t_gen = time.time() - t0
+                # PLAN.md P0.B: full-tree CONSTRUCTION validation runs on the
+                # complete generated batch, before replay insertion. This is
+                # the only stage that may require complete parent groups and
+                # full-tree queue identities.
+                if new_edges:
+                    construction_metrics = (
+                        self._update_manifest_from_generated_edges(
+                            self.run_manifest, new_edges, strict=manifest_strict
+                        )
+                    )
+                    metrics.update(construction_metrics)
                 # PLAN.md P0.2: replay age is stamped in rollout iterations,
                 # not optimizer steps. `self.rollout_iteration` has already been
                 # incremented for this iteration above.
@@ -709,12 +753,14 @@ class RayGearTreeTrainer(RayPPOTrainer):
 
                 edge_batch = self._edges_to_update_batch(sampled_edges, metrics)
 
-                # PLAN.md P0.N7/N8: run group-integrity checks + metrics BEFORE
-                # the actor step so a broken reservation cannot corrupt state.
-                integrity_metrics = self._update_manifest_from_edges(
+                # PLAN.md P0.B: sampled replay batches get ROW-LOCAL checks
+                # only (edge-level replay legally splits trees and parent
+                # groups). Run BEFORE the actor step so a broken reservation
+                # cannot corrupt state.
+                replay_batch_metrics = self._update_manifest_from_replay_batch(
                     self.run_manifest, sampled_edges, strict=manifest_strict
                 )
-                metrics.update(integrity_metrics)
+                metrics.update(replay_batch_metrics)
 
                 t0 = time.time()
                 # P0.9: RayGearTreeTrainer never trains a critic, so there is

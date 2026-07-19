@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -480,6 +480,261 @@ def validate_group_integrity(
     }
 
 
+def _queue_segment_identity_failures(
+    edges: Sequence[Dict[str, Any]],
+) -> Tuple[int, List[str]]:
+    """PLAN.md P0.B: per-tree identity
+    ``sum_q queue_released_segment_count[q] == tree_total_segment_count``.
+
+    Only meaningful on a COMPLETE generated tree — a partial replay sample
+    is missing queues by design, so this must never run on sampled batches.
+    """
+    from collections import defaultdict
+
+    tree_totals: Dict[str, int] = {}
+    queue_totals: Dict[str, int] = defaultdict(int)
+    tree_queue_seen: Dict[Tuple[str, str], bool] = {}
+    for edge in edges:
+        tid = str(edge.get("tree_id", ""))
+        total = int(edge.get("tree_total_segment_count", 0) or 0)
+        if total > 0:
+            tree_totals[tid] = total
+        qid = str(edge.get("queue_flush_id", "0"))
+        q_key = (tid, qid)
+        if not tree_queue_seen.get(q_key):
+            tree_queue_seen[q_key] = True
+            queue_totals[tid] += int(edge.get("queue_released_segment_count", 0) or 0)
+    details: List[str] = []
+    for tid, total in tree_totals.items():
+        got = queue_totals.get(tid, total)
+        if got != total:
+            details.append(
+                f"tree {tid!r}: sum_q queue_released_segment_count = {got} "
+                f"!= tree_total_segment_count = {total}"
+            )
+    return len(details), details
+
+
+def validate_tree_construction(
+    edges: Sequence[Dict[str, Any]],
+    *,
+    strict_fresh_iid: bool = True,
+) -> Dict[str, Any]:
+    """PLAN.md P0.B: full generated-tree construction validation.
+
+    Runs once on the COMPLETE batch of edges extracted from freshly
+    generated trees, immediately after normalization and before the edges
+    are inserted into replay. It is the only place allowed to require
+    complete parent groups and full-tree queue identities:
+
+      * every parent group: one tree_id, one allocated_k;
+      * fresh_iid parent groups: row_count == allocated_k and
+        sample_multiplicity == 1 on every row;
+      * edge IDs unique within the generated batch;
+      * no pruned placeholder appears as a trainable edge;
+      * per tree: sum_q queue_released_segment_count[q] ==
+        tree_total_segment_count;
+      * stored old log-probs align with response tokens.
+
+    Raises ``ValueError`` on any failure when ``strict_fresh_iid``; returns
+    a diagnostics dict either way.
+    """
+    from collections import Counter
+
+    failures: List[str] = []
+
+    # Parent-group invariants (complete trees only).
+    try:
+        metrics = validate_group_integrity(edges, strict_fresh_iid=False)
+    except ValueError as exc:  # pragma: no cover - non-strict never raises
+        metrics = {"vdra/group_integrity_failures": 1}
+        failures.append(str(exc))
+    group_failures = int(metrics.get("vdra/group_integrity_failures", 0) or 0)
+    if group_failures:
+        failures.append(
+            f"{group_failures} parent-group integrity failure(s) in generated batch"
+        )
+
+    # Edge-ID uniqueness within the generated batch.
+    id_counts = Counter(str(e.get("edge_id", "")) for e in edges)
+    duplicate_ids = sorted(
+        eid for eid, count in id_counts.items() if count > 1 and eid
+    )
+    missing_ids = sum(1 for e in edges if not str(e.get("edge_id", "")))
+    if duplicate_ids:
+        failures.append(f"duplicate edge_id values: {duplicate_ids[:5]}")
+    if missing_ids:
+        failures.append(f"{missing_ids} generated edge(s) missing edge_id")
+
+    # Pruned placeholders must never be emitted as trainable edges.
+    pruned_rows = sum(1 for e in edges if bool(e.get("pruned", False)))
+    if pruned_rows:
+        failures.append(
+            f"{pruned_rows} pruned placeholder row(s) present in generated batch"
+        )
+
+    # Full-tree queue identity.
+    queue_failures, queue_details = _queue_segment_identity_failures(edges)
+    failures.extend(queue_details)
+
+    # Stored old log-probs must align with response tokens row by row.
+    misaligned = 0
+    for e in edges:
+        log_probs = e.get("actor_shifted_log_probs")
+        response = e.get("response_token_ids")
+        if log_probs is not None and response is not None:
+            if len(list(log_probs)) != len(list(response)):
+                misaligned += 1
+    if misaligned:
+        failures.append(
+            f"{misaligned} generated edge(s) with old log-probs misaligned "
+            "with response tokens"
+        )
+
+    metrics.update(
+        {
+            "vdra/construction_failures": len(failures),
+            "vdra/queue_segment_identity_failures": float(queue_failures),
+            "vdra/generated_duplicate_edge_ids": float(len(duplicate_ids)),
+            "vdra/generated_pruned_rows": float(pruned_rows),
+        }
+    )
+    if failures and strict_fresh_iid:
+        raise ValueError(
+            "Tree-construction validation failed (PLAN.md P0.B):\n  "
+            + "\n  ".join(failures)
+        )
+    return metrics
+
+
+def validate_replay_batch(
+    edges: Sequence[Dict[str, Any]],
+    *,
+    target_edges_per_iteration: Optional[int] = None,
+    max_edges_per_question_per_iteration: Optional[int] = None,
+    max_edge_age_iterations: Optional[int] = None,
+    current_rollout_iteration: Optional[int] = None,
+    strict: bool = True,
+) -> Dict[str, Any]:
+    """PLAN.md P0.B: sampled replay-batch validation (row-local only).
+
+    Edge-level replay intentionally splits trees and parent groups, so this
+    validator must NEVER require complete trees, complete parent groups,
+    ``row_count == allocated_k``, or queue totals reconstructed from the
+    partial sample. It checks only:
+
+      * required row metadata exists (edge_id, question_id,
+        generation_rollout_iteration, training advantage);
+      * edge_id values are unique in the sampled batch;
+      * stored old log-probs align with response tokens;
+      * ages are in ``[0, max_edge_age_iterations)`` (when age inputs given);
+      * per-question selected count <= resolved cap (when given);
+      * selected count <= target (when given).
+
+    Raises ``ValueError`` on failure when ``strict``; returns diagnostics.
+    """
+    from collections import Counter, defaultdict
+
+    failures: List[str] = []
+
+    missing_edge_id = 0
+    missing_question = 0
+    missing_generation_iteration = 0
+    missing_advantage = 0
+    misaligned_log_probs = 0
+    per_question: Dict[str, int] = defaultdict(int)
+    ages: List[int] = []
+    for e in edges:
+        if not str(e.get("edge_id", "")):
+            missing_edge_id += 1
+        qid = str(e.get("question_id", ""))
+        if not qid:
+            missing_question += 1
+        per_question[qid] += 1
+        if e.get("generation_rollout_iteration") is None:
+            missing_generation_iteration += 1
+        elif current_rollout_iteration is not None:
+            ages.append(
+                int(current_rollout_iteration)
+                - int(e.get("generation_rollout_iteration"))
+            )
+        if e.get("advantage") is None:
+            missing_advantage += 1
+        log_probs = e.get("actor_shifted_log_probs")
+        response = e.get("response_token_ids")
+        if log_probs is not None and response is not None:
+            if len(list(log_probs)) != len(list(response)):
+                misaligned_log_probs += 1
+
+    if missing_edge_id:
+        failures.append(f"{missing_edge_id} sampled edge(s) missing edge_id")
+    if missing_question:
+        failures.append(f"{missing_question} sampled edge(s) missing question_id")
+    if missing_generation_iteration:
+        failures.append(
+            f"{missing_generation_iteration} sampled edge(s) missing "
+            "generation_rollout_iteration"
+        )
+    if missing_advantage:
+        failures.append(
+            f"{missing_advantage} sampled edge(s) missing training advantage"
+        )
+    if misaligned_log_probs:
+        failures.append(
+            f"{misaligned_log_probs} sampled edge(s) with old log-probs "
+            "misaligned with response tokens"
+        )
+
+    id_counts = Counter(str(e.get("edge_id", "")) for e in edges)
+    duplicate_ids = sorted(
+        eid for eid, count in id_counts.items() if count > 1 and eid
+    )
+    if duplicate_ids:
+        failures.append(f"duplicate sampled edge_id values: {duplicate_ids[:5]}")
+
+    invalid_ages = 0
+    if ages and max_edge_age_iterations is not None:
+        invalid_ages = sum(
+            1 for a in ages if a < 0 or a >= int(max_edge_age_iterations)
+        )
+        if invalid_ages:
+            failures.append(
+                f"{invalid_ages} sampled edge(s) with age outside "
+                f"[0, {int(max_edge_age_iterations)})"
+            )
+
+    max_per_question = max(per_question.values()) if per_question else 0
+    if (
+        max_edges_per_question_per_iteration is not None
+        and max_per_question > int(max_edges_per_question_per_iteration)
+    ):
+        failures.append(
+            f"per-question selected count {max_per_question} exceeds resolved "
+            f"cap {int(max_edges_per_question_per_iteration)}"
+        )
+
+    if (
+        target_edges_per_iteration is not None
+        and len(edges) > int(target_edges_per_iteration)
+    ):
+        failures.append(
+            f"selected edge count {len(edges)} exceeds "
+            f"target_edges_per_iteration {int(target_edges_per_iteration)}"
+        )
+
+    metrics = {
+        "vdra/replay_batch_failures": len(failures),
+        "vdra/replay_selected_edges": float(len(edges)),
+        "vdra/replay_unique_questions": float(len(per_question)),
+        "vdra/replay_max_per_question": float(max_per_question),
+        "vdra/replay_invalid_ages": float(invalid_ages),
+    }
+    if failures and strict:
+        raise ValueError(
+            "Replay-batch validation failed (PLAN.md P0.B):\n  "
+            + "\n  ".join(failures)
+        )
+    return metrics
 
 
 def _compute_position_id_with_mask(attention_mask: torch.Tensor) -> torch.Tensor:

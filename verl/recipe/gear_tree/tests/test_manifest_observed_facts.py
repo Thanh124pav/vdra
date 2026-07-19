@@ -28,6 +28,7 @@ def _clean_edges():
     # rows for a tree with 2 realized segments -> tree_total_segment_count=2.
     return [
         {
+            "edge_id": "T0:e0",
             "tree_id": "T0",
             "parent_group_id": "T0:p0",
             "sample_multiplicity": 1,
@@ -38,6 +39,7 @@ def _clean_edges():
             "generation_rollout_iteration": 0,
         },
         {
+            "edge_id": "T0:e1",
             "tree_id": "T0",
             "parent_group_id": "T0:p0",
             "sample_multiplicity": 1,
