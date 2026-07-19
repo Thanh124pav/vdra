@@ -19,7 +19,10 @@ import torch  # noqa: E402  after importorskip
 
 from omegaconf import OmegaConf  # noqa: E402
 from verl.workers.config.actor import ActorConfig, PolicyLossConfig  # noqa: E402
-from recipe.gear_tree.policy_loss import _resolve_segment_token_reduction  # noqa: E402
+from recipe.gear_tree.policy_loss import (  # noqa: E402
+    _resolve_policy_loss_field,
+    _resolve_segment_token_reduction,
+)
 
 
 def _make_policy_loss_cfg(reduction: str = "mean") -> PolicyLossConfig:
@@ -201,6 +204,102 @@ class TestHydraComposition:
             segment_token_reduction="sum",
         )
         assert pl.segment_token_reduction == "sum"
+
+
+class TestPolicyLossFieldReads:
+    """PLAN.md P0.F: ``use_prob_mask`` / ``ratio_threshold`` are declared on
+    ``PolicyLossConfig`` and must be read from ``config.policy_loss.*``, not
+    from the ActorConfig top level."""
+
+    def test_actor_config_policy_loss_level_is_read(self):
+        cfg = ActorConfig(
+            strategy="fsdp",
+            rollout_n=1,
+            ppo_micro_batch_size_per_gpu=32,
+            policy_loss=PolicyLossConfig(
+                loss_mode="vdra_segment_mean_ppo",
+                use_prob_mask=False,
+                ratio_threshold=5.0,
+            ),
+        )
+        assert _resolve_policy_loss_field(cfg, "use_prob_mask", True) is False
+        assert _resolve_policy_loss_field(cfg, "ratio_threshold", 10.0) == 5.0
+
+    def test_wrong_level_duplicate_is_ignored(self):
+        cfg = OmegaConf.create(
+            {
+                "use_prob_mask": True,  # wrong level — must never be read
+                "ratio_threshold": 99.0,  # wrong level — must never be read
+                "policy_loss": {
+                    "use_prob_mask": False,
+                    "ratio_threshold": 5.0,
+                },
+            }
+        )
+        assert _resolve_policy_loss_field(cfg, "use_prob_mask", True) is False
+        assert _resolve_policy_loss_field(cfg, "ratio_threshold", 10.0) == 5.0
+
+    def test_bare_policy_loss_config_direct(self):
+        pl = PolicyLossConfig(
+            loss_mode="vdra_segment_mean_ppo",
+            use_prob_mask=False,
+            ratio_threshold=7.5,
+        )
+        assert _resolve_policy_loss_field(pl, "use_prob_mask", True) is False
+        assert _resolve_policy_loss_field(pl, "ratio_threshold", 10.0) == 7.5
+
+    def test_missing_everywhere_falls_back_to_default(self):
+        cfg = OmegaConf.create({})
+        assert _resolve_policy_loss_field(cfg, "use_prob_mask", True) is True
+        assert (
+            _resolve_policy_loss_field(cfg, "ratio_threshold", 10.0) == 10.0
+        )
+
+    def test_use_prob_mask_override_changes_production_loss(self):
+        """An override under actor.policy_loss must change actual loss
+        output: with the prob mask on, tokens whose old probability is
+        >= 0.9 are excluded from the surrogate."""
+        from recipe.gear_tree.policy_loss import (
+            compute_policy_loss_vdra_segment_mean,
+        )
+
+        n, t = 2, 4
+        # High-probability old tokens (exp(-0.01) ~ 0.99): masked out when
+        # use_prob_mask=True, included when False.
+        old_log_prob = torch.full((n, t), -0.01)
+        log_prob = torch.full((n, t), -0.5)
+        advantages = torch.full((n, t), 1.0)
+        response_mask = torch.ones((n, t))
+
+        def _cfg(use_prob_mask: bool) -> ActorConfig:
+            return ActorConfig(
+                strategy="fsdp",
+                rollout_n=1,
+                ppo_micro_batch_size_per_gpu=32,
+                policy_loss=PolicyLossConfig(
+                    loss_mode="vdra_segment_mean_ppo",
+                    use_prob_mask=use_prob_mask,
+                ),
+            )
+
+        loss_masked, *_ = compute_policy_loss_vdra_segment_mean(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            config=_cfg(True),
+            original_optimizer_batch_slot_count=n,
+        )
+        loss_unmasked, *_ = compute_policy_loss_vdra_segment_mean(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            config=_cfg(False),
+            original_optimizer_batch_slot_count=n,
+        )
+        assert torch.isclose(loss_masked, torch.tensor(0.0))
+        assert not torch.isclose(loss_unmasked, loss_masked)
 
 
 class TestStartupConsistencyCheck:

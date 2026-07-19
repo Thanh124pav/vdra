@@ -147,9 +147,12 @@ def compute_policy_loss_treetune(
     assert config is not None
 
     # treetune hyper-params (defaults match PPOHParams in ppo_trainer.py).
+    # PLAN.md P0.F: read PolicyLossConfig fields from config.policy_loss.*.
     cliprange = float(config.clip_ratio)              # PPOHParams.cliprange = 0.2
-    use_prob_mask = bool(config.get("use_prob_mask", True))
-    ratio_threshold = float(config.get("ratio_threshold", 10.0))
+    use_prob_mask = bool(_resolve_policy_loss_field(config, "use_prob_mask", True))
+    ratio_threshold = float(
+        _resolve_policy_loss_field(config, "ratio_threshold", 10.0)
+    )
 
     pg_losses, action_mask, ratio, pg_losses1, pg_losses2 = _ppo_clipped_token_surrogate(
         old_log_prob, log_prob, advantages, response_mask,
@@ -247,6 +250,41 @@ def hierarchical_reference_reduction(
 
 
 _VALID_SEGMENT_TOKEN_REDUCTIONS = ("mean", "sum")
+
+
+def _resolve_policy_loss_field(config, name: str, default):
+    """PLAN.md P0.F: canonical read for fields declared on ``PolicyLossConfig``.
+
+    Prefer ``config.policy_loss.<name>`` (the typed ActorConfig level). Fall
+    back to a top-level lookup ONLY when the caller passed the policy-loss
+    subconfig (or a bare dict) directly — a duplicate left at the ActorConfig
+    top level is never read once ``policy_loss`` carries the field, which
+    effectively removes wrong-level overrides.
+    """
+
+    if config is None:
+        return default
+    policy_loss_cfg = None
+    try:
+        policy_loss_cfg = getattr(config, "policy_loss", None)
+    except Exception:  # pragma: no cover — omegaconf edge cases
+        policy_loss_cfg = None
+    if policy_loss_cfg is None and hasattr(config, "get"):
+        policy_loss_cfg = config.get("policy_loss", None)
+    if policy_loss_cfg is not None:
+        if hasattr(policy_loss_cfg, "get"):
+            value = policy_loss_cfg.get(name, None)
+        else:
+            value = getattr(policy_loss_cfg, name, None)
+        if value is not None:
+            return value
+    # The caller passed the policy-loss subconfig directly (bare
+    # PolicyLossConfig / dict), or a legacy pre-migration config.
+    if hasattr(config, "get"):
+        value = config.get(name, None)
+    else:
+        value = getattr(config, name, None)
+    return default if value is None else value
 
 
 def _resolve_segment_token_reduction(config) -> str:
@@ -362,10 +400,13 @@ def compute_policy_loss_vdra_segment_mean(
 
     reduction = _resolve_segment_token_reduction(config)
     cliprange = float(config.clip_ratio)
-    use_prob_mask = bool(config.get("use_prob_mask", True))
+    # PLAN.md P0.F: PolicyLossConfig fields read from config.policy_loss.*.
+    use_prob_mask = bool(_resolve_policy_loss_field(config, "use_prob_mask", True))
     # PLAN.md P0.4: report the ratio as a metric; do NOT skip microbatches on
     # the canonical VDRA path.
-    ratio_threshold = float(config.get("ratio_threshold", float("inf")))
+    ratio_threshold = float(
+        _resolve_policy_loss_field(config, "ratio_threshold", float("inf"))
+    )
 
     pg_losses, action_mask, ratio, pg_losses1, pg_losses2 = _ppo_clipped_token_surrogate(
         old_log_prob, log_prob, advantages, response_mask,
@@ -495,11 +536,14 @@ def compute_policy_loss_vdra_node_balanced(
         )
 
     cliprange = float(config.clip_ratio)
-    use_prob_mask = bool(config.get("use_prob_mask", True))
+    # PLAN.md P0.F: PolicyLossConfig fields read from config.policy_loss.*.
+    use_prob_mask = bool(_resolve_policy_loss_field(config, "use_prob_mask", True))
     # PLAN.md P0.4: do NOT apply ratio_threshold as a per-microbatch skip on
     # the canonical VDRA path; only report the diagnostic. Legacy skip lives
     # in treetune_ppo.
-    ratio_threshold = float(config.get("ratio_threshold", float("inf")))
+    ratio_threshold = float(
+        _resolve_policy_loss_field(config, "ratio_threshold", float("inf"))
+    )
 
     pg_losses, action_mask, ratio, pg_losses1, pg_losses2 = _ppo_clipped_token_surrogate(
         old_log_prob, log_prob, advantages, response_mask,
