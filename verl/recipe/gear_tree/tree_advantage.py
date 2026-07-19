@@ -246,8 +246,13 @@ def extract_edges_from_tree(
                 # legacy fixture is used; prefer the max we saw.
                 if int(allocated_k) > slot["allocated_k"]:
                     slot["allocated_k"] = int(allocated_k)
+            # PLAN.md P0.G: the sparsity filter must use the EXACT scalar
+            # that token_fields_for_edges broadcasts into the policy
+            # `advantages` tensor (edge["advantage"]), never the diagnostic
+            # pav_advantage — otherwise rows with zero training signal could
+            # be kept (or trained rows dropped) inconsistently.
             if (not is_pruned or emit_pruned_edges) and (
-                not only_adv_greater_than_zero or pav_advantage != 0
+                not only_adv_greater_than_zero or advantage != 0
             ):
                 edges.append(edge)
                 if not is_pruned:

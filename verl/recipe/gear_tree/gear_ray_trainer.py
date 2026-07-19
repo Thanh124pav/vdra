@@ -28,6 +28,7 @@ from recipe.gear_tree.context_contract import (
 )
 from recipe.gear_tree.replay_buffer import (
     GearTreeReplayBuffer,
+    batch_has_zero_learning_signal,
     expected_optimizer_steps,
     reserve_replay_edges,
     should_postpone_sampled_update,
@@ -875,6 +876,22 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     metrics["buffer/postponed_update"] = 1.0
                     metrics["training/postponed_updates"] = float(self.postponed_updates)
                     metrics["buffer/size_after"] = float(len(replay_buffer))
+                    logger.log(data=metrics, step=self.global_steps)
+                    continue
+
+                # PLAN.md P0.G: a batch whose every training advantage is 0
+                # produces zero gradient. Skip the actor call entirely: no
+                # optimizer.step() runs and global_step does not advance. The
+                # reservation is COMMITTED — dead rows are consumed so they
+                # cannot be re-sampled every iteration until they expire.
+                if batch_has_zero_learning_signal(sampled_edges):
+                    removed = replay_buffer.commit(reservation)
+                    metrics["training/all_zero_batch_skipped"] = 1.0
+                    metrics["buffer/removed_edges"] = float(len(removed))
+                    metrics["buffer/size_after"] = float(len(replay_buffer))
+                    self.run_manifest.zero_contribution_selected_slots_last_iteration = len(
+                        sampled_edges
+                    )
                     logger.log(data=metrics, step=self.global_steps)
                     continue
 
