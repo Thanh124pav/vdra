@@ -1,900 +1,763 @@
-# Claude Implementation Guide — Finish VDRA Before GPU Smoke
+# Claude Fix Instructions — Finish the Production Path
 
-> This file is an implementation brief. Follow it literally. Do not redesign the method, restore parent-balanced weighting, or reinterpret the replay semantics.
->
-> `PLAN.md` contains the full specification. This file gives the shortest practical path to implement it correctly.
+> Follow this file literally. Do not redesign the method. Do not claim completion from config changes, helper tests, or synthetic mirrors alone. Every task must be verified on the production path.
+
+`PLAN.md` is the full specification. This file is the execution guide for the current repository state after PR #7.
 
 ---
 
-# 0. Final behavior in one picture
+# 0. What is already done
+
+Do not reimplement these unless a regression test fails:
 
 ```text
-ONE ROLLOUT ITERATION
+DONE
 
-Generate new trees
-    │
-    ├─ stamp rollout_iteration on every new edge
-    ├─ add edges to replay
-    └─ expire edges older than 8 rollout iterations
-
-Replay sampling
-    │
-    ├─ sampling unit: edge / segment
-    ├─ group by question_id
-    ├─ per-question cap: computed automatically from tree_shape and age window
-    └─ select up to 512 edges for this rollout iteration
-
-Policy optimization
-    │
-    ├─ split selected edges into global optimizer batches of 128
-    ├─ each 128-edge batch may be split into GPU microbatches
-    ├─ accumulate gradients across those microbatches
-    └─ call optimizer.step() exactly once per 128-edge batch
-
-Counters for a full 512-edge iteration
-    │
-    ├─ rollout_iteration += 1
-    ├─ optimizer_steps_this_iteration = 4
-    └─ global_step += 4
+✓ PolicyLossConfig declares segment_token_reduction
+✓ accepted values are mean and sum
+✓ main loss supports token mean and token sum
+✓ main loss supports optimizer-batch slot averaging
+✓ ppo_mini_batch_size defaults to 128
+✓ target_edges_per_iteration defaults to 512
+✓ actor counts actual optimizer.step() calls
+✓ trainer increases global_step by returned optimizer-step count
+✓ replay edges can store generation_rollout_iteration
+✓ replay age helper uses rollout iteration
+✓ auto-cap helper exists
+✓ [6,6,6], age 8 resolves to 33
+✓ [8,8,8], age 8 resolves to 73
+✓ default scorer topology is same-server mode
 ```
 
-Canonical defaults:
+Do not write another synthetic test that only repeats these identities. Fix the remaining production mismatches below.
+
+---
+
+# 1. The actual remaining blocker
+
+Current configuration says:
 
 ```yaml
-target_edges_per_iteration: 512
-ppo_mini_batch_size: 128
-ppo_epochs: 1
-max_edge_age_iterations: 8
-max_edges_per_question_per_iteration: auto
 replay_sampling_unit: edge
-policy_aggregation: global_segment_mean
-segment_token_reduction: mean
+max_edges_per_question_per_iteration: auto
+strict_group_integrity: true
+```
+
+But the trainer still does:
+
+```python
+if manifest_strict:
+    reserve_complete_trees_for_update(...)
+else:
+    reserve_for_update(...)
+```
+
+Therefore the canonical strict main run still uses complete-tree replay.
+
+This is wrong.
+
+For a `666` tree:
+
+```text
+full tree = 258 edges
+auto cap  = 33 edges/question/iteration
+```
+
+Complete-tree replay can select all 258 edges and ignore the intended cap.
+
+It can also pack two trees:
+
+```text
+258 + 258 = 516
+```
+
+and then actor splitting can create:
+
+```text
+128 + 128 + 128 + 128 + 4
+```
+
+That unintended 4-row optimizer step is a new regression.
+
+Fix this chain end to end.
+
+---
+
+# 2. Final canonical flow
+
+```text
+ROLLOUT ITERATION
+
+Generate complete trees
+    ↓
+Validate full-tree construction invariants
+    ↓
+Convert realized non-placeholder segments to replay edges
+    ↓
+Add edges transactionally
+    ↓
+Expire by rollout_iteration age
+    ↓
+Sample individual edges by question cap
+    ↓
+Select at most 512 total
+    ↓
+Require selected_count % 128 == 0
+    ↓
+Split into optimizer batches of 128
+    ↓
+One optimizer.step() per batch
+```
+
+Counters:
+
+```text
+rollout_iteration = generation/replay-fill cycles
+global_step       = successful optimizer.step() calls
+```
+
+For 512 edges:
+
+```text
+rollout_iteration += 1
+global_step += 4
 ```
 
 ---
 
-# 1. Non-negotiable semantics
+# 3. Phase 1 — Switch strict main to real edge-level replay
 
-## 1.1 Counters
-
-Use three separate concepts:
+## Target files
 
 ```text
-rollout_iteration
-    Number of generation/replay-fill cycles.
-    Used for replay age.
-
-global_step
-    Number of successful actual optimizer.step() calls.
-    Used for LR scheduler, optimizer-step checkpoints, and optimizer-step logs.
-
-optimizer_steps_this_iteration
-    Number of successful optimizer.step() calls during the current rollout iteration.
-```
-
-Do not increment `global_step` once per call to `update_actor()` if that call contains several optimizer steps.
-
-Do not use `global_step` to expire replay rows.
-
-## 1.2 Replay
-
-Replay sampling unit is one edge, which is one training segment.
-
-Do not require complete-tree replay in the canonical path.
-
-The old TreeTune diversity mechanism is intentional:
-
-```text
-large tree
-→ its edges remain in replay for several rollout iterations
-→ each question contributes at most an automatically resolved cap per iteration
-```
-
-## 1.3 Policy objective
-
-The generated-tree derivation remains:
-
-\[
-\widehat g_T
-=
-\frac{1}{N_{\mathrm{seg}}(T)}
-\sum_{s\in\mathcal S(T)}A_sH_s
-=
-\sum_q\frac{n_q}{N_{\mathrm{seg}}(T)}
-\left(\frac1{n_q}\sum_{s\in\mathcal S_q}A_sH_s\right).
-\]
-
-Queue regrouping is analysis only. It must not produce queue weights in the actor loss.
-
-During replay training, every selected segment slot in one optimizer batch has equal outer weight.
-
-For one optimizer batch `B` of 128 selected slots:
-
-\[
-L_B^{(r)}
-=
-\frac{1}{N_B}
-\sum_{s\in\operatorname{retained}(B)}L_s^{(r)},
-\qquad N_B=128
-\]
-
-for a full batch.
-
-Supported within-segment reductions:
-
-```text
-mean: average active token losses inside the segment
-sum:  sum active token losses inside the segment
-```
-
-`mean` is default. `sum` is a supported ablation.
-
-Do not use parent-balanced `objective_weights` in the canonical path.
-
----
-
-# 2. Implement in this order
-
-Follow the phases in order. Do not start GPU work before Phase 8 passes.
-
----
-
-# Phase 1 — Fix configuration wiring
-
-## Problem
-
-`segment_token_reduction` was added to YAML but is not reliably declared/read through the real actor config schema. The `sum` option may be rejected or silently fall back to `mean`.
-
-## Required changes
-
-### A. Declare the field in the real schema
-
-Target:
-
-```text
-verl/verl/workers/config/actor.py
-```
-
-Add to `PolicyLossConfig`:
-
-```python
-segment_token_reduction: str = "mean"
-```
-
-Validate it is exactly one of:
-
-```python
-{"mean", "sum"}
-```
-
-### B. Use one actor-side source of truth
-
-Canonical source:
-
-```text
-actor_rollout_ref.actor.policy_loss.segment_token_reduction
-```
-
-The loss must read:
-
-```python
-config.policy_loss.segment_token_reduction
-```
-
-not:
-
-```python
-config.get("segment_token_reduction", "mean")
-```
-
-at the wrong config level.
-
-### C. Validate duplicate config fields
-
-If this remains:
-
-```text
-tree_policy.segment_token_reduction
-```
-
-then startup must assert:
-
-```text
-tree_policy.segment_token_reduction
-== actor.policy_loss.segment_token_reduction
-```
-
-### D. Canonical config
-
-Target:
-
-```text
+verl/recipe/gear_tree/gear_ray_trainer.py
+verl/recipe/gear_tree/replay_buffer.py
 verl/recipe/gear_tree/config/gear_tree_trainer.yaml
 ```
 
-Set:
+## Required change
 
-```yaml
-tree_policy:
-  policy_aggregation: global_segment_mean
-  segment_token_reduction: mean
+Canonical main must call:
 
-actor_rollout_ref:
-  actor:
-    ppo_mini_batch_size: 128
-    ppo_epochs: 1
-    policy_loss:
-      loss_mode: vdra_segment_mean_ppo
-      segment_token_reduction: mean
+```python
+reservation = replay_buffer.reserve_for_update(
+    current_rollout_iteration=self.rollout_iteration,
+)
 ```
 
-## Tests
+Do not choose complete-tree reservation because `strict_group_integrity` is true.
 
-- Hydra-compose the real main config.
-- Instantiate the real `ActorConfig` and `PolicyLossConfig`.
-- Repeat with `segment_token_reduction=sum`.
-- Verify production loss code receives `sum`.
-- Invalid value such as `average` must fail before training.
+Strictness controls validation, not sampling unit.
+
+If complete-tree replay remains supported, require an explicit ablation config:
+
+```yaml
+replay_sampling_unit: complete_tree
+```
+
+Then dispatch by `replay_sampling_unit`, not by manifest strictness.
+
+## Edge sampler requirements
+
+```text
+- group available edges by question_id
+- apply resolved per-question cap
+- sample individual edges
+- return at most target_edges_per_iteration
+- never exceed 512
+- never duplicate rows
+- reserve exact IDs
+- commit only after successful actor update
+- rollback unchanged on failure
+```
+
+## Required production tests
+
+Use the actual `RayGearTreeTrainer` replay-selection helper or a directly extracted production function.
+
+Test:
+
+```text
+strict main + replay_sampling_unit=edge
+→ reserve_for_update is called
+→ reserve_complete_trees_for_update is not called
+```
+
+Also test:
+
+```text
+666 tree → at most 33 edges for one question
+888 tree → at most 73 edges for one question
+516 available candidates → exactly 512 selected
+```
+
+Do not mark Phase 1 complete if only `compute_max_edges_per_question()` passes.
 
 ---
 
-# Phase 2 — Replace replay configuration semantics
+# 4. Phase 2 — Split construction validation from replay validation
 
 ## Problem
 
-Current names imply that 512 edges are one optimizer update. They are actually the target edge count consumed in one rollout iteration.
-
-Complete-tree replay also conflicts with the intended TreeTune-style diversity behavior.
-
-## Required config
-
-Replace or deprecate:
+Current `validate_group_integrity()` expects a sampled batch to contain all siblings:
 
 ```text
-target_edges_per_update
-max_edge_age
-max_edges_per_question
+sampled parent row count == allocated_k
 ```
 
-with:
+That conflicts with edge-level replay.
+
+## Required architecture
+
+Create two separate validators.
+
+### A. Full generated-tree validator
+
+Run immediately after tree-to-edge extraction, before replay insertion.
+
+Validate:
 
 ```text
-target_edges_per_iteration
-max_edge_age_iterations
-max_edges_per_question_per_iteration
-replay_sampling_unit
+realized_child_count == allocated_k under fresh_iid
+sample_multiplicity == 1 under fresh_iid
+edge IDs unique
+no pruned placeholder counted as trainable segment
+sum queue segment counts == tree total segment count
+old log-probs align with response tokens
 ```
 
-Canonical values:
+This validator sees the complete generated tree.
 
-```yaml
-replay_buffer:
-  target_edges_per_iteration: 512
-  max_edge_age_iterations: 8
-  max_edges_per_question_per_iteration: auto
-  replay_sampling_unit: edge
-```
+### B. Sampled replay-batch validator
 
-Backward-compatible aliases may be accepted temporarily, but canonical configs, manifests, logs, and tests must use the new names.
+Run before `edges_to_dataproto()`.
 
-## Replay age
-
-Each new edge must store:
+Validate only row-local and replay constraints:
 
 ```text
-generation_rollout_iteration
+required fields exist
+edge IDs unique
+question IDs exist
+generation_rollout_iteration exists
+age is in [0, max_edge_age_iterations)
+per-question selected count <= resolved cap
+selected count <= target
+old log-probs align with response tokens
+actual training advantage exists
 ```
 
-Expire when:
-
-```python
-current_rollout_iteration - generation_rollout_iteration >= max_edge_age_iterations
-```
-
-Never use optimizer `global_step` for this calculation.
-
-## Sampling behavior
-
-Canonical sampler:
+Do not require:
 
 ```text
-1. remove expired unreserved edges
-2. group remaining edges by stable question_id
-3. select at most resolved_cap edges per question
-4. combine candidates
-5. sample up to target_edges_per_iteration
-6. reserve selected edge IDs
-7. commit only after successful actor execution
-8. rollback unchanged on actor failure
+complete tree
+complete parent group
+sampled row count == allocated_k
+queue totals reconstructed from sampled rows
 ```
 
-Sampling unit is one edge. Do not pack complete trees.
+## Regression test
 
-Do not duplicate rows to fill 512.
+A sampled batch containing only 2 of 6 children from one parent must pass replay validation.
+
+The original full tree with only 5 realized children when `allocated_k=6` must still fail construction validation.
 
 ---
 
-# Phase 3 — Compute the per-question cap automatically
+# 5. Phase 3 — Remove old objective weights from canonical DataProto
 
-## Formula
+## Problem
 
-For:
-
-```text
-tree_shape = [b1, b2, ..., bD]
-```
-
-compute maximum non-root edges per full tree:
-
-\[
-E_{\max}
-=
-\sum_{d=1}^{D}\prod_{\ell=1}^{d}b_\ell.
-\]
-
-If one question may create `R` stochastic trees per rollout iteration:
-
-\[
-E_{\max}^{\text{question/iteration}}=R E_{\max}.
-\]
-
-Resolve:
-
-\[
-C_{\text{question}}
-=
-\left\lceil
-\frac{E_{\max}^{\text{question/iteration}}}
-{\text{max edge age iterations}}
-\right\rceil.
-\]
-
-Examples for `R=1`, age 8:
-
-```text
-[6,6,6]
-E_max = 6 + 36 + 216 = 258
-cap   = ceil(258 / 8) = 33
-
-[8,8,8]
-E_max = 8 + 64 + 512 = 584
-cap   = ceil(584 / 8) = 73
-```
-
-## Implementation requirements
-
-- Resolve `auto` during startup after the final tree config is known.
-- Do not retain a hidden hard-coded fallback of 32 in the main path.
-- Numeric override may exist for compatibility or ablation only.
-- Log both configured and resolved values.
-
-Required logs:
-
-```text
-replay/tree_max_edges
-replay/trees_per_question_per_iteration
-replay/max_edge_age_iterations
-replay/resolved_max_edges_per_question_per_iteration
-```
-
-## Tests
-
-- `666 → 33`.
-- `888 → 73`.
-- Changing tree shape must change the resolved cap.
-- Sampling never exceeds the resolved cap for one question.
-
----
-
-# Phase 4 — Fix optimizer-step control flow
-
-## Required behavior
-
-Given:
-
-```text
-selected edges = 512
-ppo_mini_batch_size = 128
-ppo_epochs = 1
-```
-
-production must perform:
-
-```text
-4 actual optimizer.step() calls
-```
-
-Each 128-edge optimizer batch may be split into microbatches for memory, but those microbatches belong to one optimizer step.
-
-Correct structure:
-
-```python
-optimizer_steps_this_iteration = 0
-
-for epoch in range(ppo_epochs):
-    for optimizer_batch in split(selected_edges, global_batch_size=128):
-        optimizer.zero_grad()
-
-        for microbatch in split_for_memory(optimizer_batch):
-            partial_loss = compute_partial_loss(
-                microbatch,
-                original_optimizer_batch_size=len(optimizer_batch),
-            )
-            partial_loss.backward()
-
-        optimizer.step()
-        lr_scheduler.step()
-
-        global_step += 1
-        optimizer_steps_this_iteration += 1
-```
-
-Do not normalize each 128-edge optimizer step using a denominator of 512.
-
-Do not call `optimizer.step()` after every GPU microbatch.
-
-## Underfilled behavior
-
-Canonical behavior:
-
-```text
-postpone until selected edge count is divisible by 128
-```
-
-Alternative smaller final optimizer batch is allowed only if explicitly configured, tested, and logged.
-
-Do not silently treat a 17-edge tail as if it had denominator 128.
-
-## Counter propagation
-
-The actor must return the number of successful optimizer steps to the trainer.
-
-Example actor metadata:
-
-```python
-actor_output.meta_info["num_optimizer_steps"] = 4
-```
-
-The trainer must increment its persisted `global_step` by the returned value, not by one.
-
-Better: make the actor/trainer share one authoritative counter update contract so double-increment is impossible.
-
----
-
-# Phase 5 — Fix loss normalization
-
-## One optimizer batch
-
-For each 128-edge optimizer batch:
-
-```text
-N_B = selected segment slots before optional zero-row sparsification
-```
-
-For each retained row:
-
-```python
-if reduction == "mean":
-    row_loss = masked_token_loss.sum() / active_token_count
-elif reduction == "sum":
-    row_loss = masked_token_loss.sum()
-```
-
-Then:
-
-```python
-batch_loss = sum(row_losses) / N_B
-```
-
-When split into microbatches, each microbatch contributes:
-
-```python
-partial_loss = sum(row_losses_in_microbatch) / N_B
-```
-
-and all partial gradients are accumulated before one optimizer step.
-
-## Remove float objective tensors from the main path
-
-Do not create or attach these for canonical VDRA:
+`edges_to_dataproto()` still always attaches:
 
 ```text
 objective_weights
 segment_objective_weights
 ```
 
-Keep legacy tensors only inside explicit legacy-ablation code paths when those modes are selected.
+The canonical main loss no longer uses them.
 
-Use integer counts and compute denominators in the actor.
+They preserve old tree/parent assumptions and keep manifest logic coupled to complete trees.
 
-Suggested dtype handling:
+## Required change
 
-```python
-row_loss_fp32 = row_loss.float()
-loss_fp32 = row_loss_fp32.sum() / float(original_batch_slot_count)
+Make tensorization aware of policy loss mode or pass an explicit flag.
+
+For:
+
+```text
+loss_mode = vdra_segment_mean_ppo
 ```
 
-Model forward/backward may remain BF16/FP16.
+do not compute or attach:
+
+```text
+objective_weights
+segment_objective_weights
+```
+
+For:
+
+```text
+loss_mode = vdra_node_balanced_ppo
+```
+
+the ablation may still attach its required tensors.
+
+Remove canonical manifest checks for tree-normalized and parent-normalized float weights.
+
+Keep only metadata needed for diagnostics and strict construction validation.
+
+## Test
+
+```python
+batch = edges_to_dataproto(..., loss_mode="vdra_segment_mean_ppo")
+assert "objective_weights" not in batch.batch
+assert "segment_objective_weights" not in batch.batch
+```
+
+Also verify the node-balanced ablation still works.
+
+---
+
+# 6. Phase 4 — Enforce exact sample and optimizer-batch sizes
+
+## Canonical rule
+
+```text
+selected_count <= 512
+selected_count % 128 == 0 before actor call
+```
+
+Allowed selected counts:
+
+```text
+128
+256
+384
+512
+```
+
+Canonical path must postpone and roll back for counts such as:
+
+```text
+4
+130
+258
+516
+```
+
+`516` must first be clipped/sampled to at most 512, never forwarded as 516.
+
+## Required implementation
+
+After reservation:
+
+```python
+n = len(sampled_edges)
+
+if n > target_edges_per_iteration:
+    raise AssertionError("sampler exceeded target")
+
+if n % ppo_mini_batch_size != 0:
+    replay_buffer.rollback(reservation)
+    postpone()
+```
+
+Do not rely on this old condition:
+
+```python
+len(sampled_edges) < target and len(sampled_edges) % ppo_mini != 0
+```
+
+because it allows oversized non-divisible batches.
+
+Expected optimizer steps:
+
+```python
+expected_steps = n // 128 * ppo_epochs
+```
+
+Only compute this after divisibility validation.
 
 ## Tests
 
-For both `mean` and `sum`:
-
-- 128 rows processed directly.
-- The same 128 rows processed as 2, 4, and 8 microbatches.
-- Same loss and parameter gradients.
-- Same result after row permutation.
-- Tests must execute `optimizer.step()` in the production location.
-
-Mode distinction:
-
 ```text
-mean: duplicate identical tokens inside one segment → row loss unchanged
-sum:  duplicate identical tokens inside one segment → row loss doubles
+512 → 4 steps
+384 → 3 steps
+130 → postpone
+516 candidates → select 512, then 4 steps
+no final 4-row optimizer batch
 ```
 
 ---
 
-# Phase 6 — Fix zero-advantage handling
+# 7. Phase 5 — Fix checkpoint/resume counter state
 
-## Canonical safe path
+## Current regression
 
-It is acceptable to keep all rows initially:
+The trainer restores `global_step` but resets `rollout_iteration` to zero.
 
-```yaml
-only_adv_greater_than_zero: false
-```
+Restored replay rows may then have negative age.
 
-Get the dense path correct first.
+## Required state file
 
-## Optional sparse path
-
-If zero-contribution rows are removed before model execution:
-
-- Decide using the exact advantage used by the policy loss.
-- Do not filter using `pav_advantage` if training uses another `advantage`.
-- Preserve the original optimizer-batch slot count `N_B`.
-- Dense and sparse execution must produce identical loss and gradients.
-
-Example:
+Save inside each checkpoint directory:
 
 ```text
-selected slots = 128
-nonzero retained rows = 20
-N_B remains 128
-loss = sum(20 nonzero row losses) / 128
+gear_tree_trainer_state.json
 ```
 
-All-zero selected batch:
+Contents:
 
-- do not call `optimizer.step()`;
-- do not increment `global_step`;
-- log the event;
-- use one explicit tested replay policy for those selected rows.
-
-## Required cleanup
-
-Update all validators so they distinguish:
-
-```text
-pre-filter realized rows
-post-filter retained rows
+```json
+{
+  "global_step": 400,
+  "rollout_iteration": 100,
+  "num_optimizer_steps_total": 400
+}
 ```
 
-Do not require:
+Restore this state before replay is used.
+
+## Legacy checkpoint behavior
+
+For a checkpoint without the new state file:
+
+Choose one explicit safe behavior:
 
 ```text
-retained_row_count == allocated_k
-```
-
-after sparse filtering.
-
-Allowed invariant:
-
-```text
-retained_row_count <= realized_child_count == allocated_k
-```
-
----
-
-# Phase 7 — Fix IDs, scorer contract, distributed scaling, and manifest
-
-## 7.1 Unique IDs
-
-Strict main path requires a unique `tree_instance_id` containing enough information to distinguish stochastic trees for the same question and snapshot:
-
-```text
-policy_snapshot_id
-rollout_iteration
-stable_question_id
-UUID or monotonic counter
-```
-
-No fallback to only:
-
-```text
-(snapshot, question)
-```
-
-Replay insertion remains transactional and rejects duplicate `edge_id`.
-
-## 7.2 Scorer and rollout endpoints
-
-Canonical config must resolve one valid topology:
-
-```text
-same server
+A. reset replay and start rollout_iteration from 0
 ```
 
 or:
 
 ```text
-two explicit endpoints
+B. restore replay and set rollout_iteration >= max edge generation iteration
 ```
 
-Strict mode must fail before training when endpoints or reported model versions are missing/mismatched.
+Emit a warning. Never silently create negative ages.
 
-Do not keep a default config that necessarily fails its own validator.
-
-## 7.3 Distributed scaling
-
-`ppo_mini_batch_size=128` means global optimizer batch size.
-
-It does not mean 128 rows independently on every DP rank.
-
-Required equivalence:
+## Tests
 
 ```text
-single rank, global batch 128
-==
-multi-rank sharding of the same 128 rows after actual DDP/FSDP gradient averaging
+save at global_step=400, rollout_iteration=100
+load
+assert exact counter equality
+assert restored replay edge ages are non-negative
+assert expiry still happens after 8 rollout iterations
 ```
-
-Verify whether the framework averages or sums gradients and compensate exactly once.
-
-Do not divide by world size twice.
-
-## 7.4 Manifest
-
-Remove these as canonical requirements:
-
-```text
-complete_tree_replay
-complete_parent_microbatches
-node_balanced_invariants_passed
-```
-
-Required fields include:
-
-```text
-policy_aggregation
-segment_token_reduction
-replay_sampling_unit
-target_edges_per_iteration
-resolved_max_edges_per_question_per_iteration
-max_edge_age_iterations
-ppo_mini_batch_size
-ppo_epochs
-rollout_iteration
-global_step
-optimizer_steps_last_iteration
-num_optimizer_steps_total
-replay_age_uses_rollout_iteration
-optimizer_step_accounting_valid
-stored_old_log_probs_used
-rollout_scorer_weights_verified
-no_truncation
-unique_tree_ids_verified
-```
-
-Operational booleans must come from observed runtime evidence.
-
-Do not set `stored_old_log_probs_used=True` merely because a tensor existed before actor execution. Confirm the actor used the stored denominator path.
-
-Replay diagnostics:
-
-```text
-selected edges
-unique questions
-age histogram
-mean age
-max age
-resolved cap
-max selected count for one question
-actual optimizer-step count
-zero-contribution slots
-```
-
-Do not claim that each age bucket contributes exactly `1/8`; log the observed histogram.
 
 ---
 
-# Phase 8 — Build a real pre-GPU gate
+# 8. Phase 6 — Fix logging and save/eval threshold crossing
 
-Update:
+## Logging bug
 
-```text
-scripts/pre_gpu_check.sh
-.github/workflows/cpu-ci.yml
-```
+The current event may contain a pre-update value under one key and a post-update value under another.
 
-The gate must test production integration, not only helper functions.
-
-Required checks:
+Use:
 
 ```text
-[ ] compileall passes
-[ ] Hydra main config composes
-[ ] real ActorConfig/PolicyLossConfig instantiate
-[ ] mean mode reaches production loss
-[ ] sum mode reaches production loss
-[ ] 666 auto cap = 33
-[ ] 888 auto cap = 73
-[ ] edge-level replay respects cap
-[ ] replay expiry uses rollout_iteration
-[ ] 512 selected edges / 128 batch = four optimizer.step() calls
-[ ] trainer global_step increases by four
-[ ] scheduler steps four times
-[ ] rollout_iteration increases by one
-[ ] microbatch gradients match direct 128-row reference
-[ ] two-rank gradients match one-rank reference
-[ ] dense and sparse zero handling match
-[ ] duplicate replay insertion is transactional
-[ ] strict scorer endpoint/version tests pass
-[ ] manifest records observed counters
-[ ] Smoke A-D configs compose
+training/global_step_before_update
+training/global_step_after_update
+training/global_step
+training/rollout_iteration
+training/optimizer_steps_this_iteration
 ```
 
-Do not skip `test_trainer_contracts.py` if it contains relevant integration tests.
+The final `training/global_step` must equal the post-update value.
 
-A helper test that computes:
+Remove or rename ambiguous `training/optimizer_step`.
+
+## Frequency bug
+
+A call may jump:
+
+```text
+8 → 12
+```
+
+A modulo check misses save/eval step 10.
+
+Use crossed thresholds:
 
 ```python
-(loss_a + loss_b).backward()
+previous = global_step_before_update
+current = global_step_after_update
+
+while previous < next_save_step <= current:
+    save_checkpoint()
+    next_save_step += save_freq
 ```
 
-is not sufficient evidence for production code that performs separate optimizer steps.
+Apply the same principle to evaluation and profiling triggers.
 
-Only print:
+## Tests
 
 ```text
-PRE_GPU_CHECK=PASS
+8 → 12 with save_freq=10 triggers save
+8 → 12 with test_freq=10 triggers evaluation
+final log contains one consistent global_step=12
 ```
-
-after all required checks pass.
 
 ---
 
-# 3. Expected canonical config after the fix
+# 9. Phase 7 — Finish policy-loss config reads
+
+`segment_token_reduction` is fixed.
+
+Now fix fields that still live in `PolicyLossConfig` but are read from `ActorConfig` top level.
+
+Read:
+
+```python
+config.policy_loss.use_prob_mask
+config.policy_loss.ratio_threshold
+```
+
+Do not read:
+
+```python
+config.get("use_prob_mask", ...)
+config.get("ratio_threshold", ...)
+```
+
+unless the function was passed the policy-loss subconfig directly.
+
+Add production-path tests proving an override under:
 
 ```yaml
-gear_tree:
-  tree_shape: [6, 6, 6]
-
-  replay_buffer:
-    enabled: true
-    replay_sampling_unit: edge
-    target_edges_per_iteration: 512
-    max_edge_age_iterations: 8
-    max_edges_per_question_per_iteration: auto
-    underfilled_update_policy: postpone_until_divisible
-    checkpoint: true
-
-  only_adv_greater_than_zero: false
-
-  gear:
-    pilot_execution_mode: fresh_iid
-    bound_form: linear
-    tail_mode: none
-    eps_tail: 0
-    allocation_runtime: online_timeout
-    allocation_scope: per_queue_flush_within_tree
-
-tree_policy:
-  advantage_mode: spo_local
-  policy_aggregation: global_segment_mean
-  segment_token_reduction: mean
-  strict_group_integrity: true
-
-actor_rollout_ref:
-  actor:
-    ppo_mini_batch_size: 128
-    ppo_epochs: 1
-
-    policy_loss:
-      loss_mode: vdra_segment_mean_ppo
-      segment_token_reduction: mean
+actor_rollout_ref.actor.policy_loss
 ```
 
-For the `sum` ablation, change only:
-
-```yaml
-tree_policy.segment_token_reduction: sum
-actor_rollout_ref.actor.policy_loss.segment_token_reduction: sum
-```
-
-Do not change replay, allocation, outer segment aggregation, or batch-size settings.
+changes behavior.
 
 ---
 
-# 4. Files likely requiring changes
+# 10. Phase 8 — Finish zero-advantage behavior
+
+Default main path keeps zero-advantage rows. Keep this safe dense behavior unless sparse mode is fully implemented.
+
+If sparse mode remains:
 
 ```text
-verl/recipe/gear_tree/config/gear_tree_trainer.yaml
-verl/recipe/gear_tree/config/*.yaml
-verl/recipe/gear_tree/replay_buffer.py
-verl/recipe/gear_tree/gear_ray_trainer.py
-verl/recipe/gear_tree/tree_advantage.py
-verl/recipe/gear_tree/tree_data.py
-verl/recipe/gear_tree/policy_loss.py
-verl/recipe/gear_tree/run_manifest.py
-verl/recipe/gear_tree/manifest_lifecycle.py
-verl/recipe/gear_tree/gear_core/gear/vllm_scorer.py
-verl/verl/workers/config/actor.py
-verl/verl/workers/actor/dp_actor.py
-scripts/pre_gpu_check.sh
-.github/workflows/cpu-ci.yml
-verl/recipe/gear_tree/tests/
+filter using exact training advantage
+not pav_advantage
+preserve original N_B
+skip optimizer.step() for all-zero batch
+do not increment global_step
+explicitly define replay commit/retain behavior
 ```
 
-Do not edit unrelated algorithms unless required for a shared config schema. Preserve the legacy SPO and node-balanced modes as labeled ablations when practical.
+Current standalone loss test is not enough.
+
+Add a production actor/trainer test proving the all-zero optimizer batch does not call `_optimizer_step()`.
+
+If this cannot be completed quickly, disable sparse mode in canonical config and label it unfinished.
 
 ---
 
-# 5. Completion checklist for Claude
+# 11. Phase 9 — Make strict IDs actually strict
 
-Before reporting completion, provide this exact summary with evidence:
+Strict generation must require `tree_instance_id` containing a per-tree UUID/counter.
 
-```text
-CONFIG
-[ ] canonical batch = 128
-[ ] target edges/rollout iteration = 512
-[ ] age window = 8 rollout iterations
-[ ] cap = auto
-[ ] replay unit = edge
-[ ] token mean default
-[ ] token sum supported
-
-REPLAY
-[ ] 666 resolves to 33
-[ ] 888 resolves to 73
-[ ] no complete-tree requirement in main path
-[ ] age uses rollout_iteration
-[ ] commit/rollback works
-
-OPTIMIZER
-[ ] 512/128 produces four optimizer.step() calls
-[ ] global_step counts actual steps
-[ ] rollout_iteration remains one
-[ ] scheduler count equals optimizer count
-[ ] microbatching does not create extra steps
-
-LOSS
-[ ] every 128-slot optimizer batch uses denominator 128
-[ ] no denominator 512 reused across four steps
-[ ] no main objective_weights tensor
-[ ] mean/sum differ correctly
-[ ] distributed gradient parity passes
-
-RUNTIME
-[ ] unique IDs strict
-[ ] scorer/rollout version contract valid
-[ ] manifest records observed facts
-[ ] checkpoint restores both counters
-
-GATE
-[ ] scripts/pre_gpu_check.sh prints PRE_GPU_CHECK=PASS
-[ ] Python 3.10 CI passes
-[ ] Python 3.12 CI passes
-```
-
-Also report:
+Do not silently fall back to:
 
 ```text
-files changed
-commands/tests run
-exact test counts
-any remaining unsupported path
+snapshot + question
+generic segment ID
 ```
 
-Do not claim GPU readiness if any item above is skipped, xfailed, mocked away from production control flow, or only checked by raw YAML parsing.
+Required identity components:
+
+```text
+policy snapshot
+rollout iteration
+question ID
+unique per-tree UUID/counter
+```
+
+Derive edge ID from the unique tree ID plus child identity.
+
+Manifest verification must detect collisions among multiple stochastic trees for the same question and snapshot.
+
+This is stronger than:
+
+```python
+bool(set(tree_ids))
+```
+
+Add a collision regression test on the production normalizer.
+
+---
+
+# 12. Phase 10 — Verify real distributed scaling
+
+The current test only proves an algebraic identity in one process.
+
+Before changing scale, inspect production dispatch:
+
+```text
+Are rows sharded or replicated across DP ranks?
+Does FSDP/DDP sum or average gradients?
+What denominator does each rank receive?
+```
+
+Then make the distributed gradient equal the single-rank 128-row reference.
+
+Required test:
+
+```text
+real two-process torch.distributed CPU test
+or minimal production FSDP/DDP integration
+```
+
+Test both:
+
+```text
+segment_token_reduction=mean
+segment_token_reduction=sum
+```
+
+Do not claim this task complete from `test_distributed_grad_scaling.py` if it only manually sums/averages local losses inside one process.
+
+---
+
+# 13. Phase 11 — Repair manifest semantics
+
+Canonical manifest must not require or infer complete trees in replay.
+
+Remove complete-tree and complete-parent fields from canonical validity.
+
+Do not do this:
+
+```text
+group integrity passed
+→ set node_balanced_invariants_passed=True
+→ set segment_count_invariants_passed=True
+```
+
+Those are different claims.
+
+Required runtime observations:
+
+```text
+edge-level sampler used
+selected_count <= target
+per-question cap respected
+all ages valid and based on rollout_iteration
+actual optimizer steps returned by actor
+stored old log-probs actually used by actor
+strict tensorization completed without truncation
+unique IDs verified
+scorer/rollout version verified
+```
+
+Actor should return an observed metric such as:
+
+```text
+actor/used_stored_old_log_probs = 1
+```
+
+Only then set manifest `stored_old_log_probs_used=True`.
+
+Set `no_truncation=True` after strict tensorization succeeds.
+
+Do not reconstruct full-tree queue identities from a partial replay batch.
+
+Main manifest becomes valid only after at least one successful canonical optimizer step.
+
+---
+
+# 14. Phase 12 — Upgrade pre-GPU gate
+
+The gate must run actual production wiring, not only helper tests.
+
+Required gate additions:
+
+```text
+✓ real Hydra composition of main config
+✓ real Hydra composition of sum override
+✓ instantiate complete ActorConfig
+✓ strict main dispatches to edge reservation
+✓ production replay sampler enforces cap and target
+✓ actual edges_to_dataproto canonical path has no objective weights
+✓ actual DataParallelPPOActor.update_policy control flow is exercised with a minimal mock model
+✓ 512/128 performs four real _optimizer_step calls
+✓ all-zero production batch skips optimizer step
+✓ checkpoint/resume restores rollout_iteration
+✓ threshold crossing triggers save/eval
+✓ real two-process distributed gradient parity
+✓ CPU-safe trainer contracts are no longer ignored
+```
+
+Remove complete-tree replay from canonical acceptance. Keep its test only under an explicit ablation section.
+
+Do not call raw `yaml.safe_load()` a Hydra composition test.
+
+GitHub Actions must produce a real green workflow run on both Python 3.10 and 3.12.
+
+---
+
+# 15. Required implementation order
+
+Follow exactly:
+
+```text
+1. edge-level reservation in strict main
+2. split construction/replay validators
+3. remove main-path objective weights
+4. exact target and divisibility handling
+5. checkpoint/resume counters
+6. logging and threshold crossing
+7. remaining PolicyLossConfig reads
+8. zero-adv production behavior
+9. strict IDs
+10. real distributed scaling
+11. manifest observed facts
+12. production integration gate
+```
+
+After steps 1–4, run a focused audit before continuing.
+
+---
+
+# 16. Do not do these things
+
+```text
+DO NOT restore parent-balanced main objective
+DO NOT use queue ratios as actor policy weights
+DO NOT keep complete-tree replay because strict mode is enabled
+DO NOT claim auto cap works while complete-tree reservation bypasses it
+DO NOT forward more than 512 edges
+DO NOT permit a 4-row tail optimizer step in canonical mode
+DO NOT use global_step for replay age
+DO NOT reset rollout_iteration on resume
+DO NOT infer stored old-log-prob use from tensor presence alone
+DO NOT claim distributed correctness from a one-process algebra test
+DO NOT claim Hydra composition from yaml.safe_load
+DO NOT mark completion while production trainer tests are skipped
+```
+
+---
+
+# 17. Completion report format
+
+When finished, report:
+
+```text
+A. Changed production files
+B. Changed test files
+C. Exact canonical replay function now called
+D. Sample counts tested: 128, 256, 384, 512, 516 candidates, 130 underfill
+E. Exact optimizer-step counts observed
+F. Checkpoint/resume counter values before and after
+G. Save/eval threshold-crossing evidence
+H. Real distributed test command and result
+I. Hydra composition commands and result
+J. Full pre_gpu_check output
+K. GitHub Actions run status for Python 3.10 and 3.12
+L. Any intentionally disabled unfinished feature
+```
+
+Do not report `P0 complete` unless all production-path requirements above are satisfied.
