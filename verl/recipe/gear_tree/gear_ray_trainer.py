@@ -26,7 +26,10 @@ from recipe.gear_tree.context_contract import (
     resolve_max_original_prompt_length,
     validate_context_contract,
 )
-from recipe.gear_tree.replay_buffer import GearTreeReplayBuffer
+from recipe.gear_tree.replay_buffer import (
+    GearTreeReplayBuffer,
+    reserve_replay_edges,
+)
 from recipe.gear_tree.manifest_lifecycle import (
     build_run_manifest,
     update_manifest_from_edges,
@@ -630,6 +633,11 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 "strict_group_integrity", False
             )
         )
+        # PLAN.md P0.A: the reservation path is selected by the configured
+        # sampling unit ONLY. Strictness controls validation, never sampling.
+        replay_sampling_unit = str(
+            self._replay_config().get("replay_sampling_unit", "edge")
+        )
 
         os.makedirs(self.config.trainer.default_local_dir, exist_ok=True)
         timing_path = os.path.join(self.config.trainer.default_local_dir, "training_timing.jsonl")
@@ -670,16 +678,15 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     generation_rollout_iteration=self.rollout_iteration,
                     policy_snapshot_id=self._current_policy_snapshot_id(),
                 )
-                # PLAN.md P0.2: edge-level replay is canonical. Complete-tree
-                # replay remains available for the SPO baseline ablation only.
-                if manifest_strict:
-                    reservation = replay_buffer.reserve_complete_trees_for_update(
-                        current_rollout_iteration=self.rollout_iteration
-                    )
-                else:
-                    reservation = replay_buffer.reserve_for_update(
-                        current_rollout_iteration=self.rollout_iteration
-                    )
+                # PLAN.md P0.A: canonical strict main uses EDGE-level
+                # reservation. Complete-tree replay is reachable only via the
+                # explicit `replay_sampling_unit: complete_tree` ablation and
+                # is never selected by strict_group_integrity.
+                reservation = reserve_replay_edges(
+                    replay_buffer,
+                    replay_sampling_unit=replay_sampling_unit,
+                    current_rollout_iteration=self.rollout_iteration,
+                )
                 sampled_edges = [dict(edge) for edge in reservation.edges]
                 sample_stats = reservation.stats
                 metrics.update({k: v for k, v in sample_stats.items() if k != "removed_edge_ids"})

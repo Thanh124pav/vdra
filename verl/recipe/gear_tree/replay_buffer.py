@@ -1,11 +1,12 @@
 """Trainer-owned replay buffer for tree-family VERL edge updates.
 
-PLAN.md P0.N6: the buffer indexes edges both by ``edge_id`` (backwards-
-compatible flat view) and by ``tree_id`` (canonical VDRA view). Reservations
-made via :meth:`reserve_complete_trees_for_update` return one or more
-COMPLETE trees — every edge that shares a ``tree_id`` with a returned edge
-is included, and reserved rows never straddle a parent group. Legacy
-``reserve_for_update`` remains available for the SPO baseline path.
+PLAN.md P0.A: canonical VDRA replay is EDGE-level — the trainer reserves
+individual edges via :meth:`reserve_for_update` (per-question cap, hard
+target cap, transactional commit/rollback). Complete-tree replay via
+:meth:`reserve_complete_trees_for_update` is retained only as the explicit
+``replay_sampling_unit: complete_tree`` ablation; it is never selected by
+``strict_group_integrity``. Use :func:`reserve_replay_edges` to dispatch on
+the configured sampling unit.
 """
 
 from __future__ import annotations
@@ -81,6 +82,38 @@ class ReplayReservation:
     stats: Dict[str, Any]
 
 
+VALID_REPLAY_SAMPLING_UNITS = ("edge", "complete_tree")
+
+
+def reserve_replay_edges(
+    replay_buffer: "GearTreeReplayBuffer",
+    *,
+    replay_sampling_unit: str,
+    current_rollout_iteration: int,
+) -> ReplayReservation:
+    """PLAN.md P0.A: production reservation dispatch.
+
+    The sampling unit comes from config only. ``edge`` is canonical;
+    ``complete_tree`` is an explicit non-canonical ablation. Strictness
+    (``tree_policy.strict_group_integrity``) controls validation and must
+    never select the reservation path.
+    """
+
+    unit = str(replay_sampling_unit)
+    if unit == "edge":
+        return replay_buffer.reserve_for_update(
+            current_rollout_iteration=current_rollout_iteration
+        )
+    if unit == "complete_tree":
+        return replay_buffer.reserve_complete_trees_for_update(
+            current_rollout_iteration=current_rollout_iteration
+        )
+    raise ValueError(
+        f"Unknown replay_sampling_unit={unit!r}; expected one of "
+        f"{VALID_REPLAY_SAMPLING_UNITS} (PLAN.md P0.A)."
+    )
+
+
 class GearTreeReplayBuffer:
     """CPU-native edge replay buffer shared by SPO/VDRA tree methods."""
 
@@ -130,10 +163,11 @@ class GearTreeReplayBuffer:
         self.target_edges_per_iteration = max(int(resolved_target), 1)
         self.max_edge_age_iterations = max(int(resolved_age), 1)
         self.replay_sampling_unit = str(replay_sampling_unit)
-        if self.replay_sampling_unit != "edge":
+        if self.replay_sampling_unit not in VALID_REPLAY_SAMPLING_UNITS:
             raise ValueError(
-                "Only replay_sampling_unit='edge' is supported on the canonical "
-                "main path (PLAN.md P0.2)."
+                "replay_sampling_unit must be 'edge' (canonical) or "
+                "'complete_tree' (explicit ablation), got "
+                f"{self.replay_sampling_unit!r} (PLAN.md P0.A)."
             )
         self.tree_shape: Tuple[int, ...] = tuple(int(b) for b in (tree_shape or ()))
         self.trees_per_question = max(int(trees_per_question), 1)
@@ -473,10 +507,12 @@ class GearTreeReplayBuffer:
         current_rollout_iteration: Optional[int] = None,
         current_step: Optional[int] = None,  # deprecated alias
     ) -> ReplayReservation:
-        """PLAN.md P0.N6: reserve one or more COMPLETE trees.
+        """Non-canonical ``replay_sampling_unit=complete_tree`` ablation.
 
-        Trees are added whole (all edges sharing a ``tree_id``) until the
-        cumulative edge count meets or exceeds ``target_edges_per_iteration``.
+        Trees are added whole (all edges sharing a ``tree_id``) while the
+        cumulative edge count stays within ``target_edges_per_iteration`` —
+        the reservation NEVER exceeds the target (PLAN.md P0.A/P0.D); a tree
+        that does not fit is skipped, so the reservation may be underfilled.
         ``max_edges_per_question_per_iteration`` is applied per question by
         picking a subset of that question's trees, never by dropping an
         individual edge from one of its trees. A tree is never split across
@@ -544,13 +580,19 @@ class GearTreeReplayBuffer:
             picked_trees.extend(selected)
             edges_per_question.append(cumulative)
 
-        # Shuffle whole trees, then pack until the target edge count is met.
+        # Shuffle whole trees, then pack whole trees WITHOUT ever exceeding
+        # the per-iteration target (PLAN.md P0.A/P0.D: never return more than
+        # target_edges_per_iteration). A tree that does not fit is skipped so
+        # a smaller tree later in the shuffle may still fill the remainder;
+        # trees are never split.
         rng.shuffle(picked_trees)
         packed_trees: List[List[Dict[str, Any]]] = []
+        skipped_oversized_trees = 0
         cumulative = 0
         for tree_edges in picked_trees:
-            if cumulative >= self.target_edges_per_iteration and packed_trees:
-                break
+            if cumulative + len(tree_edges) > self.target_edges_per_iteration:
+                skipped_oversized_trees += 1
+                continue
             packed_trees.append(tree_edges)
             cumulative += len(tree_edges)
 
@@ -582,6 +624,7 @@ class GearTreeReplayBuffer:
             "buffer/expired_edges": len(expired_ids),
             "buffer/candidate_trees": len(picked_trees),
             "buffer/packed_trees": len(packed_trees),
+            "buffer/skipped_oversized_trees": skipped_oversized_trees,
             "buffer/sampled_edges": len(sampled),
             "buffer/size_after": len(self._edges),
             "buffer/reserved_edges": len(self._reserved),
