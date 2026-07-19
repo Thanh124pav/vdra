@@ -76,12 +76,12 @@ def advance_past_thresholds(
 ) -> tuple[int, Optional[int]]:
     """PLAN.md P0.E: crossed-threshold trigger semantics.
 
-    ``global_step`` advances by the actual optimizer-step count (e.g.
-    ``8 -> 12``), so a modulo check misses thresholds inside the jump. This
-    returns ``(crossed_count, new_next_threshold)`` where ``crossed_count``
-    is how many thresholds lie in ``(previous_step, current_step]`` — the
-    caller fires its action when the count is positive and the counter has
-    already advanced past every crossed threshold.
+    Handles defensive threshold crossing for any counter advance larger than
+    one (for example resume/migration or legacy checkpoints). This returns
+    ``(crossed_count, new_next_threshold)`` where ``crossed_count`` is how
+    many thresholds lie in ``(previous_step, current_step]`` — the caller
+    fires its action when the count is positive and the counter has already
+    advanced past every crossed threshold.
     """
     freq = int(freq or 0)
     if freq <= 0 or next_threshold is None:

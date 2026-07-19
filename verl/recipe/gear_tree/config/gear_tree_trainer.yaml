@@ -249,9 +249,8 @@ tree_policy:
   #
   # where the within-segment reduction ``r`` is set by
   # `segment_token_reduction` below. The main path REQUIRES the actor loss
-  # `vdra_segment_mean_ppo` and the row tensors produced by
-  # ``tree_data.edges_to_dataproto`` (``segment_objective_weights``,
-  # ``tree_total_segment_count``).
+  # `vdra_segment_mean_ppo`; selected replay slots have equal outer weight.
+  # Tree/queue count tensors remain diagnostics and validation inputs.
   #
   # Values:
   #   * global_segment_mean  — canonical main-run (PLAN.md P0.1).

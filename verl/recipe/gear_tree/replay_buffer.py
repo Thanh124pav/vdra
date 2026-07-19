@@ -123,19 +123,19 @@ def should_postpone_sampled_update(
 
 
 def batch_has_zero_learning_signal(edges: Sequence[Mapping[str, Any]]) -> bool:
-    """PLAN.md P0.G: True when EVERY sampled edge's training advantage is 0.
+    """Diagnostic predicate for experiments; canonical trainer does not skip.
 
-    Uses the exact ``advantage`` scalar that tensorization broadcasts into
-    the policy ``advantages`` tensor (never ``pav_advantage``). Such a batch
-    produces zero gradient, so the trainer skips ``update_actor`` entirely:
-    no ``optimizer.step()`` runs and ``global_step`` does not advance.
+    Uses the exact ``advantage`` scalar tensorization broadcasts into the
+    policy ``advantages`` tensor. Missing advantages are invalid replay rows
+    and must fail instead of being interpreted as zero.
     """
     edge_list = list(edges)
     if not edge_list:
         return False
-    return all(
-        float(edge.get("advantage") or 0.0) == 0.0 for edge in edge_list
-    )
+    for edge in edge_list:
+        if "advantage" not in edge or edge["advantage"] is None:
+            raise ValueError("sampled edge is missing training advantage")
+    return all(float(edge["advantage"]) == 0.0 for edge in edge_list)
 
 
 def expected_optimizer_steps(

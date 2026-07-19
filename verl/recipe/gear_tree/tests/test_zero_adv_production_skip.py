@@ -1,11 +1,9 @@
-"""PLAN.md P0.G: production zero-advantage behavior.
+"""PLAN.md E1: production zero-advantage behavior stays dense.
 
-* The sparsity filter (when enabled) keys on the EXACT training advantage
-  that is broadcast into the policy ``advantages`` tensor, never on
-  ``pav_advantage``.
-* An all-zero sampled batch skips the actor update entirely: no
-  ``optimizer.step()``, no ``global_step`` advance, reservation committed.
-* The canonical default remains dense at every call site.
+* The diagnostic predicate keys on the EXACT training advantage that is
+  broadcast into the policy ``advantages`` tensor, never on ``pav_advantage``.
+* A valid all-zero sampled batch must still follow the normal actor path.
+* Missing advantages fail explicitly instead of being interpreted as zero.
 """
 
 from __future__ import annotations
@@ -51,16 +49,22 @@ class TestZeroSignalPredicate:
         assert batch_has_zero_learning_signal([]) is False
 
     def test_uses_training_advantage_not_pav(self):
-        # A diagnostic pav_advantage != 0 must not stop the skip when the
-        # actual training advantage is 0.
+        # Diagnostic pav_advantage != 0 must not hide that the actual
+        # training advantage is 0.
         edge = _edge("e0", 0.0)
         edge["prover_advantage"] = 1.0
         edge["pav_advantage"] = 1.0
         assert batch_has_zero_learning_signal([edge]) is True
 
+    def test_missing_advantage_raises(self):
+        edge = _edge("e0", 0.0)
+        del edge["advantage"]
+        with pytest.raises(ValueError, match="missing training advantage"):
+            batch_has_zero_learning_signal([edge])
 
-class TestSkipFlowWithReplayBuffer:
-    def test_all_zero_reservation_commits_and_consumes_edges(self):
+
+class TestDenseFlowWithReplayBuffer:
+    def test_all_zero_reservation_is_valid_data_not_auto_consumed(self):
         buf = GearTreeReplayBuffer(
             target_edges_per_iteration=512,
             max_edge_age_iterations=8,
@@ -76,15 +80,13 @@ class TestSkipFlowWithReplayBuffer:
             buf, replay_sampling_unit="edge", current_rollout_iteration=1
         )
         assert batch_has_zero_learning_signal(reservation.edges)
-        # Production skip path: commit (consume), never call the actor.
-        removed = buf.commit(reservation)
-        assert len(removed) == 8
-        assert len(buf) == 0
-        # Consumed rows can never be re-sampled as dead weight.
-        empty = reserve_replay_edges(
-            buf, replay_sampling_unit="edge", current_rollout_iteration=2
+        assert len(reservation.edges) == 8
+        assert len(buf) == 8
+        buf.rollback(reservation)
+        again = reserve_replay_edges(
+            buf, replay_sampling_unit="edge", current_rollout_iteration=1
         )
-        assert len(empty.edges) == 0
+        assert len(again.edges) == 8
 
 
 class TestExtractionFilterUsesTrainingAdvantage:
@@ -148,12 +150,21 @@ class TestExtractionFilterUsesTrainingAdvantage:
 
 
 class TestProductionWiring:
-    def test_trainer_skips_actor_for_all_zero_batches(self):
+    def test_trainer_does_not_shortcut_all_zero_batches(self):
         source = (
             Path(__file__).resolve().parents[1] / "gear_ray_trainer.py"
         ).read_text()
-        assert "batch_has_zero_learning_signal(" in source
-        assert "training/all_zero_batch_skipped" in source
+        assert "batch_has_zero_learning_signal" not in source
+        assert "training/all_zero_batch_skipped" not in source
+
+    def test_replay_validation_runs_before_tensorization(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "gear_ray_trainer.py"
+        ).read_text()
+        validate_idx = source.index("replay_batch_metrics = self._update_manifest_from_replay_batch(")
+        tensorize_idx = source.index("edge_batch = self._edges_to_update_batch(sampled_edges")
+        actor_idx = source.index("update_actor(edge_batch)")
+        assert validate_idx < tensorize_idx < actor_idx
 
     def test_worker_default_is_dense(self):
         source = (

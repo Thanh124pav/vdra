@@ -182,11 +182,23 @@ class TestReplayBatchValidation:
                 sampled, target_edges_per_iteration=4, strict=True
             )
 
-    def test_missing_advantage_fails(self):
+    def test_missing_advantage_key_fails(self):
+        sampled = _full_tree(k=6)[:2]
+        del sampled[0]["advantage"]
+        with pytest.raises(ValueError, match="advantage"):
+            validate_replay_batch(sampled, strict=True)
+
+    def test_none_advantage_fails(self):
         sampled = _full_tree(k=6)[:2]
         sampled[0]["advantage"] = None
         with pytest.raises(ValueError, match="advantage"):
             validate_replay_batch(sampled, strict=True)
+
+    def test_zero_advantage_is_valid(self):
+        sampled = _full_tree(k=6)[:2]
+        sampled[0]["advantage"] = 0.0
+        metrics = validate_replay_batch(sampled, strict=True)
+        assert metrics["vdra/replay_batch_failures"] == 0
 
 
 class TestManifestStageSplit:

@@ -1,8 +1,8 @@
 """PLAN.md P0.E: save/eval fire on crossed thresholds, logging is unambiguous.
 
-``global_step`` advances by the actual optimizer-step count (e.g. +4 per
-iteration), so ``global_step % freq == 0`` misses thresholds inside a jump.
-The production trigger uses ``initial_next_threshold`` +
+The preserved host contract uses outer-update ``global_step`` units. The
+threshold helper remains defensive for resume/migration or any non-unit jump,
+and production code uses ``initial_next_threshold`` +
 ``advance_past_thresholds`` from ``trainer_state.py``.
 """
 

@@ -28,7 +28,6 @@ from recipe.gear_tree.context_contract import (
 )
 from recipe.gear_tree.replay_buffer import (
     GearTreeReplayBuffer,
-    batch_has_zero_learning_signal,
     expected_optimizer_steps,
     reserve_replay_edges,
     should_postpone_sampled_update,
@@ -732,9 +731,8 @@ class RayGearTreeTrainer(RayPPOTrainer):
         self.successful_actor_updates = 0
         self.postponed_updates = 0
         self.failed_updates = 0
-        # PLAN.md P0.3: separate counters for rollout iteration vs true
-        # optimizer.step() calls. `global_steps` is bumped by the actual
-        # optimizer-step count returned by update_actor, never by 1 per call.
+        # PLAN.md M1: keep rollout iteration, outer global_step, and
+        # internal optimizer-step diagnostics as distinct counters.
         self.optimizer_steps_this_iteration = 0
         self.num_optimizer_steps_total = 0
         self._load_checkpoint()
@@ -770,10 +768,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
 
         test_freq = self.config.trainer.get("test_freq", -1)
         save_freq = self.config.trainer.get("save_freq", -1)
-        # PLAN.md P0.E: global_step advances by the actual optimizer-step
-        # count, so save/eval fire on CROSSED thresholds, never on modulo.
-        # Derived from the (possibly restored) global_steps so resume never
-        # re-fires an already-passed threshold.
+        # PLAN.md P0.E: save/eval fire on CROSSED thresholds, never on
+        # modulo. Derived from the (possibly restored) global_steps so resume
+        # never re-fires an already-passed threshold.
         self.next_eval_step = initial_next_threshold(self.global_steps, test_freq)
         self.next_save_step = initial_next_threshold(self.global_steps, save_freq)
 
@@ -849,21 +846,14 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     logger.log(data=metrics, step=self.global_steps)
                     continue
 
-                # PLAN.md P0.G: a batch whose every training advantage is 0
-                # produces zero gradient. Skip the actor call entirely: no
-                # optimizer.step() runs and global_step does not advance. The
-                # reservation is COMMITTED — dead rows are consumed so they
-                # cannot be re-sampled every iteration until they expire.
-                if batch_has_zero_learning_signal(sampled_edges):
-                    removed = replay_buffer.commit(reservation)
-                    metrics["training/all_zero_batch_skipped"] = 1.0
-                    metrics["buffer/removed_edges"] = float(len(removed))
-                    metrics["buffer/size_after"] = float(len(replay_buffer))
-                    self.run_manifest.zero_contribution_selected_slots_last_iteration = len(
-                        sampled_edges
-                    )
-                    logger.log(data=metrics, step=self.global_steps)
-                    continue
+                # PLAN.md P0.B: sampled replay batches get ROW-LOCAL checks
+                # only (edge-level replay legally splits trees and parent
+                # groups). Run BEFORE tensorization and actor update so a
+                # broken reservation cannot be converted into model inputs.
+                replay_batch_metrics = self._update_manifest_from_replay_batch(
+                    self.run_manifest, sampled_edges, strict=manifest_strict
+                )
+                metrics.update(replay_batch_metrics)
 
                 edge_batch = self._edges_to_update_batch(sampled_edges, metrics)
                 # PLAN.md P0.J: strict tensorization refuses truncation with a
@@ -871,15 +861,6 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 # no-truncation event for this batch.
                 self.run_manifest.no_truncation = True
                 self.run_manifest.extras["no_truncation"] = True
-
-                # PLAN.md P0.B: sampled replay batches get ROW-LOCAL checks
-                # only (edge-level replay legally splits trees and parent
-                # groups). Run BEFORE the actor step so a broken reservation
-                # cannot corrupt state.
-                replay_batch_metrics = self._update_manifest_from_replay_batch(
-                    self.run_manifest, sampled_edges, strict=manifest_strict
-                )
-                metrics.update(replay_batch_metrics)
 
                 t0 = time.time()
                 # P0.9: RayGearTreeTrainer never trains a critic, so there is
@@ -930,10 +911,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     metrics["buffer/removed_edges"] = float(len(removed))
                     metrics["buffer/size_after"] = float(len(replay_buffer))
                     self.successful_actor_updates += 1
-                    # PLAN.md P0.3: `global_step` counts real optimizer.step()
-                    # calls; one update_actor may perform several. Bump by the
-                    # returned count so 512 selected edges + mini_batch=128
-                    # advance global_step by 4 in one iteration.
+                    # PLAN.md M1: this legacy coupling is repaired in the
+                    # medium counter-separation phase. The internal optimizer
+                    # count is extracted here for diagnostics.
                     self.optimizer_steps_this_iteration = int(n_optim_steps)
                     self.global_steps += int(n_optim_steps)
                     self.num_optimizer_steps_total = self.global_steps

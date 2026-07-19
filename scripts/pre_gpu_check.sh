@@ -120,9 +120,9 @@ log "12/20 P0.E crossed-threshold save/eval triggers + unambiguous logging"
 python -m pytest verl/recipe/gear_tree/tests/test_threshold_crossing_and_logging.py -q \
     || fail "threshold crossing tests failed"
 
-log "13/20 P0.G zero-advantage production skip (all-zero batch, exact advantage)"
+log "13/20 P0.G zero-advantage dense production path (all-zero batch, exact advantage)"
 python -m pytest verl/recipe/gear_tree/tests/test_zero_adv_production_skip.py -q \
-    || fail "zero-advantage production skip tests failed"
+    || fail "zero-advantage dense-path tests failed"
 
 log "14/20 P0.H strict tree/edge identity + collision detection"
 python -m pytest verl/recipe/gear_tree/tests/test_strict_tree_identity.py -q \

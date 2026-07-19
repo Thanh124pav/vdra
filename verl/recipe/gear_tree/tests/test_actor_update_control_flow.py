@@ -130,7 +130,8 @@ def _build_batch(n: int = N_EDGES, advantage: float = 1.0):
 def _make_actor():
     from verl.workers.actor.dp_actor import DataParallelPPOActor
 
-    model = TinyLM()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = TinyLM().to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     actor = DataParallelPPOActor(
         config=_actor_config(), actor_module=model, actor_optimizer=optimizer

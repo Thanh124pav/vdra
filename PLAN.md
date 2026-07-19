@@ -24,9 +24,9 @@ DO NOT REDESIGN A CROSS-CUTTING CONTRACT WITHOUT USER APPROVAL.
 Implementation work remains split into:
 
 ```text
-CLAUDE_FIX_EASY.md
-CLAUDE_FIX_MEDIUM.md
-CLAUDE_FIX_HARD.md
+CODEX_FIX_EASY.md
+CODEX_FIX_MEDIUM.md
+CODEX_FIX_HARD.md
 ```
 
 ---
@@ -59,7 +59,7 @@ FSDP/DDP/world-size scaling
 public Hydra/dataclass configuration schema
 ```
 
-Claude must not silently choose a new architecture in these areas.
+Codex must not silently choose a new architecture in these areas.
 
 If a requested local fix exposes a cross-cutting conflict:
 
@@ -341,7 +341,7 @@ skipping individual zero-signal optimizer batches
 adding world-size scaling based only on toy DDP inference
 ```
 
-They belong in `CLAUDE_FIX_HARD.md` as discussion-gated proposals.
+They belong in `CODEX_FIX_HARD.md` as discussion-gated proposals.
 
 ---
 
@@ -349,7 +349,7 @@ They belong in `CLAUDE_FIX_HARD.md` as discussion-gated proposals.
 
 ## Easy
 
-Source: `CLAUDE_FIX_EASY.md`
+Source: `CODEX_FIX_EASY.md`
 
 ```text
 E1 remove/disable all-zero shortcut from canonical main
@@ -360,7 +360,7 @@ E4 add regression tests for the unchanged host contract
 
 ## Medium
 
-Source: `CLAUDE_FIX_MEDIUM.md`
+Source: `CODEX_FIX_MEDIUM.md`
 
 ```text
 M1 restore and verify three-counter separation
@@ -372,7 +372,7 @@ M5 real Hydra/dataclass validation
 
 ## Hard / discussion-gated
 
-Source: `CLAUDE_FIX_HARD.md`
+Source: `CODEX_FIX_HARD.md`
 
 ```text
 H1 FSDP/FSDP2 verification: test first, report before changing production

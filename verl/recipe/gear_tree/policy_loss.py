@@ -12,11 +12,10 @@ Three losses are registered here:
       segment -> tree (divide by pre-filter ``tree_total_segment_count``)
       tree -> update (average over trees)
 
-  Neither reduction couples to parent branch factor: the loss depends only on
-  ``tree_id`` and ``tree_total_segment_count``, not on ``parent_group_id``,
-  ``allocated_k``, or ``queue_flush_id``. The precomputed row weights come
-  from ``tree_data.compute_segment_objective_weights`` and are attached to
-  the DataProto as ``segment_objective_weights``.
+  Neither reduction couples to parent branch factor: the loss uses one equal
+  outer weight per selected replay slot. Tree and queue counts remain
+  diagnostics/validation inputs; ``segment_objective_weights`` belongs only
+  to the explicit node-balanced ablation path.
 * ``vdra_node_balanced_ppo`` — legacy parent-balanced ablation. NOT the main
   VDRA path (PLAN.md P0.1). Kept for controlled comparison runs; it must not
   be selected by the main config.
