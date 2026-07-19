@@ -480,6 +480,25 @@ def validate_group_integrity(
     }
 
 
+def derive_edge_id(
+    *,
+    snapshot_id: str,
+    tree_instance_id: str,
+    parent_group_id: str,
+    child_segment_id: str,
+) -> str:
+    """PLAN.md M3: deterministic canonical edge identity.
+
+    Derived from exactly (tree_instance_id | parent_group_id |
+    child_segment_id), digest-prefixed by the policy snapshot. The digest
+    formula is byte-identical to the historical strict-path derivation, so
+    well-formed edge IDs do not change value.
+    """
+    key = f"{tree_instance_id}|{parent_group_id}|{child_segment_id}"
+    digest = hashlib.blake2b(key.encode("utf-8"), digest_size=16).hexdigest()
+    return f"{snapshot_id}:{digest}"
+
+
 def normalize_generated_edges(
     edges: Sequence[Dict[str, Any]],
     *,
@@ -498,14 +517,16 @@ def normalize_generated_edges(
     normalized: List[Dict[str, Any]] = []
     for idx, edge in enumerate(edges):
         record = dict(edge)
-        tree_id = record.get("tree_instance_id") or record.get("tree_id")
         parent_group = record.get("parent_group_id")
         child_seg = record.get("child_segment_id")
         if strict:
+            # PLAN.md M3: strict identity requires tree_instance_id
+            # specifically — a legacy tree_id alone is not sufficient.
+            tree_instance_id = record.get("tree_instance_id")
             missing = [
                 name
                 for name, value in (
-                    ("tree_instance_id/tree_id", tree_id),
+                    ("tree_instance_id", tree_instance_id),
                     ("parent_group_id", parent_group),
                     ("child_segment_id", child_seg),
                 )
@@ -518,9 +539,28 @@ def normalize_generated_edges(
                     "Generation must stamp make_tree_instance_id-derived "
                     "tree identities and explicit parent/child segment ids."
                 )
-            key = f"{tree_id}|{parent_group}|{child_seg}"
+            derived = derive_edge_id(
+                snapshot_id=snapshot_id,
+                tree_instance_id=str(tree_instance_id),
+                parent_group_id=str(parent_group),
+                child_segment_id=str(child_seg),
+            )
+            supplied = record.get("edge_id")
+            if supplied is not None and str(supplied) != derived:
+                raise ValueError(
+                    f"Supplied edge_id {supplied!r} does not match the "
+                    f"identity-derived id {derived!r} for generated edge "
+                    f"{idx} (PLAN.md P0.H/M3)."
+                )
+            record["edge_id"] = derived
         else:
-            tree_id = tree_id or record.get("gear_segment_id", "")
+            # Legacy non-strict compatibility path: fallback chains and a
+            # caller-supplied edge_id are honored as-is.
+            tree_id = (
+                record.get("tree_instance_id")
+                or record.get("tree_id")
+                or record.get("gear_segment_id", "")
+            )
             parent_group = (
                 parent_group
                 or record.get("parent_path")
@@ -533,8 +573,10 @@ def normalize_generated_edges(
             )
             qid = record.get("question_id", "")
             key = f"{snapshot_id}|{qid}|{tree_id}|{parent_group}|{child_seg}"
-        digest = hashlib.blake2b(key.encode("utf-8"), digest_size=16).hexdigest()
-        record.setdefault("edge_id", f"{snapshot_id}:{digest}")
+            digest = hashlib.blake2b(
+                key.encode("utf-8"), digest_size=16
+            ).hexdigest()
+            record.setdefault("edge_id", f"{snapshot_id}:{digest}")
         record.setdefault("policy_snapshot_id", snapshot_id)
         if record["policy_snapshot_id"] != snapshot_id:
             raise ValueError(

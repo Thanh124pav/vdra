@@ -13,6 +13,7 @@ import pytest
 
 from recipe.gear_tree.tree_advantage import extract_edges_from_tree
 from recipe.gear_tree.tree_data import (
+    derive_edge_id,
     normalize_generated_edges,
     verify_tree_instance_id_uniqueness,
 )
@@ -93,6 +94,27 @@ class TestStrictExtractionRefusesFallback:
         assert edges
         assert edges[0]["tree_id"] == tree["tree_instance_id"]
 
+    def test_strict_rejects_legacy_tree_id_only(self):
+        # PLAN.md M3: a generic legacy tree_id (e.g. "t0") alone must not
+        # satisfy strict identity — it cannot distinguish two stochastic
+        # trees for the same question/snapshot/iteration.
+        tree = _tree_without_instance_id()
+        tree["tree_id"] = "t0"
+        with pytest.raises(ValueError, match="tree_instance_id"):
+            extract_edges_from_tree(tree, strict_fresh_iid=True)
+
+    def test_extracted_edges_stamp_tree_instance_id(self):
+        tree = _tree_without_instance_id()
+        tree["tree_instance_id"] = make_tree_instance_id(
+            policy_snapshot_id="snap0",
+            rollout_iteration=1,
+            stable_question_id="0",
+        )
+        edges = extract_edges_from_tree(tree, strict_fresh_iid=True)
+        assert edges
+        assert edges[0]["tree_instance_id"] == tree["tree_instance_id"]
+        assert edges[0]["tree_id"] == edges[0]["tree_instance_id"]
+
 
 class TestStrictNormalizer:
     def _edge(self, **overrides) -> dict:
@@ -160,6 +182,49 @@ class TestStrictNormalizer:
             strict=True,
         )
         assert edges[0]["edge_id"] != edges[1]["edge_id"]
+
+    def test_strict_rejects_tree_id_only_record(self):
+        # PLAN.md M3: strict normalization requires tree_instance_id
+        # specifically; tree_id alone must fail even when present.
+        edge = self._edge()
+        edge.pop("tree_instance_id")
+        edge["tree_id"] = "t0"
+        with pytest.raises(ValueError, match="tree_instance_id"):
+            normalize_generated_edges([edge], snapshot_id="snap0", strict=True)
+
+    def test_mismatching_supplied_edge_id_raises(self):
+        with pytest.raises(ValueError, match="does not match"):
+            normalize_generated_edges(
+                [self._edge(edge_id="snap0:not-the-derived-id")],
+                snapshot_id="snap0",
+                strict=True,
+            )
+
+    def test_matching_supplied_edge_id_is_idempotent(self):
+        [first] = normalize_generated_edges(
+            [self._edge()], snapshot_id="snap0", strict=True
+        )
+        # Re-normalizing an already-normalized record must accept its own id.
+        [second] = normalize_generated_edges(
+            [dict(first)], snapshot_id="snap0", strict=True
+        )
+        assert second["edge_id"] == first["edge_id"]
+
+    def test_derive_edge_id_matches_historical_formula(self):
+        # Pins ID stability: the digest formula is byte-identical to the
+        # pre-M3 strict derivation, so no stored edge_id changes value.
+        import hashlib
+
+        tid = "snap0|iter:1|q:q0|t:0000-abcd"
+        expected_digest = hashlib.blake2b(
+            f"{tid}|pg0|c0".encode("utf-8"), digest_size=16
+        ).hexdigest()
+        assert derive_edge_id(
+            snapshot_id="snap0",
+            tree_instance_id=tid,
+            parent_group_id="pg0",
+            child_segment_id="c0",
+        ) == f"snap0:{expected_digest}"
 
     def test_non_strict_keeps_legacy_fallback_chain(self):
         edges = normalize_generated_edges(

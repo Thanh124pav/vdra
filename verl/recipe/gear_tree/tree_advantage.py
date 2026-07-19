@@ -84,21 +84,29 @@ def extract_edges_from_tree(
     # Prefer it; legacy tree_id fields keep old fixtures working. The
     # (snapshot, question) tuple must NEVER be used as a tree id in main runs
     # — two rollouts for the same prompt in the same iteration would collide.
-    tree_id = (
+    tree_instance_id = (
         tree_copy.get("tree_instance_id")
-        or tree_copy.get("tree_id")
         or data_instance.get("tree_instance_id")
+    )
+    if strict_fresh_iid and not tree_instance_id:
+        # PLAN.md P0.H / M3: strict main generation requires the explicit
+        # tree_instance_id stamped by the tree builder (make_tree_instance_id:
+        # snapshot + rollout iteration + question + per-tree uuid/counter).
+        # A legacy tree_id alone is NOT a valid strict identity, and the
+        # (snapshot, question) tuple must never be used as a tree id.
+        raise ValueError(
+            "Strict VDRA requires a unique tree_instance_id stamped by "
+            "the tree builder (make_tree_instance_id); a legacy tree_id "
+            "alone or the ambiguous snapshot:question fallback is not a "
+            "valid strict identity (PLAN.md P0.H)."
+        )
+    tree_id = (
+        tree_instance_id
+        or tree_copy.get("tree_id")
         or data_instance.get("tree_id")
     )
     if tree_id is None:
-        if strict_fresh_iid:
-            # PLAN.md P0.H: strict main generation must never silently derive
-            # a tree identity from (snapshot, question) alone.
-            raise ValueError(
-                "Strict VDRA requires a unique tree_instance_id stamped by "
-                "the tree builder (make_tree_instance_id); refusing the "
-                "ambiguous snapshot:question fallback (PLAN.md P0.H)."
-            )
+        # Non-strict compatibility path only — strict already raised above.
         tree_id = f"{policy_snapshot_id}:{question_id}"
 
     # PLAN.md P0.N1: aggregate tree-level counts as we walk the tree so the
@@ -213,6 +221,8 @@ def extract_edges_from_tree(
                 "pruned": is_pruned,
                 # PLAN.md P0.N1/N2: canonical grouping metadata. These must
                 # survive tree -> edge -> replay -> DataProto -> actor.
+                # tree_id is kept for backward compat; on the strict path it
+                # always equals tree_instance_id (stamped below, PLAN.md M3).
                 "tree_id": str(tree_id),
                 "parent_group_id": str(parent_group_id),
                 "parent_segment_id": str(parent_segment_id),
@@ -233,6 +243,11 @@ def extract_edges_from_tree(
                 "vdra_original_pilot_indices": node.get("vdra_original_pilot_indices"),
                 **update_values,
             }
+            if tree_instance_id:
+                # PLAN.md M3: the explicit instance identity survives the
+                # tree -> edge boundary. Absent only on the legacy
+                # non-strict path, which never had one to begin with.
+                edge["tree_instance_id"] = str(tree_instance_id)
             edge["advantage"] = advantage
             # Stage 1: count every realized non-pruned segment BEFORE
             # zero-advantage filtering. ``tree_total_segment_count`` preserves
