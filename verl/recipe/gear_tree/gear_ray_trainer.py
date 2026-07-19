@@ -43,6 +43,11 @@ from recipe.gear_tree.run_manifest import (
     RunManifest,
     validate_main_run,
 )
+from recipe.gear_tree.trainer_state import (
+    GearTreeTrainerState,
+    load_trainer_state,
+    save_trainer_state,
+)
 
 
 class RayGearTreeTrainer(RayPPOTrainer):
@@ -136,14 +141,93 @@ class RayGearTreeTrainer(RayPPOTrainer):
     def _checkpoint_dir_for_step(self, step: int) -> str:
         return os.path.join(self.config.trainer.default_local_dir, f"global_step_{int(step)}")
 
+    # --- PLAN.md P0.E: counter state must survive checkpoint/resume ------- #
+
+    def _save_checkpoint(self):
+        """Base checkpoint plus the VDRA counter state file.
+
+        The base trainer restores only ``global_steps`` from the folder
+        name; ``gear_tree_trainer_state.json`` carries the remaining
+        counters (most importantly ``rollout_iteration``, which drives
+        replay ages).
+        """
+        super()._save_checkpoint()
+        save_trainer_state(
+            self._checkpoint_dir_for_step(self.global_steps),
+            GearTreeTrainerState(
+                global_step=int(self.global_steps),
+                rollout_iteration=int(getattr(self, "rollout_iteration", 0)),
+                num_optimizer_steps_total=int(
+                    getattr(self, "num_optimizer_steps_total", 0)
+                ),
+                successful_actor_updates=int(
+                    getattr(self, "successful_actor_updates", 0)
+                ),
+                postponed_updates=int(getattr(self, "postponed_updates", 0)),
+                failed_updates=int(getattr(self, "failed_updates", 0)),
+            ),
+        )
+
+    def _load_checkpoint(self):
+        """Restore ``global_steps`` (base) plus the VDRA counter state.
+
+        A checkpoint without the state file is a LEGACY checkpoint: replay
+        restore is disabled for it (PLAN.md P0.E option A) because restored
+        edges would carry generation iterations far above the reset
+        ``rollout_iteration`` and get negative, never-expiring ages.
+        """
+        ret = super()._load_checkpoint()
+        self._legacy_checkpoint_without_state = False
+        if int(getattr(self, "global_steps", 0) or 0) > 0:
+            state = load_trainer_state(
+                self._checkpoint_dir_for_step(self.global_steps)
+            )
+            if state is None:
+                self._legacy_checkpoint_without_state = True
+                print(
+                    "WARNING (PLAN.md P0.E): checkpoint "
+                    f"global_step_{self.global_steps} has no "
+                    "gear_tree_trainer_state.json (legacy checkpoint). "
+                    "The replay buffer will be RESET and rollout_iteration "
+                    "restarts at 0 so replay ages can never go negative."
+                )
+            else:
+                if int(state.global_step) != int(self.global_steps):
+                    raise ValueError(
+                        "gear_tree_trainer_state.json global_step="
+                        f"{state.global_step} does not match checkpoint "
+                        f"folder global_step_{self.global_steps}"
+                    )
+                self.rollout_iteration = int(state.rollout_iteration)
+                self.num_optimizer_steps_total = int(
+                    state.num_optimizer_steps_total
+                )
+                self.successful_actor_updates = int(
+                    state.successful_actor_updates
+                )
+                self.postponed_updates = int(state.postponed_updates)
+                self.failed_updates = int(state.failed_updates)
+        return ret
+
     def _restore_or_init_replay_buffer(self) -> Dict[str, Any]:
         replay_cfg = self._replay_config()
         metrics = {
             "buffer/checkpoint_restored": 0.0,
             "buffer/reset_on_resume": 0.0,
+            "buffer/legacy_checkpoint_reset": 0.0,
         }
         if int(getattr(self, "global_steps", 0) or 0) <= 0:
             self.replay_buffer = self._new_replay_buffer()
+            return metrics
+
+        # PLAN.md P0.E option A: a legacy checkpoint (no trainer-state file)
+        # must NOT restore replay — its edges carry generation iterations far
+        # above the reset rollout_iteration and would get negative ages.
+        if getattr(self, "_legacy_checkpoint_without_state", False):
+            self.replay_buffer = self._new_replay_buffer()
+            metrics["buffer/reset_on_resume"] = 1.0
+            metrics["buffer/legacy_checkpoint_reset"] = 1.0
+            self.replay_buffer_resume_metrics = metrics
             return metrics
 
         ckpt_dir = Path(self._checkpoint_dir_for_step(self.global_steps))
