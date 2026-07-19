@@ -445,12 +445,20 @@ class RayGearTreeTrainer(RayPPOTrainer):
 
         # P0.2: use the same L_edge_max the startup validator resolved so a
         # config that clears validation cannot then fail here on a deep edge.
+        # PLAN.md P0.C: the configured loss mode decides whether the float
+        # objective-weight tensors are attached (node-balanced ablation only).
+        loss_mode = str(
+            self.config.actor_rollout_ref.actor.policy_loss.get(
+                "loss_mode", "vdra_segment_mean_ppo"
+            )
+        )
         edge_batch = edges_to_dataproto(
             sampled_edges,
             self.tokenizer,
             max_prompt_length=self._resolved_max_edge_prompt_length(),
             max_response_length=self.config.data.max_response_length,
             include_old_log_probs=True,
+            loss_mode=loss_mode,
         )
         if self.config.trainer.get("balance_batch", False):
             self._balance_batch(edge_batch, metrics=metrics)

@@ -757,6 +757,12 @@ def _right_pad(ids: Sequence[int], length: int, pad_id: int) -> List[int]:
     return ids + [pad_id] * (length - len(ids))
 
 
+# PLAN.md P0.C: loss modes whose actor loss consumes the float objective
+# weight tensors. The canonical ``vdra_segment_mean_ppo`` batch-slot mean
+# does NOT — it must receive neither tensor.
+_LOSS_MODES_WITH_OBJECTIVE_WEIGHTS = ("vdra_node_balanced_ppo",)
+
+
 def edges_to_dataproto(
     edges: List[Dict[str, Any]],
     tokenizer,
@@ -764,6 +770,7 @@ def edges_to_dataproto(
     max_prompt_length: int,
     max_response_length: int,
     include_old_log_probs: bool = True,
+    loss_mode: str = "vdra_segment_mean_ppo",
 ) -> DataProto:
     """Build a DataProto whose rows are tree edges.
 
@@ -773,6 +780,14 @@ def edges_to_dataproto(
       (optionally) ``old_log_probs``.
     Non-tensor fields: ``uid`` (per source question, for grouping/logging),
     ``question_id``, ``reward_model``, ``extra_info``.
+
+    PLAN.md P0.C: ``loss_mode`` selects which float weight tensors are
+    attached. The canonical ``vdra_segment_mean_ppo`` mode attaches NO
+    ``objective_weights`` / ``segment_objective_weights`` — the main loss
+    uses the equal replay-slot mean (``original_optimizer_batch_slot_count``
+    supplied by the actor). Only the explicit ``vdra_node_balanced_ppo``
+    ablation still receives its precomputed weights. Integer group/identity
+    tensors are attached unconditionally for diagnostics and validation.
     """
     if not edges:
         raise ValueError("edges_to_dataproto received an empty edge list")
@@ -860,22 +875,21 @@ def edges_to_dataproto(
     for key, value in group_tensors_for_edges(edges).items():
         batch[key] = value
 
-    # PLAN.md P0.3 (legacy node-balanced path): precompute exact
-    # node-balanced weights and attach them as a row-level tensor. Kept for
-    # the ablation ``vdra_node_balanced_ppo`` loss. The main VDRA path uses
-    # ``segment_objective_weights`` below instead.
-    obj_weights = compute_objective_weights(edges)
-    validate_objective_weights(edges, obj_weights)
-    batch["objective_weights"] = torch.tensor(obj_weights, dtype=torch.float32)
+    # PLAN.md P0.C: float objective-weight tensors are attached ONLY for the
+    # explicit node-balanced ablation. The canonical segment-mean loss uses
+    # the equal replay-slot mean and must receive neither tensor; tree- and
+    # parent-normalized weights would silently re-couple the batch to
+    # complete-tree assumptions.
+    if str(loss_mode) in _LOSS_MODES_WITH_OBJECTIVE_WEIGHTS:
+        obj_weights = compute_objective_weights(edges)
+        validate_objective_weights(edges, obj_weights)
+        batch["objective_weights"] = torch.tensor(obj_weights, dtype=torch.float32)
 
-    # PLAN.md P0.4: precompute the segment-average weights on the full batch.
-    # The main VDRA loss reduces sum(segment_objective_weights * L_row), so
-    # mini/microbatch splits give gradients exactly equal to the full-batch
-    # weighted sum. Depends only on ``tree_id`` and ``tree_total_segment_count``
-    # — not on parent groups or queue labels.
-    seg_weights = compute_segment_objective_weights(edges)
-    validate_segment_objective_weights(edges, seg_weights)
-    batch["segment_objective_weights"] = torch.tensor(seg_weights, dtype=torch.float32)
+        seg_weights = compute_segment_objective_weights(edges)
+        validate_segment_objective_weights(edges, seg_weights)
+        batch["segment_objective_weights"] = torch.tensor(
+            seg_weights, dtype=torch.float32
+        )
 
     non_tensor_batch = {
         "uid": np.array(uids, dtype=object),

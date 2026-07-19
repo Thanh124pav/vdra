@@ -148,21 +148,26 @@ def update_manifest_from_generated_edges(
         if strict:
             raise
 
-    # PLAN.md P0.6: legacy node-balanced weight normalization is still
-    # computed for logging but its failure only flips the ABLATION invariant
-    # bit, not the main-path segment bit.
-    try:
-        weights = compute_objective_weights(generated_edges)
-        integrity_metrics.update(
-            validate_objective_weights(generated_edges, weights)
-        )
-        manifest.extras["objective_weight_normalization_passes"] = True
-    except ValueError as exc:
-        manifest.record_integrity_failure(1)
-        manifest.extras["objective_weight_normalization_passes"] = False
-        manifest.extras["objective_weight_normalization_error"] = str(exc)
-        integrity_metrics["vdra/objective_weight_normalization_failed"] = 1.0
-        # Non-fatal for the segment-mean main path.
+    # PLAN.md P0.C: parent-/tree-normalized node-balanced weights are an
+    # ablation concept. Compute and validate them ONLY when the run actually
+    # trains with the node-balanced loss — the canonical segment-mean path
+    # must not validate (or depend on) these float weights at all.
+    if (
+        str(manifest.extras.get("actor_loss_mode", ""))
+        == "vdra_node_balanced_ppo"
+    ):
+        try:
+            weights = compute_objective_weights(generated_edges)
+            integrity_metrics.update(
+                validate_objective_weights(generated_edges, weights)
+            )
+            manifest.extras["objective_weight_normalization_passes"] = True
+        except ValueError as exc:
+            manifest.record_integrity_failure(1)
+            manifest.extras["objective_weight_normalization_passes"] = False
+            manifest.extras["objective_weight_normalization_error"] = str(exc)
+            integrity_metrics["vdra/objective_weight_normalization_failed"] = 1.0
+            # Non-fatal for the segment-mean main path.
 
     # PLAN.md P0.6/P0.7: observe tree-id presence at construction time.
     # (Phase P0.H strengthens this into a real collision check.)
