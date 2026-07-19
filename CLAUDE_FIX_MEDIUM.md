@@ -1,118 +1,185 @@
 # Claude Fix Guide — MEDIUM Tasks
 
-> Scope: cross-function production refactors that touch replay lifecycle, strict identity, and manifest semantics. Do these after `CLAUDE_FIX_EASY.md` passes.
+> Scope: cross-function production fixes that preserve the host framework while
+> repairing VDRA-specific counter separation, replay failure handling, strict
+> identity, manifest semantics, and config validation.
 
-Do not change the mathematical objective. Canonical training remains an equal average over selected replay segment slots.
+Complete `CLAUDE_FIX_EASY.md` first.
 
-## M1 — Introduce one explicit reserved-update transaction
+## Mandatory impact review
 
-### Problem
-
-The current trainer performs reservation, shortcuts, tensorization, validation, actor execution, replay commit, counter mutation, and manifest mutation in several disconnected blocks. Exceptions before `update_actor()` may leave rows reserved; exceptions after model mutation can leave driver state partially committed.
-
-### Required design
-
-Extract one production helper, for example:
-
-```python
-_execute_reserved_actor_update(
-    reservation,
-    sampled_edges,
-    metrics,
-    manifest_strict,
-) -> ActorUpdateResult
-```
-
-The helper should make state transitions explicit:
+Before each medium task, list:
 
 ```text
-RESERVED
-  ↓ replay-row validation
-VALIDATED
-  ↓ optional all-zero handling
-TENSORIZED
-  ↓ actor update
-ACTOR_RETURNED
-  ↓ cross-worker and expected-step verification
-VERIFIED
-  ↓ replay commit + driver counters + manifest
-COMMITTED
+symbols changed
+all known consumers
+semantics preserved
+failure behavior before and after
+new tests
 ```
 
-Any exception before the actor begins:
+Stop and discuss with the user if implementation would require changing:
 
 ```text
-rollback replay reservation
-leave counters unchanged
-leave manifest success facts unchanged
+VERL global_step semantics
+scheduler cadence
+total_training_steps unit
+save/eval/checkpoint unit
+policy objective
+replay consumption after an actor has already changed the model
+FSDP/DDP scaling
 ```
-
-Any actor exception:
-
-```text
-rollback replay reservation
-increment failed-update diagnostics
-re-raise
-```
-
-Any invalid actor result after model mutation:
-
-```text
-DO NOT pretend the model was rolled back
-DO NOT commit replay rows or driver counters
-mark the run irrecoverably invalid
-save an explicit failure record
-abort strict training
-```
-
-A model update cannot be transactionally undone by replay rollback. Encode that distinction clearly.
-
-### Suggested result type
-
-```python
-@dataclass
-class ActorUpdateResult:
-    actor_output: DataProto | None
-    selected_edges: int
-    optimizer_steps: int
-    replay_committed: bool
-    skipped_all_zero: bool
-    actor_started: bool
-```
-
-### Required files
-
-```text
-verl/recipe/gear_tree/gear_ray_trainer.py
-verl/recipe/gear_tree/replay_buffer.py
-verl/recipe/gear_tree/run_manifest.py
-verl/recipe/gear_tree/tests/test_trainer_transaction_lifecycle.py
-```
-
-### Acceptance tests
-
-Inject failures at each stage:
-
-1. replay validation;
-2. tensorization;
-3. actor RPC;
-4. inconsistent worker step reports;
-5. actual/expected step mismatch;
-6. replay commit.
-
-For each injection, assert exact replay reservation state, counter state, manifest state, and whether the model may already have changed.
 
 ---
 
-## M2 — Enforce canonical tree and edge identity strictly
+## M1 — Restore and verify the three-counter separation
 
 ### Problem
 
-Strict paths still accept `tree_instance_id or tree_id`, and derived edge IDs can be bypassed by caller-supplied IDs. Collision checks based only on duplicate `(tree_id, child_segment_id)` pairs do not prove that every stochastic tree has a unique identity.
+The current branch changed `global_step` from VERL's outer-update counter into
+an internal PPO optimizer-batch counter. That conflicts with the host
+framework's `total_training_steps`, scheduler, checkpoint, and save/eval logic.
+
+### Required contract
+
+```text
+rollout_iteration
+    one generation / replay-fill cycle
+    replay-age unit
+
+global_step
+    one successful outer update_actor call
+    host-framework loop/checkpoint/log/save/eval unit
+
+num_optimizer_steps_total
+    accumulated internal PPO optimizer-batch count
+    observational metric only
+```
+
+For a normal 512/128/1 update:
+
+```text
+rollout_iteration         += 1
+global_step               += 1
+successful_actor_updates  += 1
+num_optimizer_steps_total += 4
+scheduler                 += 1   # unchanged VERL behavior
+```
+
+### Required implementation
+
+After a successful actor RPC and replay commit:
+
+```python
+self.successful_actor_updates += 1
+self.global_steps += 1
+self.num_optimizer_steps_total += reported_internal_steps
+```
+
+Do not set:
+
+```python
+self.num_optimizer_steps_total = self.global_steps
+```
+
+Do not modify base VERL `total_training_steps` derivation or move the scheduler
+inside `DataParallelPPOActor`.
+
+The internal count may remain the number currently reported by the actor. Until
+a separate approved change distinguishes attempts from successful updates, do
+not let that ambiguity control training.
+
+### Checkpoint/resume
+
+Persist and restore independently:
+
+```text
+global_step
+rollout_iteration
+num_optimizer_steps_total
+successful_actor_updates
+```
+
+Checkpoint directory naming remains keyed by outer `global_step`.
+
+### Acceptance tests
+
+- Five successful outer updates produce `global_step=5`.
+- If each reports four internal optimizer batches, total internal count is 20.
+- `total_training_steps=5` permits five outer updates, not approximately two.
+- Scheduler advances five times, not twenty.
+- Resume restores all counters without changing their units.
+- Save/eval/checkpoint consumers still use outer `global_step`.
+
+---
+
+## M2 — Guarantee rollback for every pre-actor failure
+
+### Problem
+
+Rows can be reserved before replay validation and tensorization. Exceptions in
+those stages must not leave the reservation stuck.
+
+### Required production flow
+
+```text
+reserve
+→ validate sampled replay rows
+→ tensorize
+→ actor RPC
+→ commit replay
+→ update outer counters and manifest
+```
+
+Wrap the pre-actor stages and actor RPC so that:
+
+```text
+validation failure     → rollback reservation, no counter mutation
+tensorization failure  → rollback reservation, no counter mutation
+actor RPC exception    → rollback reservation, increment failed-update metric
+actor RPC success      → commit rows, global_step += 1
+```
+
+### Important boundary
+
+An actor RPC can change model parameters before returning metrics. Do not claim
+that replay rollback can undo a model update.
+
+Internal optimizer-step metric disagreement is diagnostic under the preserved
+host contract. Do not change replay commit or outer `global_step` semantics
+based on that metric without discussing the policy with the user first.
+
+### Suggested helper
+
+```python
+_execute_reserved_actor_update(...)
+```
+
+is allowed if it only consolidates the existing semantics. It must not become
+a vehicle for scheduler/counter redesign.
+
+### Acceptance tests
+
+Inject failures in:
+
+```text
+replay validation
+tensorization
+actor RPC
+```
+
+For each, assert reservation state, replay size, outer counters, and manifest
+facts.
+
+Do not add a post-model-update rollback fiction.
+
+---
+
+## M3 — Enforce canonical tree and edge identity strictly
 
 ### Canonical strict contract
 
-Every generated stochastic tree must carry:
+Every stochastic tree must carry an explicit:
 
 ```text
 tree_instance_id
@@ -122,9 +189,10 @@ stable question_id
 per-tree UUID/counter component
 ```
 
-Strict extraction must require `tree_instance_id` specifically. A generic legacy `tree_id` is not sufficient.
+Strict extraction must require `tree_instance_id` specifically. A legacy
+`tree_id` alone is not sufficient.
 
-Every edge ID must be deterministically derived from:
+Every edge ID must be derived deterministically from:
 
 ```text
 tree_instance_id
@@ -132,72 +200,46 @@ parent_group_id
 child_segment_id
 ```
 
-Suggested contract:
+Required strict behavior:
 
 ```python
-derived_edge_id = derive_edge_id(
-    tree_instance_id,
-    parent_group_id,
-    child_segment_id,
-)
-
+derived_edge_id = derive_edge_id(...)
 if supplied_edge_id is not None and supplied_edge_id != derived_edge_id:
     raise ValueError(...)
 record["edge_id"] = derived_edge_id
 ```
 
-Do not use `setdefault()` in strict mode.
+Do not use `setdefault()` for strict IDs.
 
-### Collision checks
-
-At construction time, verify:
-
-- every edge has nonempty `tree_instance_id`;
-- all edges of one generated tree agree on that ID;
-- two independent stochastic-tree records in the same generated batch do not share an ID;
-- no identity equals an ambiguous `(snapshot, question)` fallback;
-- all derived edge IDs are globally unique within the generated batch;
-- replay insertion remains transactionally duplicate-safe.
-
-Legacy fallback behavior may remain only in explicit non-strict compatibility paths.
-
-### Required files
-
-```text
-verl/recipe/gear_tree/vllm_rollout_tree.py
-verl/recipe/gear_tree/tree_advantage.py
-verl/recipe/gear_tree/tree_data.py
-verl/recipe/gear_tree/manifest_lifecycle.py
-verl/recipe/gear_tree/tests/test_strict_tree_identity.py
-```
+Legacy fallback behavior may remain only behind an explicit non-strict
+compatibility path.
 
 ### Acceptance tests
 
-- Two trees with same question/snapshot/iteration receive different IDs.
-- Reusing `tree_id="t0"` with disjoint child IDs fails strict validation.
-- Missing `tree_instance_id` fails even when legacy `tree_id` exists.
-- A caller-supplied mismatching `edge_id` fails.
-- Non-strict legacy fixtures continue to load only when compatibility mode is explicit.
+- Two stochastic trees for the same question/snapshot/iteration get different IDs.
+- Missing `tree_instance_id` fails even if `tree_id` exists.
+- Reused generic `tree_id="t0"` cannot masquerade as two distinct trees.
+- A mismatching caller-supplied `edge_id` fails.
+- Replay insertion remains transactionally duplicate-safe.
+
+If enforcing this breaks a public serialization/checkpoint format, stop and
+report the compatibility impact before migrating it.
 
 ---
 
-## M3 — Decouple canonical manifest invariants from obsolete objective weights
+## M4 — Decouple canonical manifest invariants from obsolete weights
 
-### Problem
-
-Canonical `DataProto` no longer carries `objective_weights` or `segment_objective_weights`, but construction-time manifest code still computes tree-normalized segment weights and uses them to certify canonical segment invariants.
-
-### Required canonical checks
-
-For `vdra_segment_mean_ppo`, `segment_count_invariants_passed` should depend on observed construction facts such as:
+For `vdra_segment_mean_ppo`, manifest validity may depend on observed facts:
 
 ```text
-all realized non-placeholder segments counted exactly once
-fresh_iid realized_child_count == allocated_k
-queue segment counts sum to tree_total_segment_count
-edge IDs unique
+realized non-placeholder segments counted exactly once
+fresh_iid realized child count matches allocation
+queue counts match tree segment count
+IDs are valid and unique
 stored log-probs align with response tokens
-no silent truncation in tensorization
+no silent truncation
+replay validation passed
+at least one successful outer actor update occurred
 ```
 
 It must not depend on:
@@ -206,76 +248,56 @@ It must not depend on:
 compute_segment_objective_weights
 validate_segment_objective_weights
 compute_objective_weights
-parent/tree normalized float coefficients
+parent/tree-normalized float coefficients
 ```
 
-Only the explicit `vdra_node_balanced_ppo` ablation may compute and validate those weights.
+Only the explicit node-balanced ablation may calculate those weights.
 
-### Manifest monotonicity
+Failure counters must be monotonic and non-healing. Success on a later
+iteration must not erase a historical failure.
 
-All failure facts must be cumulative and non-healing:
-
-```text
-group_integrity_failures
-segment_count_failures
-replay_batch_failures
-optimizer_step_accounting_failures
-actor_result_failures
-```
-
-Success bits may become true only after an observed successful canonical update and must never erase historical failures.
-
-### Required files
-
-```text
-verl/recipe/gear_tree/manifest_lifecycle.py
-verl/recipe/gear_tree/run_manifest.py
-verl/recipe/gear_tree/gear_ray_trainer.py
-verl/recipe/gear_tree/tests/test_manifest_observed_facts.py
-verl/recipe/gear_tree/tests/test_run_manifest.py
-```
+Do not add internal optimizer-step equality as a canonical run requirement
+unless the user approves that stronger contract. The internal count is a
+runtime diagnostic, not the outer training unit.
 
 ### Acceptance tests
 
-- Canonical manifest validation never calls segment/objective weight helpers.
+- Canonical manifest path does not call objective-weight helpers.
 - Node-balanced ablation still validates its weights.
-- A historical failure keeps the run invalid after later clean iterations.
-- Manifest save/load preserves all cumulative failures.
+- Historical failures remain after later clean updates.
+- Save/load preserves all counters and units.
 
 ---
 
-## M4 — Make Hydra/dataclass validation reject misplaced or unknown canonical fields
+## M5 — Test the real Hydra/dataclass conversion path
 
-### Problem
-
-A composition test that removes unknown keys before dataclass instantiation cannot prove the real runtime config is schema-correct.
-
-### Required behavior
-
-The pre-GPU config check must:
+The pre-GPU gate must:
 
 1. compose the real canonical Hydra config;
-2. instantiate the same typed config path used by the worker;
-3. fail on unknown or misplaced canonical fields;
+2. instantiate the same typed path used by the worker;
+3. verify canonical fields are at the correct level;
 4. verify `mean` and `sum` overrides reach `actor.policy_loss`;
-5. verify no duplicate top-level actor field silently overrides `policy_loss`.
+5. fail or warn explicitly for misplaced canonical fields;
+6. avoid proving correctness only after silently deleting unknown fields.
 
-Do not sanitize the config into a hand-picked subset before the only schema test. If upstream runtime intentionally ignores extra runtime fields, test the exact runtime conversion function and separately assert canonical fields are located correctly.
+Do not redesign the public config schema merely because the test exposes an
+upstream runtime field. Report the conflict and distinguish:
 
-### Acceptance tests
-
-- Moving `ratio_threshold` to the wrong level fails or is demonstrably ignored with an explicit warning.
-- Invalid `segment_token_reduction` fails before training.
-- The full composed actor config round-trips through the real worker conversion.
+```text
+canonical VDRA field misplaced
+versus
+legitimate upstream runtime-only field
+```
 
 ---
 
-# Medium-task completion gate
+# Medium completion gate
 
-Run the easy guide first, then add and run:
+Run easy tests first, then at minimum:
 
 ```bash
 python -m pytest \
+  verl/recipe/gear_tree/tests/test_trainer_state_checkpoint.py \
   verl/recipe/gear_tree/tests/test_trainer_transaction_lifecycle.py \
   verl/recipe/gear_tree/tests/test_strict_tree_identity.py \
   verl/recipe/gear_tree/tests/test_manifest_observed_facts.py \
@@ -284,4 +306,15 @@ python -m pytest \
 python scripts/check_hydra_composition.py
 ```
 
-Do not mark a medium task complete from source-string guards alone. At least one test must execute the production helper or runtime conversion path changed by that task.
+Completion report must include a counter table like:
+
+```text
+five outer updates:
+rollout_iteration = ...
+global_step = 5
+scheduler steps = 5
+num_optimizer_steps_total = 20  # when four were reported per update
+```
+
+Do not proceed to a hard production change automatically. Hard changes require
+explicit user approval as described in `CLAUDE_FIX_HARD.md`.
