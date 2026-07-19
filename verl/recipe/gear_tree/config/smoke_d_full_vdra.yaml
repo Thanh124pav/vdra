@@ -9,7 +9,7 @@
 # Acceptance (per PLAN.md P0.6):
 #   * at least five successful actor updates;
 #   * finite loss & gradients;
-#   * complete-tree replay held every update;
+#   * edge-level replay held every update;
 #   * exact segment-count normalization (sum_q n_q == N_seg(T));
 #   * rollout / scorer weights verified;
 #   * stored old log probabilities used;
@@ -31,7 +31,7 @@ tree_policy:
   strict_group_integrity: true
 
 gear_tree:
-  only_adv_greater_than_zero: false
+  only_adv_greater_than_zero: true
   gear:
     enabled: true
     strict_vdra: true

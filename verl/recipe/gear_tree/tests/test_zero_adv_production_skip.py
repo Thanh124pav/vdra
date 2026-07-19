@@ -167,12 +167,13 @@ class TestProductionWiring:
         actor_idx = source.index("update_actor(edge_batch)")
         assert validate_idx < tensorize_idx < actor_idx
 
-    def test_main_config_enables_exact_zero_filter(self):
+    def test_canonical_configs_enable_exact_zero_filter(self):
         from omegaconf import OmegaConf
 
-        cfg_path = Path(__file__).resolve().parents[1] / "config" / "gear_tree_trainer.yaml"
-        cfg = OmegaConf.load(cfg_path)
-        assert cfg.gear_tree.only_adv_greater_than_zero is True
+        config_dir = Path(__file__).resolve().parents[1] / "config"
+        for name in ["gear_tree_trainer.yaml", "smoke_d_full_vdra.yaml"]:
+            cfg = OmegaConf.load(config_dir / name)
+            assert cfg.gear_tree.only_adv_greater_than_zero is True
 
     def test_extraction_filter_no_longer_uses_pav(self):
         source = (
