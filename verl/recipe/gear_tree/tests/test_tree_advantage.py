@@ -58,8 +58,8 @@ def test_extract_edges_matches_vendor_update_modes(mode, expected_adv, expected_
 
 
 def test_pruned_edge_is_dropped_by_default():
-    # PLAN.md P0.1: administrative pruned=True placeholder rows must NOT enter
-    # DataProto or the parent denominator. Default emit_pruned_edges=False.
+    # Stage 1: administrative pruned=True placeholder rows must NOT enter
+    # replay or the realized non-pruned pre-filter count.
     tree = _tree()
     tree["children"][0]["pruned"] = True
     edges = extract_edges_from_tree(tree, only_adv_greater_than_zero=False)

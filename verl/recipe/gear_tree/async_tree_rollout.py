@@ -260,10 +260,10 @@ async def build_tree_edges_async(
         except Exception:
             pass
 
-    # PLAN.md P0.1: administrative pruned=True rows must never enter DataProto
-    # (emit_pruned_edges=False), and every realized (non-pruned) child must
-    # remain — including zero-advantage ones — so the parent denominator
-    # equals allocated_k.
+    # Stage 1: administrative pruned=True rows must never enter DataProto
+    # (emit_pruned_edges=False). Advantages are computed for every realized
+    # non-pruned child before optional exact-zero filtering; positive and
+    # negative advantages are retained.
     edges = extract_edges_from_tree(
         tree, adv_method=adv_method, only_adv_greater_than_zero=only_adv_greater_than_zero,
         tree_update_mode=tree_update_mode, treepo_global_weight=treepo_global_weight,
@@ -619,9 +619,10 @@ try:  # keep CPU-importable when agent_loop isn't installed
 
                 self._gate.set_terminal_reward_fn(_terminal_grader)
 
-            # PLAN.md P0.1: default only_adv_greater_than_zero to False so the
-            # parent denominator matches the realized child count. Callers who
-            # need the legacy SPO baseline can still override to True.
+            # Stage 1: the shipped main config sets only_adv_greater_than_zero
+            # to true, which removes exact-zero advantages after construction
+            # counts are stamped. The runtime fallback stays false only for
+            # legacy configs that omit the field.
             edges = await build_tree_edges_async(
                 prompt_text, prompt_ids, data_instance,
                 segment_generator=per_call_gen, reward_fn=self._reward_fn,

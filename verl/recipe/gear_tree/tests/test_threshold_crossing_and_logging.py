@@ -136,6 +136,8 @@ class TestTrainerWiring:
             "scheduler must step once per internal PPO mini-batch",
             "total_training_steps must use optimizer-step units",
             "segment_objective_weights are required by vdra_segment_mean_ppo",
+            "segment -> tree (divide by pre-filter",
+            "segment-denominator",
             "training/all_zero_batch_skipped",
         ]
         for target in targets:

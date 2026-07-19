@@ -19,8 +19,9 @@
 #   * exact fresh_iid final-child accounting;
 #   * valid manifest (RunManifest.is_valid_main_run() true).
 #
-# PLAN.md P0.1: `only_adv_greater_than_zero: true` may remain enabled for
-# compute efficiency; the segment denominator ignores the filter.
+# Stage 1: advantages are computed before filtering. Main VDRA may
+# remove exact-zero rows to save compute while preserving the pre-filter
+# tree_total_segment_count for diagnostics / later manifest validation.
 
 tree_policy:
   advantage_mode: spo_local

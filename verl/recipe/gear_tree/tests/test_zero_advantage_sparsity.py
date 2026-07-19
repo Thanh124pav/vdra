@@ -1,13 +1,12 @@
 """PLAN.md P0.5 — zero-advantage sparse-vs-dense + unique ID tests.
 
-Canonical safe path keeps every realized child row
-(``only_adv_greater_than_zero=False``) so the parent denominator matches
-``allocated_k``. An optional sparse path may drop zero-contribution rows
-before model execution — but the batch-slot mean loss must use the ORIGINAL
-N_B (128 in main). This gives identical loss/gradient dense vs sparse.
+These legacy tests exercise the loss helper and replay uniqueness guards.
+Stage 1 production computes advantages before filtering, retains positive and
+negative advantages, and may remove exact-zero rows before replay insertion to
+save compute. ``tree_total_segment_count`` remains the pre-filter realized
+non-pruned count; these tests do not assert production loss normalization.
 
-Additional invariants:
-* an all-zero optimizer batch skips ``optimizer.step()``;
+Additional invariant:
 * replay insertion rejects duplicate ``edge_id`` transactionally (unique
   ``tree_instance_id`` regression guard).
 """
@@ -103,11 +102,10 @@ class TestDenseVsSparseParity:
 
 
 class TestAllZeroBatchIsHandled:
-    """PLAN.md P0.5: a batch whose every retained slot has zero contribution
-    should skip ``optimizer.step()`` and leave ``global_step`` unchanged.
+    """The loss helper returns zero for an all-zero-advantage batch.
 
-    We verify the loss reduces to zero so the caller can safely detect and
-    skip. The trainer-side skip is exercised in P0.3 tests.
+    Stage 1 removes the trainer-level all-zero shortcut; this test does not
+    claim optimizer-step or global-step behavior.
     """
 
     def test_all_zero_advantage_gives_zero_loss(self):

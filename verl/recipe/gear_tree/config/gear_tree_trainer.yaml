@@ -46,6 +46,9 @@ gear_tree:
   # TreeRL-style discount (only used by treerl_style_ablation).
   treerl_gamma: 0.9
 
+  # Stage 1 zero-filter contract: despite the legacy name, true removes
+  # only exact-zero advantages after all realized non-pruned segments have
+  # been counted; positive and negative advantages are retained.
   only_adv_greater_than_zero: true
 
   replay_buffer:
@@ -229,14 +232,10 @@ tree_policy:
   advantage_mode: spo_local
 
   # policy_aggregation selects the actor loss reduction. Main VDRA is
-  # `global_segment_mean` (PLAN.md P0.1):
-  #
-  #     L = (1/N_T) * sum_T (1/N_seg(T)) * sum_s L_s^r,
-  #
-  # where the within-segment reduction ``r`` is set by
-  # `segment_token_reduction` below. The main path REQUIRES the actor loss
-  # `vdra_segment_mean_ppo`; selected replay slots have equal outer weight.
-  # Tree/queue count tensors remain diagnostics and validation inputs.
+  # `global_segment_mean` (PLAN.md P0.1). In the current preserved host
+  # contract, selected replay slots have equal outer weight; tree/queue count
+  # tensors remain diagnostics and validation inputs until the Medium manifest
+  # cleanup.
   #
   # Values:
   #   * global_segment_mean  — canonical main-run (PLAN.md P0.1).
@@ -248,13 +247,13 @@ tree_policy:
   # PLAN.md P0.1: within-segment token reduction. Must be exactly `mean` or
   # `sum`. `mean` is the canonical/default main setting; `sum` is a supported
   # first-class ablation of the score-function convention. The two modes
-  # share exactly one rollout / advantage / segment-denominator / replay /
-  # batching path — only the per-row `L_s` differs.
+  # share exactly one rollout / advantage / replay / batching path — only
+  # the per-row `L_s` differs.
   segment_token_reduction: mean
 
-  # If true (canonical), root-generated child segments participate in the
-  # tree average as segments in their own right — every realized segment is
-  # counted.
+  # If true, root-generated child segments are included in construction
+  # counts and diagnostics. Do not treat this as a Stage 1 loss-normalization
+  # change.
   include_root_parent_group: true
 
   # Strict main runs must abort on any group integrity failure.

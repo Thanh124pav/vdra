@@ -140,8 +140,9 @@ def build_edge_batch(
             except Exception:
                 pass
 
-        # PLAN.md P0.1: exclude pruned placeholders; keep zero-advantage
-        # realized children so the parent denominator matches allocated_k.
+        # Stage 1: extract after computing advantages for realized children.
+        # The legacy flag removes only exact-zero advantages; positive and
+        # negative advantages remain trainable. Pruned placeholders stay out.
         edges = extract_edges_from_tree(
             tree,
             adv_method=adv_method,

@@ -6,16 +6,11 @@ Three losses are registered here:
   ``PPOTrainer._compute_actor_loss`` used by SPO/TreeRL/TreePO/GEAR-*. Kept as
   the SPO baseline and legacy aggregation; see the module docstring below.
 * ``vdra_segment_mean_ppo`` — PLAN.md P0.1 / P0.4 canonical main-run loss.
-  Global segment-average with configurable within-segment token reduction:
-
-      token -> segment (``segment_token_reduction=mean|sum``)
-      segment -> tree (divide by pre-filter ``tree_total_segment_count``)
-      tree -> update (average over trees)
-
-  Neither reduction couples to parent branch factor: the loss uses one equal
-  outer weight per selected replay slot. Tree and queue counts remain
-  diagnostics/validation inputs; ``segment_objective_weights`` belongs only
-  to the explicit node-balanced ablation path.
+  It applies configurable within-segment token reduction and, in the preserved
+  host contract, one equal outer weight per selected replay slot. Stage 1 does
+  not change policy-loss normalization: tree and queue counts remain
+  diagnostics/validation inputs, and ``segment_objective_weights`` belongs
+  only to the explicit node-balanced ablation path.
 * ``vdra_node_balanced_ppo`` — legacy parent-balanced ablation. NOT the main
   VDRA path (PLAN.md P0.1). Kept for controlled comparison runs; it must not
   be selected by the main config.

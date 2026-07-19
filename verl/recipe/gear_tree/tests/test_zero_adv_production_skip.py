@@ -1,9 +1,11 @@
-"""PLAN.md E1: production zero-advantage behavior stays dense.
+"""PLAN.md E1: zero-advantage handling before replay insertion.
 
-* The diagnostic predicate keys on the EXACT training advantage that is
-  broadcast into the policy ``advantages`` tensor, never on ``pav_advantage``.
-* A valid all-zero sampled batch must still follow the normal actor path.
-* Missing advantages fail explicitly instead of being interpreted as zero.
+* Advantages are computed before filtering and the filter reads the exact
+  ``advantage`` scalar broadcast into the policy tensor, never ``pav_advantage``.
+* Main config removes exact-zero edges to save compute while retaining positive
+  and negative advantages.
+* Dense ablation mode keeps positive, negative, and zero advantages; replay
+  validation still treats ``advantage=0.0`` as valid input.
 """
 
 from __future__ import annotations
@@ -118,35 +120,34 @@ class TestExtractionFilterUsesTrainingAdvantage:
             "_request_object": {"_treetune__idx": 0},
         }
 
-    def test_sparse_mode_drops_only_zero_training_advantage_rows(self):
+    def test_true_keeps_positive_and_negative_but_removes_zero(self):
         from recipe.gear_tree.tree_advantage import extract_edges_from_tree
 
-        tree = self._tree([0.0, 1.0, 1.0])
+        filtered = extract_edges_from_tree(
+            dict(self._tree([0.0, 1.0, -1.0])), only_adv_greater_than_zero=True
+        )
+        advantages = sorted(float(e["advantage"]) for e in filtered)
+        assert advantages == [-1.0, 1.0]
+        assert all(float(e["advantage"]) != 0.0 for e in filtered)
+
+    def test_false_keeps_positive_negative_and_zero(self):
+        from recipe.gear_tree.tree_advantage import extract_edges_from_tree
+
         dense = extract_edges_from_tree(
-            dict(tree), only_adv_greater_than_zero=False
+            dict(self._tree([0.0, 1.0, -1.0])), only_adv_greater_than_zero=False
         )
-        sparse = extract_edges_from_tree(
-            dict(self._tree([0.0, 1.0, 1.0])), only_adv_greater_than_zero=True
-        )
-        assert len(dense) == 3
-        # Sparse mode keeps exactly the rows whose TRAINING advantage is
-        # non-zero (the same scalar tensorized into `advantages`).
-        assert len(sparse) == len(
-            [e for e in dense if float(e["advantage"]) != 0.0]
-        )
-        for e in sparse:
-            assert float(e["advantage"]) != 0.0
+        advantages = sorted(float(e["advantage"]) for e in dense)
+        assert advantages == [-1.0, 0.0, 1.0]
 
-    def test_denominator_counts_survive_sparse_filtering(self):
+    def test_tree_total_segment_count_survives_zero_filtering(self):
         from recipe.gear_tree.tree_advantage import extract_edges_from_tree
 
-        sparse = extract_edges_from_tree(
-            dict(self._tree([0.0, 1.0, 1.0])), only_adv_greater_than_zero=True
+        filtered = extract_edges_from_tree(
+            dict(self._tree([0.0, 1.0, -1.0])), only_adv_greater_than_zero=True
         )
-        # tree_total_segment_count still counts every realized segment.
-        assert sparse and all(
-            int(e["tree_total_segment_count"]) == 3 for e in sparse
-        )
+        assert len(filtered) == 2
+        assert all(int(e["tree_total_segment_count"]) == 3 for e in filtered)
+        assert all(int(e["realized_child_count"]) == 3 for e in filtered)
 
 
 class TestProductionWiring:
@@ -166,11 +167,12 @@ class TestProductionWiring:
         actor_idx = source.index("update_actor(edge_batch)")
         assert validate_idx < tensorize_idx < actor_idx
 
-    def test_worker_default_is_dense(self):
-        source = (
-            Path(__file__).resolve().parents[1] / "gear_tree_worker.py"
-        ).read_text()
-        assert 'gt.get("only_adv_greater_than_zero", False)' in source
+    def test_main_config_enables_exact_zero_filter(self):
+        from omegaconf import OmegaConf
+
+        cfg_path = Path(__file__).resolve().parents[1] / "config" / "gear_tree_trainer.yaml"
+        cfg = OmegaConf.load(cfg_path)
+        assert cfg.gear_tree.only_adv_greater_than_zero is True
 
     def test_extraction_filter_no_longer_uses_pav(self):
         source = (

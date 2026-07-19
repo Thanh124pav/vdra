@@ -44,11 +44,12 @@ def extract_edges_from_tree(
     This ports ``TreeEpisodeUtils.extract_edges_from_tree`` while reading both
     ``reward`` and legacy ``score`` fields.
 
-    PLAN.md P0.1: main VDRA runs must keep every realized child (including
-    zero-advantage ones) so the parent denominator ``|children_of_p|`` matches
-    ``allocated_k``. Administrative ``pruned=True`` placeholder rows must NOT
-    enter training nor the parent denominator; ``emit_pruned_edges`` defaults
-    to ``False``. Set to ``True`` only for diagnostic dumps.
+    Stage 1 zero-filter contract: advantages are computed for every realized
+    child before filtering. When ``only_adv_greater_than_zero`` is true, the
+    legacy name means "drop exact-zero advantages to save compute"; positive
+    and negative advantages are retained. Administrative ``pruned=True``
+    placeholder rows must NOT enter replay; ``emit_pruned_edges`` defaults to
+    ``False`` and is only for diagnostic dumps.
 
     ``strict_fresh_iid`` enforces the fresh_iid invariants right at edge
     extraction:
@@ -105,11 +106,10 @@ def extract_edges_from_tree(
     expanded_parent_group_ids: set[str] = set()
     trainable_child_count = 0
     queue_to_parent_group_counts: dict[Any, set[str]] = {}
-    # PLAN.md P0.2: pre-filter segment counts. Every realized (non-pruned)
+    # Stage 1: pre-filter segment counts. Every realized non-pruned
     # segment increments ``tree_total_segment_count`` even if its advantage
-    # ends up zero and it gets dropped from ``edges`` — the segment denominator
-    # ``N_seg(T)`` must not shift under advantage sparsity. Queue counts obey
-    # the same rule so the identity ``sum_q n_q == N_seg(T)`` holds.
+    # is exactly zero and the row is dropped from replay to save compute.
+    # Queue counts preserve the same pre-filter construction snapshot.
     tree_total_segment_count = 0
     queue_released_segment_count: dict[Any, int] = {}
     # PLAN.md P0.2: per-parent realized-vs-allocated snapshot. Fresh_iid
@@ -234,10 +234,10 @@ def extract_edges_from_tree(
                 **update_values,
             }
             edge["advantage"] = advantage
-            # PLAN.md P0.2: count every realized segment BEFORE zero-advantage
-            # filtering so the segment denominator stays stable even when
-            # ``only_adv_greater_than_zero`` drops rows. Pruned placeholders
-            # remain excluded from both counts.
+            # Stage 1: count every realized non-pruned segment BEFORE
+            # zero-advantage filtering. ``tree_total_segment_count`` preserves
+            # the construction count even when exact-zero rows are dropped
+            # from replay to save compute. Pruned placeholders remain excluded.
             if not is_pruned:
                 tree_total_segment_count += 1
                 queue_released_segment_count[queue_flush_id] = (
@@ -256,11 +256,11 @@ def extract_edges_from_tree(
                 # legacy fixture is used; prefer the max we saw.
                 if int(allocated_k) > slot["allocated_k"]:
                     slot["allocated_k"] = int(allocated_k)
-            # PLAN.md P0.G: the sparsity filter must use the EXACT scalar
-            # that token_fields_for_edges broadcasts into the policy
-            # `advantages` tensor (edge["advantage"]), never the diagnostic
-            # pav_advantage — otherwise rows with zero training signal could
-            # be kept (or trained rows dropped) inconsistently.
+            # Stage 1: the zero filter uses the EXACT scalar that
+            # token_fields_for_edges broadcasts into the policy `advantages`
+            # tensor (edge["advantage"]), never diagnostic pav_advantage.
+            # Despite the legacy flag name, true keeps positive and negative
+            # advantages and removes only exact-zero rows.
             if (not is_pruned or emit_pruned_edges) and (
                 not only_adv_greater_than_zero or advantage != 0
             ):
@@ -277,11 +277,11 @@ def extract_edges_from_tree(
         node.pop("children", None)
 
     visit(tree_copy)
-    # PLAN.md P0.N1 + P0.2: tree-level counts. Stamp them on every edge so
-    # replay / tensorization / actor can index by tree without another tree
-    # walk. ``tree_total_segment_count`` is the canonical N_seg(T) used as the
-    # segment denominator; queue_released_segment_count[q] is the pre-filter
-    # ``n_q`` used only for logging / theoretical validation.
+    # PLAN.md P0.N1 + Stage 1: tree-level construction counts. Stamp them on
+    # every retained edge so replay / tensorization / actor can index by tree
+    # without another tree walk. ``tree_total_segment_count`` is the pre-filter
+    # realized non-pruned segment count; queue_released_segment_count[q] is the
+    # matching pre-filter queue count for logging / theoretical validation.
     tree_summary = {
         "tree_id": str(tree_id),
         "expanded_parent_group_count": len(expanded_parent_group_ids),
