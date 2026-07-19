@@ -715,6 +715,56 @@ class RayGearTreeTrainer(RayPPOTrainer):
             manifest, sampled_edges, strict=strict, **kwargs
         )
 
+    def _execute_reserved_actor_update(
+        self,
+        replay_buffer,
+        reservation,
+        sampled_edges: List[Dict[str, Any]],
+        metrics: Dict[str, Any],
+        *,
+        manifest_strict: bool,
+    ):
+        """PLAN.md M2: transaction stages for a reserved replay batch.
+
+        validation failure     -> rollback reservation, no counter mutation
+        tensorization failure  -> rollback reservation, no counter mutation
+        actor RPC exception    -> rollback reservation, failed_updates += 1
+        actor RPC success      -> return; commit + outer counters stay in fit()
+
+        An actor RPC may mutate model parameters before raising; replay
+        rollback only restores buffer state and never claims to undo a model
+        update.
+        """
+        try:
+            # PLAN.md P0.B: sampled replay batches get ROW-LOCAL checks only
+            # (edge-level replay legally splits trees and parent groups). Run
+            # BEFORE tensorization and actor update so a broken reservation
+            # cannot be converted into model inputs.
+            replay_batch_metrics = self._update_manifest_from_replay_batch(
+                self.run_manifest, sampled_edges, strict=manifest_strict
+            )
+            metrics.update(replay_batch_metrics)
+            edge_batch = self._edges_to_update_batch(sampled_edges, metrics)
+        except Exception:
+            replay_buffer.rollback(reservation)
+            raise
+        # PLAN.md P0.J: strict tensorization refuses truncation with a
+        # ValueError, so REACHING this line is the observed no-truncation
+        # event for this batch.
+        self.run_manifest.no_truncation = True
+        self.run_manifest.extras["no_truncation"] = True
+
+        t0 = time.time()
+        # P0.9: RayGearTreeTrainer never trains a critic, so there is no
+        # critic warmup to gate the actor update on. Always update.
+        try:
+            actor_output = self.actor_rollout_wg.update_actor(edge_batch)
+        except Exception:
+            replay_buffer.rollback(reservation)
+            self.failed_updates += 1
+            raise
+        return edge_batch, actor_output, time.time() - t0
+
     def fit(self):
         from omegaconf import OmegaConf
         from verl.utils.tracking import Tracking
@@ -846,31 +896,18 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     logger.log(data=metrics, step=self.global_steps)
                     continue
 
-                # PLAN.md P0.B: sampled replay batches get ROW-LOCAL checks
-                # only (edge-level replay legally splits trees and parent
-                # groups). Run BEFORE tensorization and actor update so a
-                # broken reservation cannot be converted into model inputs.
-                replay_batch_metrics = self._update_manifest_from_replay_batch(
-                    self.run_manifest, sampled_edges, strict=manifest_strict
+                # PLAN.md M2: validation, tensorization, and the actor RPC run
+                # inside one transaction helper — any failure before a
+                # successful RPC rolls the reservation back.
+                edge_batch, actor_output, t_update = (
+                    self._execute_reserved_actor_update(
+                        replay_buffer,
+                        reservation,
+                        sampled_edges,
+                        metrics,
+                        manifest_strict=manifest_strict,
+                    )
                 )
-                metrics.update(replay_batch_metrics)
-
-                edge_batch = self._edges_to_update_batch(sampled_edges, metrics)
-                # PLAN.md P0.J: strict tensorization refuses truncation with a
-                # ValueError, so REACHING this line is the observed
-                # no-truncation event for this batch.
-                self.run_manifest.no_truncation = True
-                self.run_manifest.extras["no_truncation"] = True
-
-                t0 = time.time()
-                # P0.9: RayGearTreeTrainer never trains a critic, so there is
-                # no critic warmup to gate the actor update on. Always update.
-                try:
-                    actor_output = self.actor_rollout_wg.update_actor(edge_batch)
-                except Exception:
-                    replay_buffer.rollback(reservation)
-                    self.failed_updates += 1
-                    raise
                 actor_updated = True
                 actor_metrics_meta = actor_output.meta_info["metrics"]
                 # PLAN.md P0.3: extract the true optimizer.step() count BEFORE
@@ -971,8 +1008,6 @@ class RayGearTreeTrainer(RayPPOTrainer):
                                 f"ppo_mini_batch_size={ppo_mini}, "
                                 f"ppo_epochs={ppo_epochs} (PLAN.md P0.D)."
                             )
-                t_update = time.time() - t0
-
                 response_tokens = edge_batch.batch["response_mask"].sum().item()
                 # PLAN.md P0.2: age uses rollout_iteration (never global_step).
                 ages = [
