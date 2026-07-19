@@ -33,9 +33,9 @@ jobs:
           # Python. The gate/trainer tests importorskip when verl or transformers
           # are missing, so we do NOT install the full verl stack here.
           pip install pytest numpy sortedcontainers httpx pyyaml
-          # OmegaConf is used by RayGearTreeTrainer._gear_tree_config; installing
-          # it here lets the P0.2 trainer stub tests run when verl is available.
-          pip install omegaconf
+          # OmegaConf + Hydra: needed by RayGearTreeTrainer._gear_tree_config
+          # and by the PLAN.md P0.1 config-wiring tests.
+          pip install omegaconf hydra-core
           # PLAN.md P0.7: recipe.gear_tree tests exercise policy loss +
           # tree data helpers that live under verl/. Install the CPU torch
           # wheel and the small set of gear-tree deps so the correctness
@@ -46,7 +46,11 @@ jobs:
           # without it. Install ``ray[default]==2.35.*`` to keep the CPU
           # image lean; the tests never call into ray runtime.
           pip install --index-url https://download.pytorch.org/whl/cpu torch
-          pip install tensordict transformers codetiming pylatexenc
+          # PLAN.md P0.8: verl.utils.model imports AutoModelForVision2Seq
+          # which was removed in transformers 5.x. Pin to the 4.x line the
+          # worker configs were written against, otherwise the pre-GPU gate's
+          # real dataclass instantiation step fails on import.
+          pip install tensordict "transformers>=4.40,<5.0" codetiming pylatexenc
           pip install "ray>=2.35,<2.40"
 
       - name: Install the local package
