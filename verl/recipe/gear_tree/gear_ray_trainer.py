@@ -21,6 +21,7 @@ from verl import DataProto
 from verl.trainer.ppo.metric_utils import reduce_metrics
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
+from recipe.gear_tree.config_validation import validate_policy_loss_consistency
 from recipe.gear_tree.context_contract import (
     resolve_max_edge_prompt_length,
     resolve_max_original_prompt_length,
@@ -303,82 +304,10 @@ class RayGearTreeTrainer(RayPPOTrainer):
             segment_length=int(gt.get("segment_length", 0) or 0),
             model_context_length=model_context,
         )
-        # PLAN.md P1.R7: refuse the deprecated ablation `_original` names in
-        # strict main runs, and refuse to combine the *_style_ablation modes
-        # with the canonical policy aggregation (they are ablations, not
-        # main-paper losses). The gate's own strict checks cover
-        # pilot_execution_mode and allocation_runtime.
-        gear_cfg = gt.get("gear") or {}
-        strict = bool(gear_cfg.get("strict_vdra", True))
-        tree_update_mode = str(gt.get("tree_update_mode", "spo"))
-        tree_policy = self.config.get("tree_policy") or {}
-        policy_agg = str(tree_policy.get("policy_aggregation", "legacy_token_mean"))
-        actor_loss_mode = str(
-            self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        )
-        segment_reduction = str(
-            tree_policy.get("segment_token_reduction", "mean")
-        ).strip().lower()
-        # PLAN.md P0.1: segment_token_reduction must be exactly `mean` or `sum`.
-        if segment_reduction not in ("mean", "sum"):
-            raise ValueError(
-                "tree_policy.segment_token_reduction must be exactly 'mean' or "
-                f"'sum' (PLAN.md P0.1); got {segment_reduction!r}."
-            )
-        # PLAN.md P0.1: `tree_policy.segment_token_reduction` and
-        # `actor.policy_loss.segment_token_reduction` are duplicates that MUST
-        # agree, otherwise the actor loss silently reads a different reduction
-        # than the manifest/logs advertise.
-        actor_reduction = str(
-            self.config.actor_rollout_ref.actor.policy_loss.get(
-                "segment_token_reduction", "mean"
-            )
-        ).strip().lower()
-        if actor_reduction not in ("mean", "sum"):
-            raise ValueError(
-                "actor_rollout_ref.actor.policy_loss.segment_token_reduction "
-                f"must be exactly 'mean' or 'sum' (PLAN.md P0.1); got "
-                f"{actor_reduction!r}."
-            )
-        if actor_reduction != segment_reduction:
-            raise ValueError(
-                "tree_policy.segment_token_reduction "
-                f"({segment_reduction!r}) must equal "
-                "actor_rollout_ref.actor.policy_loss.segment_token_reduction "
-                f"({actor_reduction!r}) (PLAN.md P0.1)."
-            )
-        if strict:
-            if tree_update_mode in {"treepo_original", "treerl_original"}:
-                raise ValueError(
-                    "strict VDRA main runs must not use the deprecated "
-                    "tree_update_mode aliases (PLAN.md P1.R7); rename to "
-                    "'*_style_ablation' or set strict_vdra=false."
-                )
-            if (
-                policy_agg == "vdra_node_balanced"
-                and tree_update_mode
-                in {"treepo_style_ablation", "treerl_style_ablation"}
-            ):
-                raise ValueError(
-                    "The style-ablation tree_update_modes are not main-paper "
-                    "advantage estimators (PLAN.md P1.R7)."
-                )
-            # PLAN.md P0.1: the canonical main policy_aggregation is
-            # global_segment_mean, which requires vdra_segment_mean_ppo. The
-            # legacy vdra_node_balanced_ppo must not appear in the strict main
-            # config; keep it available only when strict_vdra=false (ablation).
-            if policy_agg == "global_segment_mean" and actor_loss_mode != "vdra_segment_mean_ppo":
-                raise ValueError(
-                    "tree_policy.policy_aggregation=global_segment_mean requires "
-                    "actor_rollout_ref.actor.policy_loss.loss_mode=vdra_segment_mean_ppo "
-                    f"(PLAN.md P0.1); got {actor_loss_mode!r}."
-                )
-            if actor_loss_mode == "vdra_node_balanced_ppo" and policy_agg != "vdra_node_balanced":
-                raise ValueError(
-                    "loss_mode=vdra_node_balanced_ppo is only valid when "
-                    "tree_policy.policy_aggregation=vdra_node_balanced "
-                    "(labeled ablation, PLAN.md P0.1)."
-                )
+        # PLAN.md M5: the cross-level tree_policy <-> actor.policy_loss
+        # validation lives in config_validation.validate_policy_loss_consistency
+        # so the pre-GPU Hydra gate runs the exact same code.
+        validate_policy_loss_consistency(self.config, gear_tree_cfg=gt)
 
     def _should_postpone_sampled_update(self, sampled_edges: List[Dict[str, Any]]) -> bool:
         """PLAN.md P0.D: enforce exact optimizer-batch cardinality.

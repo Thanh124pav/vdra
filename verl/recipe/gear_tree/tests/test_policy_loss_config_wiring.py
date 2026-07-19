@@ -205,6 +205,66 @@ class TestHydraComposition:
         )
         assert pl.segment_token_reduction == "sum"
 
+    @staticmethod
+    def _compose_real(overrides=None):
+        # PLAN.md M5: REAL hydra.compose of the shipped main config,
+        # including the pkg://verl.trainer.config searchpath.
+        pytest.importorskip("hydra")
+        from pathlib import Path
+
+        from hydra import compose, initialize_config_dir
+
+        config_dir = Path(__file__).resolve().parents[1] / "config"
+        with initialize_config_dir(
+            config_dir=str(config_dir), version_base=None
+        ):
+            return compose(
+                config_name="gear_tree_trainer", overrides=overrides or []
+            )
+
+    def test_real_compose_canonical_mean(self):
+        cfg = self._compose_real()
+        actor = cfg.actor_rollout_ref.actor
+        assert actor.policy_loss.loss_mode == "vdra_segment_mean_ppo"
+        assert actor.policy_loss.segment_token_reduction == "mean"
+        assert cfg.tree_policy.segment_token_reduction == "mean"
+        assert cfg.tree_policy.policy_aggregation == "global_segment_mean"
+
+    def test_real_compose_sum_override_reaches_actor_policy_loss(self):
+        cfg = self._compose_real(
+            overrides=[
+                "tree_policy.segment_token_reduction=sum",
+                "actor_rollout_ref.actor.policy_loss.segment_token_reduction=sum",
+            ]
+        )
+        assert (
+            cfg.actor_rollout_ref.actor.policy_loss.segment_token_reduction
+            == "sum"
+        )
+        assert cfg.tree_policy.segment_token_reduction == "sum"
+
+    def test_real_compose_passes_extracted_trainer_validation(self):
+        from recipe.gear_tree.config_validation import (
+            validate_policy_loss_consistency,
+        )
+
+        assert validate_policy_loss_consistency(self._compose_real()) is None
+
+    def test_real_compose_round_trips_typed_policy_loss(self):
+        cfg = self._compose_real()
+        from omegaconf import OmegaConf
+
+        from verl.utils.config import omega_conf_to_dataclass
+
+        pl_node = OmegaConf.create(
+            OmegaConf.to_container(
+                cfg.actor_rollout_ref.actor.policy_loss, resolve=True
+            )
+        )
+        pl = omega_conf_to_dataclass(pl_node, dataclass_type=PolicyLossConfig)
+        assert pl.loss_mode == "vdra_segment_mean_ppo"
+        assert pl.segment_token_reduction == "mean"
+
 
 class TestPolicyLossFieldReads:
     """PLAN.md P0.F: ``use_prob_mask`` / ``ratio_threshold`` are declared on
@@ -335,28 +395,65 @@ class TestStartupConsistencyCheck:
         )
 
     def test_matching_values_pass(self):
-        # Direct assertion of the invariant — the trainer function needs a
-        # full Ray/verl bootstrap to instantiate, so we mirror its check here
-        # to keep the test surface small and dependency-light.
-        cfg = self._minimal_config("mean", "mean")
-        tree_r = str(
-            cfg["tree_policy"]["segment_token_reduction"]
-        ).strip().lower()
-        actor_r = str(
-            cfg["actor_rollout_ref"]["actor"]["policy_loss"][
-                "segment_token_reduction"
-            ]
-        ).strip().lower()
-        assert tree_r == actor_r == "mean"
+        # PLAN.md M5: run the REAL extracted trainer validation, not a
+        # mirrored re-implementation.
+        from recipe.gear_tree.config_validation import (
+            validate_policy_loss_consistency,
+        )
 
-    def test_mismatched_values_would_be_rejected(self):
-        cfg = self._minimal_config("mean", "sum")
-        tree_r = str(
-            cfg["tree_policy"]["segment_token_reduction"]
-        ).strip().lower()
-        actor_r = str(
-            cfg["actor_rollout_ref"]["actor"]["policy_loss"][
-                "segment_token_reduction"
-            ]
-        ).strip().lower()
-        assert tree_r != actor_r
+        assert (
+            validate_policy_loss_consistency(
+                self._minimal_config("mean", "mean")
+            )
+            is None
+        )
+        assert (
+            validate_policy_loss_consistency(
+                self._minimal_config("sum", "sum")
+            )
+            is None
+        )
+
+    def test_mismatched_values_are_rejected(self):
+        from recipe.gear_tree.config_validation import (
+            validate_policy_loss_consistency,
+        )
+
+        with pytest.raises(ValueError, match="P0.1"):
+            validate_policy_loss_consistency(
+                self._minimal_config("mean", "sum")
+            )
+
+    def test_invalid_reduction_is_rejected(self):
+        from recipe.gear_tree.config_validation import (
+            validate_policy_loss_consistency,
+        )
+
+        with pytest.raises(ValueError, match="exactly 'mean' or"):
+            validate_policy_loss_consistency(
+                self._minimal_config("median", "median")
+            )
+
+    def test_wrong_loss_mode_for_canonical_aggregation_is_rejected(self):
+        from recipe.gear_tree.config_validation import (
+            validate_policy_loss_consistency,
+        )
+
+        cfg = self._minimal_config("mean", "mean")
+        cfg.actor_rollout_ref.actor.policy_loss.loss_mode = (
+            "vdra_node_balanced_ppo"
+        )
+        with pytest.raises(ValueError, match="vdra_segment_mean_ppo"):
+            validate_policy_loss_consistency(cfg)
+
+    def test_trainer_startup_routes_through_extracted_validator(self):
+        # Source guard: the trainer must call the extracted function so the
+        # gate and the trainer can never diverge.
+        import inspect
+
+        from recipe.gear_tree import gear_ray_trainer
+
+        source = inspect.getsource(
+            gear_ray_trainer.RayGearTreeTrainer._validate_replay_startup
+        )
+        assert "validate_policy_loss_consistency(" in source

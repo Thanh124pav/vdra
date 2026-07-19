@@ -16,11 +16,23 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+REPO = Path(__file__).resolve().parents[1]
+CONFIG_DIR = REPO / "verl" / "recipe" / "gear_tree" / "config"
+# PLAN.md M5: allow standalone execution (pre_gpu_check.sh also exports
+# PYTHONPATH; this keeps `python scripts/check_hydra_composition.py` working
+# without it).
+if str(REPO / "verl") not in sys.path:
+    sys.path.insert(0, str(REPO / "verl"))
+
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
-REPO = Path(__file__).resolve().parents[1]
-CONFIG_DIR = REPO / "verl" / "recipe" / "gear_tree" / "config"
+# Same compatibility shim the recipe tests use: newer transformers releases
+# removed AutoModelForVision2Seq, which verl.utils.model imports eagerly.
+import transformers
+
+if not hasattr(transformers, "AutoModelForVision2Seq"):
+    transformers.AutoModelForVision2Seq = object
 
 
 def _fail(message: str) -> None:
@@ -105,24 +117,66 @@ def check_canonical(cfg) -> None:
     )
 
 
+# PLAN.md M5: canonical VDRA policy-loss fields. Finding one of these at the
+# actor TOP level (outside actor.policy_loss) while the dataclass schema does
+# not declare it there means a canonical field was misplaced — that is a hard
+# FAIL, never a silent drop.
+CANONICAL_POLICY_LOSS_FIELDS = {
+    "loss_mode",
+    "segment_token_reduction",
+    "use_prob_mask",
+    "ratio_threshold",
+}
+
+
 def instantiate_actor_config(cfg) -> None:
-    """PLAN.md P0.K: build the COMPLETE typed ActorConfig from the composed
+    """PLAN.md P0.K/M5: build the COMPLETE typed ActorConfig from the composed
     actor block — a Hydra-composed run must round-trip into the dataclass
-    schema, not only into PolicyLossConfig."""
+    schema, not only into PolicyLossConfig. Unknown fields are never silently
+    deleted: a misplaced canonical VDRA field FAILS the gate, and legitimate
+    upstream runtime-only fields are excluded with an explicit WARN listing.
+    """
     from verl.utils.config import omega_conf_to_dataclass
     from verl.workers.config.actor import ActorConfig, PolicyLossConfig
 
     actor_cfg = cfg.actor_rollout_ref.actor
     container = OmegaConf.to_container(actor_cfg, resolve=True)
-    # The composed block carries runtime-resolved fields the dataclass does
-    # not declare; keep only declared fields, exactly like the worker does
-    # through its config plumbing.
     target = getattr(actor_cfg, "_target_", None)
     known = set(ActorConfig.__dataclass_fields__) | set(
         __import__(
             "verl.workers.config.actor", fromlist=["FSDPActorConfig"]
         ).FSDPActorConfig.__dataclass_fields__
     )
+    dropped = sorted(
+        key for key in container if key not in known and key != "_target_"
+    )
+    misplaced = sorted(set(dropped) & CANONICAL_POLICY_LOSS_FIELDS)
+    if misplaced:
+        _fail(
+            "canonical VDRA field(s) misplaced at the actor top level "
+            f"instead of actor.policy_loss: {misplaced}"
+        )
+    if dropped:
+        # Legitimate upstream runtime-only fields the dataclass schema does
+        # not declare. Report them explicitly; never delete silently.
+        print(
+            "HYDRA_COMPOSITION=WARN: upstream runtime-only actor fields not "
+            f"in the dataclass schema (excluded from typed round-trip): {dropped}"
+        )
+    # The policy_loss block itself must round-trip exactly: any key the
+    # typed PolicyLossConfig does not declare is a misplaced canonical field.
+    policy_loss_container = dict(container.get("policy_loss") or {})
+    unknown_policy_loss = sorted(
+        key
+        for key in policy_loss_container
+        if key not in set(PolicyLossConfig.__dataclass_fields__)
+        and key != "_target_"
+    )
+    if unknown_policy_loss:
+        _fail(
+            "actor.policy_loss carries field(s) unknown to the typed "
+            f"PolicyLossConfig schema: {unknown_policy_loss}"
+        )
     cleaned = {
         key: value for key, value in container.items() if key in known
     }
@@ -161,6 +215,21 @@ def instantiate_actor_config(cfg) -> None:
     )
 
 
+def run_trainer_cross_level_validation(cfg, label: str) -> None:
+    """PLAN.md M5: run the EXACT tree_policy <-> actor.policy_loss validation
+    the trainer runs at startup (extracted to config_validation), instead of
+    re-implementing it in this gate."""
+    from recipe.gear_tree.config_validation import (
+        validate_policy_loss_consistency,
+    )
+
+    try:
+        validate_policy_loss_consistency(cfg)
+    except ValueError as exc:
+        _fail(f"trainer cross-level validation rejected {label}: {exc}")
+    print(f"trainer cross-level validation ({label}): OK")
+
+
 def main() -> None:
     cfg = compose_main()
     check_canonical(cfg)
@@ -182,6 +251,9 @@ def main() -> None:
         "sum override did not reach tree_policy",
     )
     print("composed sum override: OK")
+
+    run_trainer_cross_level_validation(cfg, "canonical mean config")
+    run_trainer_cross_level_validation(cfg_sum, "sum override config")
 
     instantiate_actor_config(cfg)
     print("HYDRA_COMPOSITION=PASS")
