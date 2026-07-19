@@ -28,7 +28,9 @@ from recipe.gear_tree.context_contract import (
 )
 from recipe.gear_tree.replay_buffer import (
     GearTreeReplayBuffer,
+    expected_optimizer_steps,
     reserve_replay_edges,
+    should_postpone_sampled_update,
 )
 from recipe.gear_tree.manifest_lifecycle import (
     build_run_manifest,
@@ -293,17 +295,29 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 )
 
     def _should_postpone_sampled_update(self, sampled_edges: List[Dict[str, Any]]) -> bool:
+        """PLAN.md P0.D: enforce exact optimizer-batch cardinality.
+
+        The sampler must never return more than
+        ``target_edges_per_iteration`` — exceeding it is a sampler bug and
+        raises. In canonical mode (``postpone_until_divisible``) any selected
+        count not divisible by ``ppo_mini_batch_size`` is postponed, whether
+        under- or over-filled, so no tail optimizer batch can ever form.
+        """
         replay_cfg = self._replay_config()
-        policy = replay_cfg.get("underfilled_update_policy", "postpone_until_divisible")
-        if policy == "use_available":
-            return False
-        if policy != "postpone_until_divisible":
-            raise ValueError(f"Unknown underfilled_update_policy: {policy!r}")
-        if not sampled_edges:
-            return False
-        ppo_mini = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
-        target = int(replay_cfg["target_edges_per_iteration"])
-        return len(sampled_edges) < target and len(sampled_edges) % ppo_mini != 0
+        return should_postpone_sampled_update(
+            selected_count=len(sampled_edges),
+            target_edges_per_iteration=int(
+                replay_cfg["target_edges_per_iteration"]
+            ),
+            ppo_mini_batch_size=int(
+                self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+            ),
+            underfilled_update_policy=str(
+                replay_cfg.get(
+                    "underfilled_update_policy", "postpone_until_divisible"
+                )
+            ),
+        )
 
     def _fetch_rollout_server_weight_version(self, gear_cfg: Dict[str, Any]) -> str | None:
         """PLAN.md P0.5: delegate to :func:`scorer_verification.fetch_rollout_weight_version`
@@ -828,6 +842,32 @@ class RayGearTreeTrainer(RayPPOTrainer):
                         sample_stats=sample_stats,
                         actual_optimizer_steps=int(n_optim_steps),
                     )
+                    # PLAN.md P0.D: with divisibility enforced before the
+                    # actor call, N_steps = N_selected/ppo_mini * ppo_epochs
+                    # exactly. A mismatch means step accounting is broken.
+                    ppo_mini = int(
+                        self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                    )
+                    ppo_epochs = int(
+                        self.config.actor_rollout_ref.actor.get("ppo_epochs", 1)
+                    )
+                    if len(sampled_edges) % ppo_mini == 0:
+                        expected_steps = expected_optimizer_steps(
+                            selected_count=len(sampled_edges),
+                            ppo_mini_batch_size=ppo_mini,
+                            ppo_epochs=ppo_epochs,
+                        )
+                        metrics["training/optimizer_steps_expected"] = float(
+                            expected_steps
+                        )
+                        if manifest_strict and int(n_optim_steps) != expected_steps:
+                            raise AssertionError(
+                                f"actor performed {int(n_optim_steps)} optimizer "
+                                f"steps but {expected_steps} were expected for "
+                                f"{len(sampled_edges)} selected edges / "
+                                f"ppo_mini_batch_size={ppo_mini}, "
+                                f"ppo_epochs={ppo_epochs} (PLAN.md P0.D)."
+                            )
                 t_update = time.time() - t0
 
                 response_tokens = edge_batch.batch["response_mask"].sum().item()

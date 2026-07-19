@@ -84,6 +84,66 @@ class ReplayReservation:
 
 VALID_REPLAY_SAMPLING_UNITS = ("edge", "complete_tree")
 
+VALID_UNDERFILLED_UPDATE_POLICIES = ("postpone_until_divisible", "use_available")
+
+
+def should_postpone_sampled_update(
+    *,
+    selected_count: int,
+    target_edges_per_iteration: int,
+    ppo_mini_batch_size: int,
+    underfilled_update_policy: str = "postpone_until_divisible",
+) -> bool:
+    """PLAN.md P0.D: exact optimizer-batch cardinality for one iteration.
+
+    * ``selected_count > target`` is a sampler bug and raises
+      ``AssertionError`` — both reservation paths cap at the target, so an
+      oversized batch must never reach the actor.
+    * Canonical ``postpone_until_divisible``: postpone whenever the count is
+      not divisible by ``ppo_mini_batch_size`` (under- OR over-filled), so no
+      tail optimizer batch can form.
+    * ``use_available``: ablation-only; runs whatever was sampled.
+    """
+    n = int(selected_count)
+    target = int(target_edges_per_iteration)
+    if n > target:
+        raise AssertionError(
+            f"replay sampler returned {n} edges, exceeding "
+            f"target_edges_per_iteration={target} (PLAN.md P0.D). This is a "
+            "sampler bug; the reservation path must cap at the target."
+        )
+    policy = str(underfilled_update_policy)
+    if policy == "use_available":
+        return False
+    if policy != "postpone_until_divisible":
+        raise ValueError(f"Unknown underfilled_update_policy: {policy!r}")
+    if n == 0:
+        return False
+    return n % int(ppo_mini_batch_size) != 0
+
+
+def expected_optimizer_steps(
+    *,
+    selected_count: int,
+    ppo_mini_batch_size: int,
+    ppo_epochs: int = 1,
+) -> int:
+    """PLAN.md P0.D: N_steps = N_selected / ppo_mini_batch_size * ppo_epochs.
+
+    Valid ONLY after divisibility has been enforced; raises otherwise so the
+    floor formula can never silently hide a tail batch.
+    """
+    n = int(selected_count)
+    mini = int(ppo_mini_batch_size)
+    if mini <= 0:
+        raise ValueError("ppo_mini_batch_size must be > 0")
+    if n % mini != 0:
+        raise ValueError(
+            f"expected_optimizer_steps requires selected_count divisible by "
+            f"ppo_mini_batch_size; got {n} % {mini} != 0 (PLAN.md P0.D)."
+        )
+    return n // mini * max(int(ppo_epochs), 1)
+
 
 def reserve_replay_edges(
     replay_buffer: "GearTreeReplayBuffer",
