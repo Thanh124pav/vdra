@@ -120,3 +120,25 @@ class TestTrainerWiring:
         assert '"training/global_step_before_update"' in source
         assert '"training/global_step_after_update"' in source
         assert '"training/global_step"' in source
+
+    def test_no_stale_host_contract_claims_in_production_docs(self):
+        root = Path(__file__).resolve().parents[1]
+        targets = [
+            root / "gear_ray_trainer.py",
+            root / "policy_loss.py",
+            root / "run_manifest.py",
+            root / "config" / "gear_tree_trainer.yaml",
+            root.parents[2] / "scripts" / "pre_gpu_check.sh",
+        ]
+        forbidden = [
+            "global_step += 4",
+            "global_step is the internal optimizer-step count",
+            "scheduler must step once per internal PPO mini-batch",
+            "total_training_steps must use optimizer-step units",
+            "segment_objective_weights are required by vdra_segment_mean_ppo",
+            "training/all_zero_batch_skipped",
+        ]
+        for target in targets:
+            source = target.read_text(encoding="utf-8")
+            for phrase in forbidden:
+                assert phrase not in source, f"{phrase!r} found in {target}"

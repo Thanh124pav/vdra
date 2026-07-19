@@ -132,9 +132,9 @@ def update_manifest_from_generated_edges(
         raise raised
     integrity_metrics.update(compute_group_metrics(generated_edges))
 
-    # PLAN.md P0.4 / P0.6: segment-average weight normalization over the
-    # complete generated batch (the partial replay sample must never run
-    # tree-normalization checks).
+    # Legacy segment-weight diagnostic over the complete generated batch.
+    # M4 removes this as a canonical manifest dependency; replay samples must
+    # never run tree-normalization checks.
     try:
         seg_weights = compute_segment_objective_weights(generated_edges)
         integrity_metrics.update(

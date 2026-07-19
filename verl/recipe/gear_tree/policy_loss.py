@@ -450,10 +450,10 @@ def compute_policy_loss_vdra_segment_mean(
         pg_loss = (w * row_losses).sum()
     else:
         raise ValueError(
-            "vdra_segment_mean_ppo requires either "
-            "original_optimizer_batch_slot_count (PLAN.md P0.4 main path) or "
-            "segment_objective_weights / (tree_group_ids, "
-            "tree_total_segment_count) for the legacy tree-average path."
+            "vdra_segment_mean_ppo expected original_optimizer_batch_slot_count "
+            "for the PLAN.md P0.4 main path. The legacy tree-average fallback "
+            "is available only when segment_objective_weights or "
+            "(tree_group_ids, tree_total_segment_count) are explicitly provided."
         )
 
     # Report ratio as a metric.

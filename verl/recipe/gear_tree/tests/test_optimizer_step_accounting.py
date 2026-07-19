@@ -1,17 +1,10 @@
-"""PLAN.md P0.3 — optimizer-step accounting tests.
+"""PLAN.md host-counter contract and optimizer-step diagnostics.
 
-The trainer must advance ``global_step`` by the actual number of
-``optimizer.step()`` calls performed during ``update_actor``, not by 1 per
-call. For 512 selected edges with ``ppo_mini_batch_size=128`` and one epoch
-this must be 4 steps per iteration.
-
-We exercise the accounting logic without a full FSDP/ Ray bootstrap:
-  * a synthetic ``update_policy`` loop that mirrors ``DataParallelPPOActor``
-    (mini_batch split + one ``optimizer.step()`` per mini_batch) confirms
-    that 512/128 → 4 steps and returns the metadata the trainer will read;
-  * a synthetic trainer loop confirms it bumps ``global_step`` by the
-    returned count and only bumps ``rollout_iteration`` by 1;
-  * failed update rolls back reservation, does not bump ``global_step``.
+The actor may perform several internal ``optimizer.step()`` calls during one
+``update_actor`` RPC, and it must report that diagnostic count. The preserved
+VERL trainer contract is different: ``global_step`` counts successful outer
+actor updates, while ``num_optimizer_steps_total`` accumulates the internal
+optimizer-batch count only for logging/analysis.
 """
 
 from __future__ import annotations
@@ -116,71 +109,89 @@ class TestOptimizerStepCount:
 
 
 class _FakeTrainer:
-    """PLAN.md P0.3: minimal counter-book-keeping mirror of RayGearTreeTrainer.
+    """Minimal expected host-counter contract for M1 implementation."""
 
-    The point of this stub is to hold ONE authoritative counter update path so
-    a wrong `update_actor` return value cannot silently double- or under-count.
-    """
-
-    def __init__(self, ppo_mini_batch_size: int = 128, ppo_epochs: int = 1):
+    def __init__(self, total_training_steps: int = 5):
         self.global_steps = 0
         self.rollout_iteration = 0
+        self.successful_actor_updates = 0
         self.optimizer_steps_this_iteration = 0
         self.num_optimizer_steps_total = 0
-        self.ppo_mini_batch_size = ppo_mini_batch_size
-        self.ppo_epochs = ppo_epochs
+        self.total_training_steps = total_training_steps
 
     def start_iteration(self):
         self.rollout_iteration += 1
         self.optimizer_steps_this_iteration = 0
 
     def apply_actor_update(self, n_optim_steps: int) -> None:
+        self.successful_actor_updates += 1
         self.optimizer_steps_this_iteration = int(n_optim_steps)
-        self.global_steps += int(n_optim_steps)
-        self.num_optimizer_steps_total = self.global_steps
+        self.global_steps += 1
+        self.num_optimizer_steps_total += int(n_optim_steps)
+
+    def should_stop(self) -> bool:
+        return self.global_steps >= self.total_training_steps
 
     def rollback_failed(self) -> None:
-        # PLAN.md P0.3: a failed update leaves counters untouched.
         self.optimizer_steps_this_iteration = 0
 
 
-class TestTrainerCounterSemantics:
-    def test_512_edges_iteration_bumps_global_step_by_four(self):
+class TestHostCounterContract:
+    def test_512_edges_iteration_bumps_outer_global_step_once(self):
         tr = _FakeTrainer()
         tr.start_iteration()
         tr.apply_actor_update(4)
         assert tr.rollout_iteration == 1
-        assert tr.global_steps == 4
+        assert tr.global_steps == 1
+        assert tr.successful_actor_updates == 1
         assert tr.optimizer_steps_this_iteration == 4
         assert tr.num_optimizer_steps_total == 4
 
-    def test_five_iterations_produce_twenty_steps(self):
-        tr = _FakeTrainer()
+    def test_five_outer_updates_keep_internal_count_separate(self):
+        tr = _FakeTrainer(total_training_steps=5)
         for _ in range(5):
+            assert not tr.should_stop()
             tr.start_iteration()
             tr.apply_actor_update(4)
         assert tr.rollout_iteration == 5
-        assert tr.global_steps == 20
+        assert tr.global_steps == 5
+        assert tr.successful_actor_updates == 5
+        assert tr.num_optimizer_steps_total == 20
+        assert tr.should_stop()
 
-    def test_failed_iteration_does_not_advance_global_step(self):
+    def test_failed_iteration_does_not_advance_outer_counters(self):
         tr = _FakeTrainer()
         tr.start_iteration()
         tr.rollback_failed()
         assert tr.rollout_iteration == 1
         assert tr.global_steps == 0
+        assert tr.successful_actor_updates == 0
+        assert tr.num_optimizer_steps_total == 0
 
-    def test_replay_age_uses_rollout_iteration(self):
-        """PLAN.md P0.2/P0.3: replay age must be measured in rollout
-        iterations. Even with 4 optimizer steps per iteration, replay age
-        advances by 1 per iteration.
-        """
+    def test_replay_age_uses_rollout_iteration_not_internal_steps(self):
         tr = _FakeTrainer()
         for _ in range(3):
             tr.start_iteration()
             tr.apply_actor_update(4)
-        # 3 rollout iterations = age 3, not 12.
         assert tr.rollout_iteration == 3
-        assert tr.global_steps == 12
+        assert tr.global_steps == 3
+        assert tr.num_optimizer_steps_total == 12
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="M1 pending: production still couples global_step to internal optimizer count",
+)
+def test_production_counter_mutation_uses_host_contract_source_guard():
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1] / "gear_ray_trainer.py"
+    ).read_text()
+    assert "self.global_steps += int(n_optim_steps)" not in source
+    assert "self.num_optimizer_steps_total = self.global_steps" not in source
+    assert "self.global_steps += 1" in source
+    assert "self.num_optimizer_steps_total += int(n_optim_steps)" in source
 
 
 class TestActorReturnsRealCount:
