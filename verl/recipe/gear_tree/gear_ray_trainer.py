@@ -911,12 +911,14 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     metrics["buffer/removed_edges"] = float(len(removed))
                     metrics["buffer/size_after"] = float(len(replay_buffer))
                     self.successful_actor_updates += 1
-                    # PLAN.md M1: this legacy coupling is repaired in the
-                    # medium counter-separation phase. The internal optimizer
-                    # count is extracted here for diagnostics.
+                    # PLAN.md M1 three-counter contract: global_step advances
+                    # by 1 per successful outer update_actor call (the host
+                    # VERL loop/checkpoint/save/eval unit). The internal PPO
+                    # optimizer-batch count accumulates separately as an
+                    # observational diagnostic only.
                     self.optimizer_steps_this_iteration = int(n_optim_steps)
-                    self.global_steps += int(n_optim_steps)
-                    self.num_optimizer_steps_total = self.global_steps
+                    self.global_steps += 1
+                    self.num_optimizer_steps_total += int(n_optim_steps)
                     # PLAN.md P0.J: manifest bit only from the actor-observed
                     # metric — never inferred from tensor presence.
                     if actor_used_stored_old_log_probs:

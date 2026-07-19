@@ -54,6 +54,25 @@ class TestStateRoundTrip:
         assert loaded.rollout_iteration == 100
         assert loaded.num_optimizer_steps_total == 400
 
+    def test_m1_counter_units_survive_resume(self, tmp_path):
+        """PLAN.md M1 completion table: five successful outer updates that
+        each report four internal PPO optimizer batches persist and restore
+        as global_step=5 / num_optimizer_steps_total=20 — the units must not
+        change across a save/load boundary.
+        """
+        state = GearTreeTrainerState(
+            global_step=5,
+            rollout_iteration=5,
+            num_optimizer_steps_total=20,
+            successful_actor_updates=5,
+        )
+        save_trainer_state(tmp_path, state)
+        loaded = load_trainer_state(tmp_path)
+        assert loaded.global_step == 5
+        assert loaded.rollout_iteration == 5
+        assert loaded.num_optimizer_steps_total == 20
+        assert loaded.successful_actor_updates == 5
+
     def test_state_file_name_and_location(self, tmp_path):
         save_trainer_state(tmp_path, GearTreeTrainerState(global_step=8))
         assert (tmp_path / TRAINER_STATE_FILENAME).exists()

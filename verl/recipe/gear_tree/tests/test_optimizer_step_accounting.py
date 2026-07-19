@@ -178,10 +178,6 @@ class TestHostCounterContract:
         assert tr.num_optimizer_steps_total == 12
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="M1 pending: production still couples global_step to internal optimizer count",
-)
 def test_production_counter_mutation_uses_host_contract_source_guard():
     from pathlib import Path
 
@@ -192,6 +188,21 @@ def test_production_counter_mutation_uses_host_contract_source_guard():
     assert "self.num_optimizer_steps_total = self.global_steps" not in source
     assert "self.global_steps += 1" in source
     assert "self.num_optimizer_steps_total += int(n_optim_steps)" in source
+
+
+def test_scheduler_cadence_stays_one_step_per_update_actor_source_guard():
+    """PLAN.md M1: the host scheduler cadence is one lr_scheduler.step() per
+    successful ``update_actor`` RPC, owned by the worker — never one per
+    internal PPO optimizer batch inside ``update_policy``.
+    """
+    from pathlib import Path
+
+    repo_verl = Path(__file__).resolve().parents[3] / "verl"
+    fsdp_workers = (repo_verl / "workers" / "fsdp_workers.py").read_text()
+    dp_actor = (repo_verl / "workers" / "actor" / "dp_actor.py").read_text()
+
+    assert fsdp_workers.count("self.actor_lr_scheduler.step()") == 1
+    assert "lr_scheduler.step" not in dp_actor
 
 
 class TestActorReturnsRealCount:

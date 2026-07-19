@@ -583,17 +583,18 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
-                # PLAN.md P0.3: each successful call to _optimizer_step is one
-                # true optimizer.step() call. The trainer must advance
-                # global_step by the returned count, not by 1 per update_actor.
+                # PLAN.md M1: each call to _optimizer_step is one internal PPO
+                # optimizer-batch update. The trainer accumulates the returned
+                # count into the diagnostic num_optimizer_steps_total;
+                # global_step still advances by 1 per successful update_actor.
                 num_optimizer_steps += 1
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
-        # PLAN.md P0.3: expose the true optimizer-step count for this update so
-        # the trainer can advance global_step and optimizer_steps_this_iteration
-        # by the correct amount. Stored under the standard verl `metrics` key
-        # so it is emitted through `reduce_metrics` unchanged.
+        # PLAN.md M1: expose the true optimizer-step count for this update so
+        # the trainer can log the diagnostic num_optimizer_steps_total and
+        # optimizer_steps_this_iteration. Stored under the standard verl
+        # `metrics` key so it is emitted through `reduce_metrics` unchanged.
         metrics.setdefault("actor/num_optimizer_steps", []).append(int(num_optimizer_steps))
         # PLAN.md P0.J: OBSERVED fact for the manifest — 1.0 only when the
         # stored generation-time old_log_probs were actually kept as the PPO
