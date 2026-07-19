@@ -1,4 +1,4 @@
-# PLAN.md — Remaining Work Before GPU Smoke
+# PLAN.md — Conflict-Safe Work Before GPU Smoke
 
 ## Purpose
 
@@ -8,11 +8,20 @@ This is the current source of truth for branch:
 claude/plan-tasks-execution-iih9zc
 ```
 
-The branch has implemented most historical P0.A–P0.K items, but the latest production audit found several cross-cutting regressions that are not covered by the old task-completion claims.
+The previous plan incorrectly required the repository to redefine VERL's
+`global_step` as the number of internal `optimizer.step()` calls. That change
+created unit conflicts with `total_training_steps`, the LR scheduler,
+checkpoint naming, and save/eval intervals.
 
-Do not treat a commit name, passing helper test, or source-string guard as proof of completion. A task is complete only when the production path and its failure path satisfy the contract below.
+This plan corrects that decision. The default rule from now on is:
 
-Implementation work is split by difficulty:
+```text
+PRESERVE HOST-FRAMEWORK SEMANTICS.
+MAKE THE SMALLEST COMPATIBLE CHANGE.
+DO NOT REDESIGN A CROSS-CUTTING CONTRACT WITHOUT USER APPROVAL.
+```
+
+Implementation work remains split into:
 
 ```text
 CLAUDE_FIX_EASY.md
@@ -20,24 +29,116 @@ CLAUDE_FIX_MEDIUM.md
 CLAUDE_FIX_HARD.md
 ```
 
-Complete them in that order unless a dependency explicitly requires otherwise.
+---
+
+# 0. Mandatory conflict-review rule
+
+Before changing production code, write a short impact map containing:
+
+```text
+1. exact symbol / behavior being changed
+2. its current meaning in VERL
+3. every known consumer
+4. intended new meaning, if any
+5. compatibility risks
+6. tests proving no existing contract was broken
+```
+
+## Stop and discuss with the user before implementation if a change may affect
+
+```text
+global_step or total_training_steps
+LR scheduler ownership or cadence
+checkpoint directory naming or resume units
+save/eval frequency semantics
+policy objective or sample weights
+replay sampling unit, replay age, or row-consumption policy
+optimizer-step ownership
+zero-signal batch consumption
+FSDP/DDP/world-size scaling
+public Hydra/dataclass configuration schema
+```
+
+Claude must not silently choose a new architecture in these areas.
+
+If a requested local fix exposes a cross-cutting conflict:
+
+```text
+STOP
+summarize the conflict
+show at least two compatible options
+state which files and semantics each option changes
+wait for user approval
+```
+
+Passing tests does not waive this rule when the change alters a framework
+contract.
 
 ---
 
-# 1. Canonical behavior
+# 1. Canonical behavior to preserve
 
-## 1.1 Rollout and replay
+## 1.1 Host-framework counters and schedules
+
+The canonical counter contract is:
 
 ```text
-ONE ROLLOUT ITERATION
+rollout_iteration
+    One generation / replay-fill cycle.
+    Used for replay age and rollout diagnostics.
 
+global_step
+    One successful outer actor update in the VERL trainer.
+    Preserves the host framework's training-loop, checkpoint, logging,
+    save/eval, and scheduler unit.
+
+total_training_steps
+    Number of outer VERL training updates planned for the run.
+    It remains compatible with len(train_dataloader) * total_epochs.
+
+num_optimizer_steps_total
+    Observational metric for internal PPO optimizer-batch updates.
+    It must NOT control the outer loop, scheduler, checkpoint naming,
+    save/eval frequency, or policy snapshot numbering.
+```
+
+The existing VERL scheduler remains:
+
+```text
+one scheduler.step() per successful update_actor call
+```
+
+Do not move the scheduler into the internal PPO mini-batch loop unless the user
+explicitly approves a scheduler redesign after an impact review.
+
+For 512 selected replay edges, PPO mini-batch 128, and one PPO epoch:
+
+```text
+rollout_iteration         += 1
+global_step               += 1
+scheduler steps           += 1
+num_optimizer_steps_total += 4   # diagnostic internal count
+```
+
+If TreeTune-style optimizer-update curves are needed, log a separate axis such
+as:
+
+```text
+training/num_optimizer_steps_total
+```
+
+Do not rename or repurpose VERL's `global_step` to obtain that plot.
+
+## 1.2 Rollout and replay
+
+```text
 Generate complete stochastic trees
     ↓
 Validate full-tree construction invariants
     ↓
 Convert every realized non-placeholder segment into one replay edge
     ↓
-Stamp generation_rollout_iteration and unique tree/edge identity
+Stamp generation_rollout_iteration and unique identities
     ↓
 Insert edges transactionally
     ↓
@@ -49,7 +150,9 @@ Select at most 512 total edges
     ↓
 Validate sampled replay rows
     ↓
-Train optimizer batches of 128 selected edges
+Tensorize
+    ↓
+Run one outer actor update
 ```
 
 Canonical defaults:
@@ -75,28 +178,21 @@ tree_policy:
   segment_token_reduction: mean
 ```
 
-## 1.2 Canonical policy objective
+Complete-tree replay remains an explicitly labeled ablation only.
 
-For one global optimizer batch `B`:
+## 1.3 Canonical policy objective
 
-```text
-N_B = number of selected replay slots in that optimizer batch
-```
-
-Normally `N_B=128`.
-
-For each selected segment `s`, the loss first reduces over active tokens using either token mean or token sum. The outer objective is:
+For each internal PPO optimizer batch `B`:
 
 \[
 L_B^{(r)}
 =
 \frac{1}{N_B}
 \sum_{s\in B}L_s^{(r)},
-\qquad
-r\in\{\mathrm{mean},\mathrm{sum}\}.
+\qquad r\in\{\mathrm{mean},\mathrm{sum}\}.
 \]
 
-Every selected replay slot has equal outer weight.
+Normally `N_B=128`. Every selected replay slot has equal outer weight.
 
 The following must not affect canonical policy weight:
 
@@ -107,295 +203,266 @@ allocated_k
 queue_flush_id
 branch factor
 replay age
-segment_objective_weights
 objective_weights
+segment_objective_weights
 ```
 
-Tree and queue counts remain construction/theory diagnostics only.
+Tree and queue counts remain construction/theory diagnostics.
 
-## 1.3 Counter units
+---
+
+# 2. Correction of the previous regression analysis
+
+The previous plan listed R1-R6 as newly discovered P0 regressions. Their correct
+status is:
+
+## R1 — Training duration wrong unit
 
 ```text
-rollout_iteration
-    One generation/replay-fill cycle.
-    Used for replay age and rollout-frequency reporting.
-
-global_step
-    One successful actual optimizer.step().
-    Used for LR scheduling, optimizer-step checkpoints, and step-based logs.
-
-optimizer_steps_this_iteration
-    Successful optimizer steps during the current rollout iteration.
+CAUSE: previous instruction changed global_step from outer update count
+       to internal optimizer-step count.
 ```
 
-For a fully trainable 512-edge reservation with mini-batch 128 and one PPO epoch:
+This is a regression caused by that instruction, not a defect in VERL's
+`total_training_steps` derivation.
+
+Correct fix:
 
 ```text
-rollout_iteration += 1
-global_step += 4
-scheduler steps += 4
+restore global_step += 1 per successful outer actor update
+keep total_training_steps in outer-update units
+keep num_optimizer_steps_total separate and observational
 ```
 
-The phrase “successful optimizer step” excludes:
+## R2 — Four optimizer updates but one scheduler step
+
+This is **not a bug under the preserved VERL contract**.
 
 ```text
-non-finite gradient attempts that skip optimizer.step()
-zero-signal optimizer batches that are intentionally skipped
-failed actor calls
+one update_actor call = one outer policy update = one scheduler step
+```
+
+Do not change scheduler cadence without user approval.
+
+## R3 — Non-finite attempts counted in internal optimizer metric
+
+The optimizer's finite-gradient safety behavior is valid. The ambiguity is in
+the newly added metric name/interpretation.
+
+For now:
+
+```text
+internal optimizer count is diagnostic only
+it does not drive global_step or schedules
+```
+
+Renaming it to attempts versus successful updates, or changing `_optimizer_step`
+to return `did_step`, requires a separate discussion because it can affect
+metrics and tests but is not a training-loop blocker.
+
+## R4 — Reserved-update failure handling
+
+This contains one real production issue independent of the counter redesign:
+
+```text
+validation or tensorization failure after reservation must rollback rows
+```
+
+Pre-actor rollback must be fixed.
+
+An actor-result metric mismatch after the model may already have changed is not
+a normal replay transaction. Do not invent rollback/commit semantics for that
+case without discussing it with the user.
+
+## R5 — All-zero shortcut bypasses validation
+
+This regression was introduced by an optional shortcut. Submission-first
+resolution:
+
+```text
+disable/remove the canonical whole-reservation all-zero shortcut
+retain dense actor behavior
+```
+
+No zero shortcut may run before validation.
+
+## R6 — Zero-signal internal optimizer batch still steps
+
+This is not a canonical correctness bug. Per-mini-batch zero skipping changes:
+
+```text
+AdamW weight decay behavior
+entropy/KL behavior
+optimizer-update counts
+scheduler semantics
+replay row-consumption policy
+```
+
+It is an optional redesign and must not be implemented without user approval.
+
+---
+
+# 3. Current status
+
+## 3.1 Preserve these completed fixes
+
+| Area | Status | Rule |
+|---|---|---|
+| Edge-level replay dispatch | DONE | Keep canonical `replay_sampling_unit=edge`. |
+| Auto per-question cap | DONE | Keep `666→33`, `888→73`. |
+| Hard target cap | DONE | Never forward more than 512 rows. |
+| Mean/sum policy-loss wiring | DONE | Keep `actor.policy_loss.*` as source. |
+| Canonical DataProto float weights | DONE | Main path carries neither objective-weight tensor. |
+| Stored old log-probs | DONE | Actor must use generation-time denominator. |
+| `rollout_iteration` checkpoint state | DONE | Keep for replay age. |
+| DDP two-process parity evidence | USEFUL | Keep as evidence; do not infer FSDP proof. |
+
+## 3.2 Remaining production work
+
+| ID | Status | Work |
+|---|---|---|
+| E1 | REQUIRED | Disable/remove canonical all-zero shortcut. |
+| E2 | REQUIRED | Validate replay rows before tensorization; missing advantage must fail. |
+| E3 | REQUIRED | Correct stale comments/specs. |
+| M1 | REQUIRED | Restore VERL `global_step += 1` and separate optimizer metric. |
+| M2 | REQUIRED | Guarantee rollback for all pre-actor failures. |
+| M3 | REQUIRED | Enforce strict tree/edge identities without legacy fallback in strict mode. |
+| M4 | REQUIRED | Decouple canonical manifest from obsolete weight normalization. |
+| M5 | REQUIRED | Validate real Hydra/dataclass path without silently sanitizing canonical fields. |
+| H1 | VERIFY | Run actual FSDP/FSDP2-oriented smoke/parity evidence. Test first. |
+
+The following are not approved implementation tasks:
+
+```text
+changing scheduler to step per internal optimizer batch
+redefining global_step as optimizer-step count
+changing total_training_steps to optimizer-step units
+skipping individual zero-signal optimizer batches
+adding world-size scaling based only on toy DDP inference
+```
+
+They belong in `CLAUDE_FIX_HARD.md` as discussion-gated proposals.
+
+---
+
+# 4. Work split by difficulty
+
+## Easy
+
+Source: `CLAUDE_FIX_EASY.md`
+
+```text
+E1 remove/disable all-zero shortcut from canonical main
+E2 validate rows before tensorization and reject missing advantage
+E3 remove stale comments and wrong step/weight claims
+E4 add regression tests for the unchanged host contract
+```
+
+## Medium
+
+Source: `CLAUDE_FIX_MEDIUM.md`
+
+```text
+M1 restore and verify three-counter separation
+M2 pre-actor replay transaction / rollback
+M3 strict tree_instance_id and derived edge_id
+M4 manifest invariant cleanup
+M5 real Hydra/dataclass validation
+```
+
+## Hard / discussion-gated
+
+Source: `CLAUDE_FIX_HARD.md`
+
+```text
+H1 FSDP/FSDP2 verification: test first, report before changing production
+H2 scheduler-per-internal-step redesign: not approved
+H3 per-mini-batch zero skip: not approved
+H4 global-step / total-step unit redesign: prohibited without approval
+H5 distributed scaling modifications: test and discuss before patching
 ```
 
 ---
 
-# 2. Current audit status
-
-## 2.1 Implemented correctly enough to preserve
-
-| Area | Status | Notes |
-|---|---|---|
-| Canonical edge-level replay dispatch | DONE | Strictness no longer chooses complete-tree replay. |
-| Auto per-question cap | DONE on edge path | `666→33`, `888→73`; hard target cap is active. |
-| Complete-tree replay | ABLATION ONLY | No longer canonical. |
-| Mean/sum schema and resolver | DONE | Reads `actor.policy_loss.*`. |
-| Canonical DataProto weight tensors | DONE | Main path omits float objective-weight tensors. |
-| Default 512/128/1 configuration | DONE | Config and actor control-flow tests exist. |
-| Checkpointed `rollout_iteration` | DONE | Legacy checkpoint replay reset is documented. |
-| Crossed save/eval thresholds | DONE for reported global-step jumps | Must be re-audited after hard step refactor. |
-| Actor-observed stored old log-probs | DONE | Manifest bit is no longer inferred from tensor presence alone. |
-| Two-process DDP parity | DONE as DDP evidence | Not sufficient proof for FSDP/FSDP2 production. |
-
-## 2.2 Claimed complete but still incomplete
-
-| Area | Real status | Remaining issue |
-|---|---|---|
-| P0.B validation split | PARTIAL | Replay validation still occurs after tensorization; pre-actor exceptions may not rollback. |
-| P0.C obsolete weights | PARTIAL | DataProto is clean, but canonical manifest still validates tree-normalized segment weights. |
-| P0.D optimizer-step accounting | PARTIAL | Worker counts may disagree; mismatch is checked after replay/counters mutate. |
-| P0.G zero-adv handling | BLOCKED | Missing advantage can be treated as zero; whole-reservation shortcut can bypass validation; zero mini-batches are not skipped individually. |
-| P0.H strict IDs | PARTIAL | Strict path can still accept generic `tree_id`; caller-supplied `edge_id` may bypass derivation; some collisions remain undetected. |
-| P0.I distributed scaling | PARTIAL | Toy DDP parity exists, but actual FSDP/FSDP2 production path is unverified. |
-| P0.J observed manifest | PARTIAL | Accounting validity can heal after a later success; canonical segment invariant still depends on obsolete weight validation. |
-| P0.K pre-GPU gate | PARTIAL | Gate does not detect the current total-step/scheduler/transaction regressions. |
-
-## 2.3 Newly discovered P0 regressions
-
-### R1 — Training duration uses the wrong unit
-
-Base VERL derives `total_training_steps` from dataloader/rollout iterations, while the VDRA loop compares it with optimizer-step `global_step`.
-
-With four optimizer steps per rollout iteration:
-
-```text
-planned rollout iterations = N
-global_step budget used by loop = N
-actual rollouts before stop ≈ N/4
-```
-
-Unless an explicit optimizer-step budget is supplied, training can terminate about four times early.
-
-### R2 — LR scheduler advances once per actor call, not per optimizer step
-
-A single `update_policy()` may execute four `optimizer.step()` calls, but the worker advances the scheduler once afterward.
-
-Current mismatch:
-
-```text
-4 optimizer steps
-1 scheduler step
-```
-
-### R3 — Non-finite optimizer attempts are counted as successful steps
-
-`_optimizer_step()` can skip `optimizer.step()` when gradient norm is non-finite, but the actor still increments `num_optimizer_steps` after the call.
-
-### R4 — Reserved-update failure handling is not fully transactional
-
-Failures in replay validation or tensorization can occur after reservation without guaranteed rollback. Actor-result mismatch is checked after model/replay/counter mutation.
-
-### R5 — All-zero shortcut can bypass replay validation
-
-A missing `advantage` can be interpreted as zero, and the all-zero reservation path can commit rows before replay validation.
-
-### R6 — Zero-signal optimizer batches inside a mixed reservation still step
-
-A 512-edge reservation can contain one zero-signal 128-edge optimizer batch and three trainable batches. The current whole-reservation shortcut cannot skip only the zero batch.
-
----
-
-# 3. Work split by difficulty
-
-## 3.1 Easy tasks
-
-Source of truth:
-
-```text
-CLAUDE_FIX_EASY.md
-```
-
-| ID | Task | Why it is easy |
-|---|---|---|
-| E1 | Move replay validation before zero shortcut and tensorization | Local control-flow reorder. |
-| E2 | Missing/`None` advantage must raise | Small predicate fix. |
-| E3 | Require identical worker optimizer-step reports | Local actor-result validation. |
-| E4 | Verify actual/expected steps before replay/counter commit | Small state-mutation reorder. |
-| E5 | Add monotonic optimizer-accounting failure counter | Local manifest schema/lifecycle change. |
-| E6 | Remove stale comments and canonical weight claims | Documentation/source guards only. |
-
-Easy tasks must not redesign scheduler ownership, optimizer loop structure, or FSDP behavior.
-
-## 3.2 Medium tasks
-
-Source of truth:
-
-```text
-CLAUDE_FIX_MEDIUM.md
-```
-
-| ID | Task | Scope |
-|---|---|---|
-| M1 | Create explicit reserved-update transaction/state machine | Cross-function replay/actor/manifest lifecycle. |
-| M2 | Enforce strict `tree_instance_id` and derived `edge_id` | Tree builder, extraction, normalization, manifest. |
-| M3 | Decouple canonical manifest from objective-weight validation | Manifest and construction invariants. |
-| M4 | Make real Hydra/dataclass validation reject misplaced fields | Runtime config conversion and pre-GPU gate. |
-
-Medium tasks require production-path failure-injection tests. Source-string tests alone are insufficient.
-
-## 3.3 Hard tasks
-
-Source of truth:
-
-```text
-CLAUDE_FIX_HARD.md
-```
-
-| ID | Task | Scope |
-|---|---|---|
-| H1 | Unify total-step unit, successful optimizer steps, scheduler and global step | Base trainer, actor, FSDP worker, checkpoint, manifest. |
-| H2 | Skip zero signal at each 128-edge optimizer batch | Actor optimizer loop and runtime expected-step accounting. |
-| H3 | Verify actual FSDP/FSDP2 production gradient semantics | Distributed integration/GPU smoke. |
-| H4 | Re-audit checkpoint/save/eval semantics after H1/H2 | Scheduler/counter resume and interval thresholds. |
-
-Do not implement H1 as independent one-line patches. `total_training_steps`, scheduler stepping, `did_step`, global counters, and resume semantics must change together.
-
----
-
-# 4. Required execution order
+# 5. Required execution order
 
 ```text
 Stage 1 — EASY
-E1 → E2 → E3 → E4 → E5 → E6
+E1 → E2 → E3 → E4
 
 Stage 2 — MEDIUM
-M1 → M2 → M3 → M4
+M1 → M2 → M3 → M4 → M5
 
-Stage 3 — HARD
-H1 → H2 → H4 → H3
-
-Stage 4 — INTEGRATION
+Stage 3 — INTEGRATION
 full CPU gate
-short GPU smoke
-manifest review
-long experiment only after all pass
-```
+short GPU smoke using preserved VERL semantics
+manifest and metric review
 
-Dependency notes:
+Stage 4 — HARD VERIFICATION
+H1 only
 
-- M1 relies on E1–E4 to define correct validation and commit order.
-- H1 relies on E3/E5 and M1 so step reports and failure state are trustworthy.
-- H2 must be implemented after or together with H1 because zero-batch skips change the number of successful optimizer and scheduler steps.
-- H4 follows H1/H2 because checkpoint thresholds depend on the final step semantics.
-- H3 is last because distributed parity must test the final optimizer/scheduler loop.
-
----
-
-# 5. Production transaction contract
-
-The final reserved-update flow must be:
-
-```text
-reserve replay rows
-    ↓
-validate sampled replay rows
-    ↓
-classify zero/trainable optimizer batches
-    ↓
-tensorize
-    ↓
-actor forward/backward/optimizer loop
-    ↓
-collect all worker reports
-    ↓
-verify rank agreement and runtime step accounting
-    ↓
-commit replay rows
-    ↓
-update driver counters and manifest
-```
-
-Failure semantics:
-
-```text
-before actor starts:
-    rollback replay
-    no counter mutation
-    no success manifest facts
-
-during actor RPC:
-    rollback replay
-    record failed update
-    re-raise
-
-after model may have changed but actor result is invalid:
-    do not claim rollback of model
-    do not commit replay/counters as successful
-    mark run irrecoverably invalid
-    abort strict training
+Any other hard change requires a user discussion first.
 ```
 
 ---
 
-# 6. Definition of done
+# 6. Conflict-safe completion rule
 
-The branch is ready for a GPU smoke only when:
-
-```text
-[ ] Every EASY task passes its production regression tests
-[ ] Every MEDIUM task passes failure-injection tests
-[ ] total_training_steps uses optimizer-step units or is explicitly separated from total_rollout_iterations
-[ ] scheduler steps exactly once per successful optimizer.step()
-[ ] non-finite attempts do not increment scheduler/global step
-[ ] zero-signal 128-edge optimizer batches are skipped individually
-[ ] replay validation always precedes zero shortcuts and tensorization
-[ ] all pre-actor failures rollback reservations
-[ ] all worker optimizer-step reports must agree
-[ ] actor-result mismatch is detected before replay/counter commit
-[ ] canonical manifest never depends on objective-weight normalization
-[ ] strict main requires tree_instance_id and derived edge_id
-[ ] accounting failures are monotonic and non-healing
-[ ] DDP evidence remains green
-[ ] FSDP/FSDP2 production parity or an equivalent GPU smoke is recorded
-[ ] scripts/pre_gpu_check.sh prints PRE_GPU_CHECK=PASS
-```
-
-Then run at least five rollout iterations and report:
+A task is complete only when:
 
 ```text
-rollout iterations completed
-optimizer batches planned
-zero-signal optimizer batches skipped
-optimizer-step attempts
-successful optimizer steps
-non-finite steps skipped
-scheduler steps
-global step
+production success path passes
+production failure path passes
+existing host-framework semantics remain unchanged unless approved
+no counter, scheduler, checkpoint, replay, objective, or distributed contract
+was silently redefined
 ```
 
-For a fully trainable 512/128/1 run, the expected relation is:
+For every completed task, report:
 
 ```text
-5 rollout iterations
-20 successful optimizer steps
-20 scheduler steps
-global_step = 20
+files changed
+behavior changed
+behavior intentionally preserved
+consumers audited
+regression tests run
+known unresolved risks
 ```
 
-Do not launch long paper experiments until these counts are consistent after both a fresh run and checkpoint resume.
+If a test can only be made to pass by changing an unrelated contract, stop and
+discuss the conflict instead of broadening the patch.
+
+---
+
+# 7. Definition of done before GPU smoke
+
+```text
+[ ] global_step increases by one per successful outer actor update
+[ ] total_training_steps remains in the same outer-update unit
+[ ] scheduler remains one step per successful update_actor call
+[ ] num_optimizer_steps_total is separate and observational
+[ ] rollout_iteration is restored and used for replay age
+[ ] canonical all-zero shortcut is disabled or removed
+[ ] replay rows are validated before tensorization
+[ ] validation/tensorization/actor-RPC failures rollback reservations
+[ ] canonical manifest does not depend on objective-weight normalization
+[ ] strict main requires canonical tree/edge identities
+[ ] edge-level replay/caps remain correct
+[ ] stored old log-probs remain in use
+[ ] CPU gate passes
+```
+
+Then run a short GPU smoke and report separately:
+
+```text
+rollout_iteration
+global_step
+successful_actor_updates
+num_optimizer_steps_total
+scheduler step / LR observations
+selected replay edges
+replay ages
+manifest verdict
+```
+
+Do not start a long paper experiment if those counters use inconsistent units.
