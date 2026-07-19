@@ -480,6 +480,128 @@ def validate_group_integrity(
     }
 
 
+def normalize_generated_edges(
+    edges: Sequence[Dict[str, Any]],
+    *,
+    snapshot_id: str,
+    strict: bool = False,
+) -> List[Dict[str, Any]]:
+    """PLAN.md P0.H: normalize freshly generated edges and assign edge IDs.
+
+    Strict mode requires the unique tree identity stamped by
+    ``make_tree_instance_id`` (snapshot + rollout iteration + question +
+    per-tree uuid/counter) plus explicit parent/child identities, and
+    derives ``edge_id`` from exactly (tree identity | parent group | child
+    segment). Legacy fallback chains (generic ``gear_segment_id`` /
+    ``child_index``) survive only in non-strict mode for old fixtures.
+    """
+    normalized: List[Dict[str, Any]] = []
+    for idx, edge in enumerate(edges):
+        record = dict(edge)
+        tree_id = record.get("tree_instance_id") or record.get("tree_id")
+        parent_group = record.get("parent_group_id")
+        child_seg = record.get("child_segment_id")
+        if strict:
+            missing = [
+                name
+                for name, value in (
+                    ("tree_instance_id/tree_id", tree_id),
+                    ("parent_group_id", parent_group),
+                    ("child_segment_id", child_seg),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    "Strict VDRA edge identity is incomplete; missing "
+                    f"{missing} on generated edge {idx} (PLAN.md P0.H). "
+                    "Generation must stamp make_tree_instance_id-derived "
+                    "tree identities and explicit parent/child segment ids."
+                )
+            key = f"{tree_id}|{parent_group}|{child_seg}"
+        else:
+            tree_id = tree_id or record.get("gear_segment_id", "")
+            parent_group = (
+                parent_group
+                or record.get("parent_path")
+                or record.get("gear_parent_segment_id", "")
+            )
+            child_seg = (
+                child_seg
+                or record.get("gear_segment_id")
+                or str(record.get("child_index", idx))
+            )
+            qid = record.get("question_id", "")
+            key = f"{snapshot_id}|{qid}|{tree_id}|{parent_group}|{child_seg}"
+        digest = hashlib.blake2b(key.encode("utf-8"), digest_size=16).hexdigest()
+        record.setdefault("edge_id", f"{snapshot_id}:{digest}")
+        record.setdefault("policy_snapshot_id", snapshot_id)
+        if record["policy_snapshot_id"] != snapshot_id:
+            raise ValueError(
+                "Generated edge policy_snapshot_id mismatches rollout snapshot"
+            )
+        response = list(record.get("response_token_ids") or [])
+        log_probs = record.get("actor_shifted_log_probs")
+        if log_probs is None:
+            raise ValueError(
+                "Generated edge is missing generation-time actor_shifted_log_probs"
+            )
+        if len(log_probs) != len(response):
+            raise ValueError(
+                "Generated edge log-probs do not align with response tokens"
+            )
+        record.setdefault("depth", int(record.get("depth", 0) or 0))
+        record.setdefault("leaf", bool(record.get("leaf", False)))
+        record.setdefault("pruned", bool(record.get("pruned", False)))
+        record.setdefault("tree_update_mode", record.get("tree_update_mode", "spo"))
+        normalized.append(record)
+    return normalized
+
+
+def verify_tree_instance_id_uniqueness(
+    edges: Sequence[Dict[str, Any]],
+) -> Tuple[bool, List[str]]:
+    """PLAN.md P0.H: real tree-identity verification for a generated batch.
+
+    Stronger than ``bool(set(tree_ids))``:
+
+    * a collision between two stochastic trees merged under one ``tree_id``
+      shows up as duplicate ``(tree_id, child_segment_id)`` pairs;
+    * a ``tree_id`` equal to the ambiguous ``snapshot:question`` fallback of
+      its own edge is a forbidden identity in main runs.
+
+    Returns ``(ok, failure_details)``.
+    """
+    from collections import Counter
+
+    details: List[str] = []
+    pair_counts = Counter(
+        (str(e.get("tree_id", "")), str(e.get("child_segment_id", "")))
+        for e in edges
+    )
+    for (tid, child_seg), count in sorted(pair_counts.items()):
+        # Legacy fixtures without child_segment_id cannot express a
+        # collision; edge_id uniqueness (construction validation) covers
+        # duplicates for them.
+        if count > 1 and tid and child_seg:
+            details.append(
+                f"tree_id {tid!r} carries child_segment_id {child_seg!r} "
+                f"{count} times — two stochastic trees collided under one id"
+            )
+    for e in edges:
+        tid = str(e.get("tree_id", ""))
+        fallback = (
+            f"{e.get('policy_snapshot_id', '')}:{e.get('question_id', '')}"
+        )
+        if tid and tid == fallback:
+            details.append(
+                f"tree_id {tid!r} equals the ambiguous snapshot:question "
+                "fallback — not a unique tree identity"
+            )
+            break
+    return (not details), details
+
+
 def _queue_segment_identity_failures(
     edges: Sequence[Dict[str, Any]],
 ) -> Tuple[int, List[str]]:

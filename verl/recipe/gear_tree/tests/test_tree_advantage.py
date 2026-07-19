@@ -111,6 +111,8 @@ def _tree_with_alloc(k: int, mark_multiplicity: int = 1):
         "reward_std": 0.25,
         "full_text": "Q",
         "_request_object": {"_treetune__idx": 42, "problem": "1+1"},
+        # PLAN.md P0.H: strict extraction requires a unique tree identity.
+        "tree_instance_id": f"snap|iter:0|q:42|t:alloc-{k}-{mark_multiplicity}",
         "vdra_allocated_k": k,
         "children": [
             {

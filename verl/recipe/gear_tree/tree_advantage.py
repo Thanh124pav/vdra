@@ -77,9 +77,10 @@ def extract_edges_from_tree(
         or data_instance.get("policy_snapshot_id")
         or data_instance.get("current_rollout_snapshot_id")
     )
-    # PLAN.md P0.2: every stochastic tree has one globally-unique
-    # tree_instance_id stamped by the tree builder. Prefer it; fall back to
-    # legacy tree_id fields only to keep old fixtures working. The
+    # PLAN.md P0.2/P0.H: every stochastic tree has one globally-unique
+    # tree_instance_id stamped by the tree builder (make_tree_instance_id:
+    # snapshot + rollout iteration + question + per-tree uuid/counter).
+    # Prefer it; legacy tree_id fields keep old fixtures working. The
     # (snapshot, question) tuple must NEVER be used as a tree id in main runs
     # — two rollouts for the same prompt in the same iteration would collide.
     tree_id = (
@@ -87,8 +88,17 @@ def extract_edges_from_tree(
         or tree_copy.get("tree_id")
         or data_instance.get("tree_instance_id")
         or data_instance.get("tree_id")
-        or f"{policy_snapshot_id}:{question_id}"
     )
+    if tree_id is None:
+        if strict_fresh_iid:
+            # PLAN.md P0.H: strict main generation must never silently derive
+            # a tree identity from (snapshot, question) alone.
+            raise ValueError(
+                "Strict VDRA requires a unique tree_instance_id stamped by "
+                "the tree builder (make_tree_instance_id); refusing the "
+                "ambiguous snapshot:question fallback (PLAN.md P0.H)."
+            )
+        tree_id = f"{policy_snapshot_id}:{question_id}"
 
     # PLAN.md P0.N1: aggregate tree-level counts as we walk the tree so the
     # trainer can assert group integrity without a second pass.

@@ -497,49 +497,19 @@ class RayGearTreeTrainer(RayPPOTrainer):
     def _normalize_generated_edges(
         self, edges: List[Dict[str, Any]], *, snapshot_id: str
     ) -> List[Dict[str, Any]]:
-        import hashlib
+        """PLAN.md P0.H: delegate to the production normalizer. Strict main
+        runs require make_tree_instance_id-derived identities and refuse the
+        legacy fallback chains."""
+        from recipe.gear_tree.tree_data import normalize_generated_edges
 
-        normalized: List[Dict[str, Any]] = []
-        for idx, edge in enumerate(edges):
-            record = dict(edge)
-            # PLAN.md P0.2: derive the edge_id from the unique tree_instance_id
-            # + parent_group_id + child_segment_id so two rollouts for the
-            # same (question, snapshot) tuple never produce the same edge_id.
-            # Falls back to legacy fields to keep old fixtures/tests working.
-            tree_id = (
-                record.get("tree_id")
-                or record.get("tree_instance_id")
-                or record.get("gear_segment_id", "")
+        strict = bool(
+            (self.config.get("tree_policy") or {}).get(
+                "strict_group_integrity", False
             )
-            parent_group = (
-                record.get("parent_group_id")
-                or record.get("parent_path")
-                or record.get("gear_parent_segment_id", "")
-            )
-            child_seg = (
-                record.get("child_segment_id")
-                or record.get("gear_segment_id")
-                or str(record.get("child_index", idx))
-            )
-            qid = record.get("question_id", "")
-            key = f"{snapshot_id}|{qid}|{tree_id}|{parent_group}|{child_seg}"
-            digest = hashlib.blake2b(key.encode("utf-8"), digest_size=16).hexdigest()
-            record.setdefault("edge_id", f"{snapshot_id}:{digest}")
-            record.setdefault("policy_snapshot_id", snapshot_id)
-            if record["policy_snapshot_id"] != snapshot_id:
-                raise ValueError("Generated edge policy_snapshot_id mismatches rollout snapshot")
-            response = list(record.get("response_token_ids") or [])
-            log_probs = record.get("actor_shifted_log_probs")
-            if log_probs is None:
-                raise ValueError("Generated edge is missing generation-time actor_shifted_log_probs")
-            if len(log_probs) != len(response):
-                raise ValueError("Generated edge log-probs do not align with response tokens")
-            record.setdefault("depth", int(record.get("depth", 0) or 0))
-            record.setdefault("leaf", bool(record.get("leaf", False)))
-            record.setdefault("pruned", bool(record.get("pruned", False)))
-            record.setdefault("tree_update_mode", record.get("tree_update_mode", "spo"))
-            normalized.append(record)
-        return normalized
+        )
+        return normalize_generated_edges(
+            edges, snapshot_id=snapshot_id, strict=strict
+        )
 
     def _edges_to_update_batch(self, sampled_edges: List[Dict[str, Any]], metrics: Dict[str, Any]) -> DataProto:
         from recipe.gear_tree.tree_data import edges_to_dataproto

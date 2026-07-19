@@ -28,6 +28,7 @@ from recipe.gear_tree.tree_data import (
     validate_replay_batch,
     validate_segment_objective_weights,
     validate_tree_construction,
+    verify_tree_instance_id_uniqueness,
 )
 
 
@@ -169,13 +170,26 @@ def update_manifest_from_generated_edges(
             integrity_metrics["vdra/objective_weight_normalization_failed"] = 1.0
             # Non-fatal for the segment-mean main path.
 
-    # PLAN.md P0.6/P0.7: observe tree-id presence at construction time.
-    # (Phase P0.H strengthens this into a real collision check.)
+    # PLAN.md P0.H: REAL tree-identity verification at construction time —
+    # detects two stochastic trees for the same (question, snapshot)
+    # colliding under one tree_id, and forbids the ambiguous
+    # snapshot:question fallback identity. Far stronger than the old
+    # "tree-id set is non-empty" check.
     tree_ids = {str(e.get("tree_id", "")) for e in generated_edges}
-    manifest.extras["unique_tree_ids_verified"] = bool(tree_ids)
+    ids_ok, id_failures = verify_tree_instance_id_uniqueness(generated_edges)
+    manifest.extras["unique_tree_ids_verified"] = ids_ok and bool(tree_ids)
     manifest.extras["unique_tree_ids_count"] = len(tree_ids)
-    manifest.unique_tree_ids_verified = bool(tree_ids)
+    manifest.unique_tree_ids_verified = ids_ok and bool(tree_ids)
     integrity_metrics["vdra/unique_tree_ids"] = float(len(tree_ids))
+    integrity_metrics["vdra/tree_id_collisions"] = float(len(id_failures))
+    if not ids_ok:
+        manifest.extras["tree_id_collision_details"] = id_failures[:5]
+        manifest.record_integrity_failure(len(id_failures))
+        if strict:
+            raise ValueError(
+                "Tree-identity verification failed (PLAN.md P0.H):\n  "
+                + "\n  ".join(id_failures)
+            )
 
     # PLAN.md P0.6: only when the full-tree queue identity holds and the
     # segment weights normalize does the segment-count invariants bit flip on.
