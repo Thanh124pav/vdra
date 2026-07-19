@@ -109,10 +109,18 @@ class RunManifest:
     # Free-form extra provenance (e.g., dataset hash, GPU count).
     extras: Dict[str, Any] = field(default_factory=dict)
 
+    def record_segment_invariant_pass(self) -> None:
+        """PLAN.md P0.J: the canonical segment-mean invariant claim."""
+        self.segment_count_invariants_passed = True
+
+    def record_node_balanced_invariant_pass(self) -> None:
+        """PLAN.md P0.J: the node-balanced ABLATION invariant claim."""
+        self.node_balanced_invariants_passed = True
+
     def record_invariant_pass(self) -> None:
-        # Legacy alias — flips the segment-count bit on for the segment-mean
-        # main path AND keeps the node-balanced bit compatible for ablation
-        # manifests.
+        # Deprecated legacy alias — the two bits are DIFFERENT claims
+        # (PLAN.md P0.J); production code calls the specific recorder for
+        # its configured loss mode. Kept only for pre-split callers.
         self.node_balanced_invariants_passed = True
         self.segment_count_invariants_passed = True
 
@@ -180,6 +188,18 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
     if manifest.policy_aggregation != POLICY_AGGREGATION_SEGMENT_MEAN:
         failures.append(
             f"policy_aggregation={manifest.policy_aggregation!r} != {POLICY_AGGREGATION_SEGMENT_MEAN!r}"
+        )
+    # PLAN.md P0.J: canonical replay is edge-level; a complete_tree run is a
+    # labeled ablation, never a valid main run.
+    if manifest.replay_sampling_unit != "edge":
+        failures.append(
+            f"replay_sampling_unit={manifest.replay_sampling_unit!r} != 'edge'"
+        )
+    # PLAN.md P0.J: the main manifest becomes valid only after at least one
+    # successful canonical optimizer step has been observed.
+    if manifest.num_optimizer_steps_total < 1:
+        failures.append(
+            f"num_optimizer_steps_total={manifest.num_optimizer_steps_total} < 1"
         )
     if manifest.segment_token_reduction not in _VALID_SEGMENT_TOKEN_REDUCTIONS:
         failures.append(

@@ -866,6 +866,11 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     continue
 
                 edge_batch = self._edges_to_update_batch(sampled_edges, metrics)
+                # PLAN.md P0.J: strict tensorization refuses truncation with a
+                # ValueError, so REACHING this line is the observed
+                # no-truncation event for this batch.
+                self.run_manifest.no_truncation = True
+                self.run_manifest.extras["no_truncation"] = True
 
                 # PLAN.md P0.B: sampled replay batches get ROW-LOCAL checks
                 # only (edge-level replay legally splits trees and parent
@@ -910,6 +915,15 @@ class RayGearTreeTrainer(RayPPOTrainer):
 
                 step_ints = _flatten_int_list(raw_step_counts)
                 n_optim_steps = max(step_ints) if step_ints else 1
+                # PLAN.md P0.J: OBSERVED stored-old-log-prob use, reported by
+                # the actor itself. The manifest bit flips only from this
+                # metric — never from tensor presence alone.
+                used_stored_ints = _flatten_int_list(
+                    actor_metrics_meta.get("actor/used_stored_old_log_probs")
+                )
+                actor_used_stored_old_log_probs = bool(
+                    used_stored_ints and min(used_stored_ints) >= 1
+                )
                 metrics.update(reduce_metrics(actor_metrics_meta))
                 if actor_updated:
                     removed = replay_buffer.commit(reservation)
@@ -923,10 +937,25 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     self.optimizer_steps_this_iteration = int(n_optim_steps)
                     self.global_steps += int(n_optim_steps)
                     self.num_optimizer_steps_total = self.global_steps
-                    # PLAN.md P0.N8: at least one successful update with no
-                    # integrity failures flips the invariants-passed bit on.
+                    # PLAN.md P0.J: manifest bit only from the actor-observed
+                    # metric — never inferred from tensor presence.
+                    if actor_used_stored_old_log_probs:
+                        self.run_manifest.stored_old_log_probs_used = True
+                        self.run_manifest.extras["stored_old_log_probs_used"] = True
+                    # PLAN.md P0.J: at least one successful update with no
+                    # integrity failures flips ONLY the invariant bit matching
+                    # the configured loss mode — segment-mean and
+                    # node-balanced are different claims.
                     if self.run_manifest.group_integrity_failures == 0:
-                        self.run_manifest.record_invariant_pass()
+                        loss_mode = str(
+                            self.config.actor_rollout_ref.actor.policy_loss.get(
+                                "loss_mode", "vdra_segment_mean_ppo"
+                            )
+                        )
+                        if loss_mode == "vdra_node_balanced_ppo":
+                            self.run_manifest.record_node_balanced_invariant_pass()
+                        else:
+                            self.run_manifest.record_segment_invariant_pass()
                     # PLAN.md P0.7: stamp observed counters + replay
                     # diagnostics on the manifest.
                     self._record_iteration_on_manifest(

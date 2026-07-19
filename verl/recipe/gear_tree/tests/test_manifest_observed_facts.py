@@ -99,6 +99,7 @@ def test_clean_synthetic_update_produces_valid_manifest_mean():
     # PLAN.md P0.7: trainer flips this after observing the correct number of
     # optimizer.step() calls (see P0.3). Simulate here.
     manifest.optimizer_step_accounting_valid = True
+    manifest.num_optimizer_steps_total = 4  # PLAN.md P0.J: >=1 observed step
     assert validate_main_run(manifest) is None
 
 
@@ -114,6 +115,7 @@ def test_clean_synthetic_update_produces_valid_manifest_sum():
     manifest.rollout_scorer_weights_verified = True
     manifest.record_invariant_pass()
     manifest.optimizer_step_accounting_valid = True
+    manifest.num_optimizer_steps_total = 4  # PLAN.md P0.J: >=1 observed step
     assert manifest.segment_token_reduction == SEGMENT_TOKEN_REDUCTION_SUM
     assert validate_main_run(manifest) is None
 
@@ -129,6 +131,7 @@ def test_later_failure_keeps_run_invalid():
     manifest.rollout_scorer_weights_verified = True
     manifest.record_invariant_pass()
     manifest.optimizer_step_accounting_valid = True
+    manifest.num_optimizer_steps_total = 4  # PLAN.md P0.J: >=1 observed step
     assert validate_main_run(manifest) is None
 
     # Second batch — inject a broken parent group so group-integrity fails.
@@ -152,12 +155,97 @@ def test_manifest_save_load_preserves_all_fields(tmp_path):
     manifest.rollout_scorer_weights_verified = True
     manifest.record_invariant_pass()
     manifest.optimizer_step_accounting_valid = True
+    manifest.num_optimizer_steps_total = 4  # PLAN.md P0.J: >=1 observed step
 
     p = tmp_path / "manifest.json"
     manifest.save(p)
     loaded = RunManifest.load(p)
     assert loaded.to_dict() == manifest.to_dict()
     assert loaded.segment_token_reduction == manifest.segment_token_reduction
+
+
+class TestObservedFactsP0J:
+    """PLAN.md P0.J: manifest bits flip only from observed runtime events."""
+
+    def _manifest(self):
+        tree_policy, gear_tree_cfg = _cfg()
+        return build_run_manifest(
+            tree_policy=tree_policy,
+            gear_tree_cfg=gear_tree_cfg,
+            actor_loss_mode="vdra_segment_mean_ppo",
+        )
+
+    def test_replay_stage_update_does_not_hard_set_observed_bits(self):
+        from recipe.gear_tree.manifest_lifecycle import (
+            update_manifest_from_replay_batch,
+        )
+
+        manifest = self._manifest()
+        sampled = [
+            {**e, "question_id": "q0", "advantage": 1.0}
+            for e in _clean_edges()
+        ]
+        update_manifest_from_replay_batch(manifest, sampled, strict=True)
+        # These flip ONLY from the actor metric / successful tensorization.
+        assert manifest.stored_old_log_probs_used is False
+        assert manifest.no_truncation is False
+        # Replay-age observation IS a per-batch observed fact.
+        assert manifest.replay_age_uses_rollout_iteration is True
+
+    def test_invariant_recorders_are_independent_claims(self):
+        manifest = self._manifest()
+        manifest.record_segment_invariant_pass()
+        assert manifest.segment_count_invariants_passed is True
+        assert manifest.node_balanced_invariants_passed is False
+
+        manifest2 = self._manifest()
+        manifest2.record_node_balanced_invariant_pass()
+        assert manifest2.node_balanced_invariants_passed is True
+        assert manifest2.segment_count_invariants_passed is False
+
+    def test_complete_tree_unit_is_never_a_valid_main_run(self):
+        manifest = self._manifest()
+        update_manifest_from_edges(manifest, _clean_edges(), strict=True)
+        manifest.rollout_scorer_weights_verified = True
+        manifest.record_segment_invariant_pass()
+        manifest.optimizer_step_accounting_valid = True
+        manifest.num_optimizer_steps_total = 4
+        assert validate_main_run(manifest) is None
+        manifest.replay_sampling_unit = "complete_tree"
+        reason = validate_main_run(manifest)
+        assert reason is not None and "complete_tree" in reason
+
+    def test_main_manifest_invalid_before_first_optimizer_step(self):
+        manifest = self._manifest()
+        update_manifest_from_edges(manifest, _clean_edges(), strict=True)
+        manifest.rollout_scorer_weights_verified = True
+        manifest.record_segment_invariant_pass()
+        manifest.optimizer_step_accounting_valid = True
+        assert manifest.num_optimizer_steps_total == 0
+        reason = validate_main_run(manifest)
+        assert reason is not None and "num_optimizer_steps_total" in reason
+
+    def test_trainer_and_actor_wiring_for_observed_facts(self):
+        from pathlib import Path
+
+        recipe_root = Path(__file__).resolve().parents[1]
+        trainer_source = (recipe_root / "gear_ray_trainer.py").read_text()
+        # The stored-log-prob bit comes from the actor metric only.
+        assert "actor/used_stored_old_log_probs" in trainer_source
+        assert "actor_used_stored_old_log_probs" in trainer_source
+        # no_truncation flips after strict tensorization succeeds.
+        assert "self.run_manifest.no_truncation = True" in trainer_source
+        # The loss-mode-specific invariant recorders are used, not the alias.
+        assert "record_segment_invariant_pass()" in trainer_source
+        assert "record_node_balanced_invariant_pass()" in trainer_source
+        assert "record_invariant_pass()" not in trainer_source.replace(
+            "record_segment_invariant_pass()", ""
+        ).replace("record_node_balanced_invariant_pass()", "")
+
+        actor_source = (
+            recipe_root.parents[1] / "verl" / "workers" / "actor" / "dp_actor.py"
+        ).read_text()
+        assert "actor/used_stored_old_log_probs" in actor_source
 
 
 def test_queue_identity_failure_flags_segment_count():

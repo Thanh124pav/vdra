@@ -595,4 +595,12 @@ class DataParallelPPOActor(BasePPOActor):
         # by the correct amount. Stored under the standard verl `metrics` key
         # so it is emitted through `reduce_metrics` unchanged.
         metrics.setdefault("actor/num_optimizer_steps", []).append(int(num_optimizer_steps))
+        # PLAN.md P0.J: OBSERVED fact for the manifest — 1.0 only when the
+        # stored generation-time old_log_probs were actually kept as the PPO
+        # ratio denominator (i.e. this update was not treated as on-policy
+        # with old_log_prob overwritten by the current policy's log_prob).
+        used_stored = (not on_policy) and ("old_log_probs" in data.batch.keys())
+        metrics.setdefault("actor/used_stored_old_log_probs", []).append(
+            1.0 if used_stored else 0.0
+        )
         return metrics

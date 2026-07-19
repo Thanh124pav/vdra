@@ -33,6 +33,10 @@ def _valid_main_manifest(*, reduction: str = SEGMENT_TOKEN_REDUCTION_MEAN) -> Ru
         replay_age_uses_rollout_iteration=True,
         optimizer_step_accounting_valid=True,
         unique_tree_ids_verified=True,
+        # PLAN.md P0.J: valid only after >= 1 observed canonical optimizer
+        # step on the edge-level replay unit.
+        replay_sampling_unit="edge",
+        num_optimizer_steps_total=4,
     )
     return m
 

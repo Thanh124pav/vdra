@@ -246,14 +246,10 @@ def update_manifest_from_replay_batch(
     # observed edge carries the canonical stamp.
     if any("generation_rollout_iteration" in edge for edge in sampled_edges):
         manifest.replay_age_uses_rollout_iteration = True
-    # PLAN.md P0.6: stored old log-probs are what the trainer forces via
-    # meta_info["force_stored_old_log_probs"]; record the observed presence
-    # both on the extras (legacy) and on the top-level manifest field.
-    # (Phase P0.J replaces these with actor-observed facts.)
-    manifest.stored_old_log_probs_used = True
-    manifest.no_truncation = True  # edges_to_dataproto refuses truncation
-    manifest.extras["stored_old_log_probs_used"] = True
-    manifest.extras["no_truncation"] = True
+    # PLAN.md P0.J: `stored_old_log_probs_used` and `no_truncation` are NOT
+    # set here. The trainer flips them only from actually observed runtime
+    # events: the actor's actor/used_stored_old_log_probs metric and a
+    # successful strict tensorization respectively.
 
     return replay_metrics
 
