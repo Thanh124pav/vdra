@@ -57,24 +57,50 @@ class RunManifest:
     advantage_mode: str = ADVANTAGE_MODE_ABLATION
     segment_definition: str = SEGMENT_DEFINITION_FIXED
 
+    # PLAN.md P0.7 replay-cadence snapshot (declared config → observed cap).
+    replay_sampling_unit: str = "edge"
+    target_edges_per_iteration: int = 0
+    resolved_max_edges_per_question_per_iteration: int = 0
+    max_edge_age_iterations: int = 0
+    ppo_mini_batch_size: int = 0
+    ppo_epochs: int = 1
+
+    # PLAN.md P0.7 counter snapshot (observed by the trainer).
+    rollout_iteration: int = 0
+    global_step: int = 0
+    optimizer_steps_last_iteration: int = 0
+    num_optimizer_steps_total: int = 0
+
     # Operational invariants (updated by the trainer at runtime — never
-    # inferred from config). PLAN.md P0.6.
+    # inferred from config). PLAN.md P0.6 / P0.7.
+    # Legacy (kept for backwards compat; not required for the main path):
     complete_tree_replay: bool = False
     complete_parent_microbatches: bool = False
-    # Legacy: node_balanced_invariants_passed (kept for backwards compat).
     node_balanced_invariants_passed: bool = False
-    # PLAN.md P0.6: canonical segment-count invariants (the main path).
+    # PLAN.md P0.6 / P0.7 canonical bits.
     segment_count_invariants_passed: bool = False
     stored_old_log_probs_used: bool = False
     rollout_scorer_weights_verified: bool = False
     no_truncation: bool = False
     fresh_iid_row_count_matches_allocated_k: bool = True
+    replay_age_uses_rollout_iteration: bool = False
+    optimizer_step_accounting_valid: bool = False
+    unique_tree_ids_verified: bool = False
 
     # Running counters (updated by the trainer)
     parent_split_count: int = 0
     tree_split_count: int = 0
     group_integrity_failures: int = 0
     segment_count_failures: int = 0
+
+    # PLAN.md P0.7 replay diagnostics from the most recent iteration.
+    selected_edges_last_iteration: int = 0
+    unique_questions_last_iteration: int = 0
+    mean_edge_age_last_iteration: float = 0.0
+    max_edge_age_last_iteration: int = 0
+    per_question_selected_count_max_last_iteration: int = 0
+    zero_contribution_selected_slots_last_iteration: int = 0
+    edge_age_histogram_last_iteration: Dict[int, int] = field(default_factory=dict)
 
     # Free-form extra provenance (e.g., dataset hash, GPU count).
     extras: Dict[str, Any] = field(default_factory=dict)
@@ -152,22 +178,35 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
         failures.append(
             f"segment_token_reduction={manifest.segment_token_reduction!r} not in {_VALID_SEGMENT_TOKEN_REDUCTIONS}"
         )
-    if manifest.tree_split_count > 0:
-        failures.append(f"tree_split_count={manifest.tree_split_count} > 0")
     if manifest.segment_count_failures > 0:
         failures.append(
             f"segment_count_failures={manifest.segment_count_failures} > 0"
         )
+    # PLAN.md P0.7: an observed group-integrity failure — even one — must
+    # keep the run invalid. Edge-level replay is canonical, but a broken
+    # parent group still means the batch's row alignment is wrong.
+    if manifest.group_integrity_failures > 0:
+        failures.append(
+            f"group_integrity_failures={manifest.group_integrity_failures} > 0"
+        )
     if not manifest.segment_count_invariants_passed:
         failures.append("segment_count_invariants_passed=False")
-    if not manifest.complete_tree_replay:
-        failures.append("complete_tree_replay=False")
+    # PLAN.md P0.7: complete-tree replay is NOT canonical anymore; edge-level
+    # replay is intentional. We keep the field for backwards-compat and only
+    # require it in a labeled "complete-tree ablation" manifest.
     if not manifest.stored_old_log_probs_used:
         failures.append("stored_old_log_probs_used=False")
     if not manifest.rollout_scorer_weights_verified:
         failures.append("rollout_scorer_weights_verified=False")
     if not manifest.no_truncation:
         failures.append("no_truncation=False")
+    # PLAN.md P0.7 canonical bits.
+    if not manifest.replay_age_uses_rollout_iteration:
+        failures.append("replay_age_uses_rollout_iteration=False")
+    if not manifest.optimizer_step_accounting_valid:
+        failures.append("optimizer_step_accounting_valid=False")
+    if not manifest.unique_tree_ids_verified:
+        failures.append("unique_tree_ids_verified=False")
     if failures:
         return (
             "Manifest is invalid for a canonical VDRA main run (PLAN.md P0.6):\n  "

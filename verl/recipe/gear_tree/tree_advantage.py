@@ -287,6 +287,14 @@ def extract_edges_from_tree(
         edge["queue_released_segment_count"] = int(
             queue_released_segment_count.get(qid, 0)
         )
+        # PLAN.md P0.5: persist the parent's pre-filter realized child count
+        # on every edge. Downstream sparse-vs-dense parity checks compare
+        # ``realized_child_count`` (unaffected by zero-adv filtering) against
+        # ``allocated_k``.
+        pgid = str(edge.get("parent_group_id", ""))
+        slot = realized_by_parent.get(pgid)
+        if slot is not None:
+            edge["realized_child_count"] = int(slot["realized"])
 
     # PLAN.md P0.2: fresh_iid invariants — realized_child_count == allocated_k
     # is a construction invariant checked from the pre-filter snapshot; the

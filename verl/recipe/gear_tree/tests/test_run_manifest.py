@@ -29,6 +29,10 @@ def _valid_main_manifest(*, reduction: str = SEGMENT_TOKEN_REDUCTION_MEAN) -> Ru
         rollout_scorer_weights_verified=True,
         no_truncation=True,
         fresh_iid_row_count_matches_allocated_k=True,
+        # PLAN.md P0.7 canonical bits — always required on a valid main run.
+        replay_age_uses_rollout_iteration=True,
+        optimizer_step_accounting_valid=True,
+        unique_tree_ids_verified=True,
     )
     return m
 

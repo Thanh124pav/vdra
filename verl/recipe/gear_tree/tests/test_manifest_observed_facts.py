@@ -35,6 +35,7 @@ def _clean_edges():
             "tree_total_segment_count": 2,
             "queue_flush_id": "q0",
             "queue_released_segment_count": 2,
+            "generation_rollout_iteration": 0,
         },
         {
             "tree_id": "T0",
@@ -44,6 +45,7 @@ def _clean_edges():
             "tree_total_segment_count": 2,
             "queue_flush_id": "q0",
             "queue_released_segment_count": 2,
+            "generation_rollout_iteration": 0,
         },
     ]
 
@@ -92,6 +94,9 @@ def test_clean_synthetic_update_produces_valid_manifest_mean():
     update_manifest_from_edges(manifest, _clean_edges(), strict=True)
     manifest.rollout_scorer_weights_verified = True  # observed by trainer
     manifest.record_invariant_pass()
+    # PLAN.md P0.7: trainer flips this after observing the correct number of
+    # optimizer.step() calls (see P0.3). Simulate here.
+    manifest.optimizer_step_accounting_valid = True
     assert validate_main_run(manifest) is None
 
 
@@ -106,6 +111,7 @@ def test_clean_synthetic_update_produces_valid_manifest_sum():
     update_manifest_from_edges(manifest, _clean_edges(), strict=True)
     manifest.rollout_scorer_weights_verified = True
     manifest.record_invariant_pass()
+    manifest.optimizer_step_accounting_valid = True
     assert manifest.segment_token_reduction == SEGMENT_TOKEN_REDUCTION_SUM
     assert validate_main_run(manifest) is None
 
@@ -120,6 +126,7 @@ def test_later_failure_keeps_run_invalid():
     update_manifest_from_edges(manifest, _clean_edges(), strict=True)
     manifest.rollout_scorer_weights_verified = True
     manifest.record_invariant_pass()
+    manifest.optimizer_step_accounting_valid = True
     assert validate_main_run(manifest) is None
 
     # Second batch — inject a broken parent group so group-integrity fails.
@@ -142,6 +149,7 @@ def test_manifest_save_load_preserves_all_fields(tmp_path):
     update_manifest_from_edges(manifest, _clean_edges(), strict=True)
     manifest.rollout_scorer_weights_verified = True
     manifest.record_invariant_pass()
+    manifest.optimizer_step_accounting_valid = True
 
     p = tmp_path / "manifest.json"
     manifest.save(p)

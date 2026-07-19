@@ -423,8 +423,16 @@ class DataParallelPPOActor(BasePPOActor):
         )
 
         metrics = {}
+        # PLAN.md P0.3: count actual optimizer.step() calls so the trainer can
+        # advance ``global_step`` by the correct amount for this update.
+        num_optimizer_steps = 0
+        # PLAN.md P0.3/P0.4: the original selected-slot count for this
+        # optimizer batch is used by the batch-slot mean loss (N_B) and must
+        # not shrink when micro/dynamic batching splits the mini_batch.
+        original_optimizer_batch_slot_count = len(mini_batches[0]) if mini_batches else 0
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
+                original_optimizer_batch_slot_count = len(mini_batch)
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
@@ -524,6 +532,17 @@ class DataParallelPPOActor(BasePPOActor):
                         maybe = model_inputs.get(group_key, None)
                         if maybe is not None and group_key in policy_loss_fn.__code__.co_varnames:
                             loss_kwargs[group_key] = maybe
+                    # PLAN.md P0.4: batch-slot mean loss reads N_B from the
+                    # original optimizer batch's slot count (128 in the main
+                    # config), so microbatch splits do not shrink the
+                    # denominator.
+                    if (
+                        "original_optimizer_batch_slot_count"
+                        in policy_loss_fn.__code__.co_varnames
+                    ):
+                        loss_kwargs["original_optimizer_batch_slot_count"] = (
+                            original_optimizer_batch_slot_count
+                        )
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(**loss_kwargs)
 
                     if entropy_coeff != 0:
@@ -564,7 +583,16 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
+                # PLAN.md P0.3: each successful call to _optimizer_step is one
+                # true optimizer.step() call. The trainer must advance
+                # global_step by the returned count, not by 1 per update_actor.
+                num_optimizer_steps += 1
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
+        # PLAN.md P0.3: expose the true optimizer-step count for this update so
+        # the trainer can advance global_step and optimizer_steps_this_iteration
+        # by the correct amount. Stored under the standard verl `metrics` key
+        # so it is emitted through `reduce_metrics` unchanged.
+        metrics.setdefault("actor/num_optimizer_steps", []).append(int(num_optimizer_steps))
         return metrics

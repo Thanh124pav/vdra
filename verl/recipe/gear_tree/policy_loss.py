@@ -251,13 +251,31 @@ _VALID_SEGMENT_TOKEN_REDUCTIONS = ("mean", "sum")
 
 def _resolve_segment_token_reduction(config) -> str:
     """PLAN.md P0.1: `segment_token_reduction` must be exactly ``mean`` or
-    ``sum``. An invalid value is an actionable startup error, not a silent
-    fallback.
+    ``sum``. Read from the authoritative source
+    ``config.policy_loss.segment_token_reduction`` (typed field on
+    ``PolicyLossConfig``); fall back to a legacy top-level lookup only if the
+    caller passed a raw ``PolicyLossConfig`` directly. An invalid value is an
+    actionable startup error, not a silent fallback.
     """
 
-    raw = "mean"
+    raw = None
     if config is not None:
-        raw = config.get("segment_token_reduction", "mean")
+        # Prefer the actor.policy_loss level (canonical, PLAN.md P0.1). Falls
+        # through to config.get(...) when the caller passed the policy-loss
+        # subconfig directly (e.g. tests that build PolicyLossConfig alone).
+        policy_loss_cfg = None
+        try:
+            policy_loss_cfg = getattr(config, "policy_loss", None)
+        except Exception:  # pragma: no cover — omegaconf edge cases
+            policy_loss_cfg = None
+        if policy_loss_cfg is None and hasattr(config, "get"):
+            policy_loss_cfg = config.get("policy_loss", None)
+        if policy_loss_cfg is not None and hasattr(policy_loss_cfg, "get"):
+            raw = policy_loss_cfg.get("segment_token_reduction", None)
+        if raw is None and hasattr(config, "get"):
+            # Legacy shape: field lived on ActorConfig top-level. Kept so
+            # existing overrides do not silently regress before migration.
+            raw = config.get("segment_token_reduction", None)
     if raw is None:
         raw = "mean"
     reduction = str(raw).strip().lower()
@@ -305,25 +323,34 @@ def compute_policy_loss_vdra_segment_mean(
     segment_objective_weights: torch.Tensor | None = None,
     tree_group_ids: torch.Tensor | None = None,
     tree_total_segment_count: torch.Tensor | None = None,
+    original_optimizer_batch_slot_count: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """PLAN.md P0.1 / P0.4 canonical VDRA main-run loss.
+    """PLAN.md P0.1 / P0.4 canonical VDRA main-run loss (batch-slot mean).
 
-    ``segment_objective_weights`` is expected to be precomputed by
-    ``tree_data.compute_segment_objective_weights`` and attached to the
-    DataProto. The loss is a single weighted reduction:
+    Canonical semantics (main path)
+    ------------------------------
+    For one optimizer batch of ``N_B`` selected segment slots the loss is
 
-        L = sum_row w_row * L_row^r
+        L_B = (1/N_B) * sum_{s in retained(B)} L_s^r,
 
-    where ``L_row^r`` is either ``TokenMean(pg_row)`` (``r=mean``) or the raw
-    token sum (``r=sum``) — selected by ``config.segment_token_reduction``.
+    where ``L_s^r`` is either ``TokenMean(pg_row)`` (``r=mean``) or the raw
+    token sum (``r=sum``). ``N_B`` is the ORIGINAL selected-slot count for
+    this optimizer batch (128 in the canonical main config). It is passed by
+    ``dp_actor.update_policy`` via ``original_optimizer_batch_slot_count``
+    so that microbatch splits do not shrink the denominator.
 
-    Mini/microbatch splits partition ``w_row`` and preserve the invariant
-    total loss (see ``test_vdra_full_vs_split_parity.py``).
+    Legacy tree-average fallback
+    ---------------------------
+    When ``original_optimizer_batch_slot_count`` is not passed and either
+    ``segment_objective_weights`` or ``(tree_group_ids,
+    tree_total_segment_count)`` is available, the function falls back to the
+    pre-PLAN.md-P0.4 tree-average
 
-    ``tree_group_ids`` + ``tree_total_segment_count`` are accepted for
-    backwards compatibility when the DataProto lacks precomputed weights.
-    Passing ``edge_weights`` is a hard error — the main path does not mix
-    row-level edge weights with the segment objective.
+        L = sum_row w_row * L_row^r,   w_row = 1 / (N_T * N_seg(T)).
+
+    This preserves the ablation-only ``vdra_node_balanced_ppo`` path and
+    unit-test surface without silently mixing the two conventions.
+    ``edge_weights`` is a hard error in both paths.
     """
 
     assert config is not None
@@ -348,32 +375,18 @@ def compute_policy_loss_vdra_segment_mean(
 
     row_losses = _segment_row_losses(pg_losses, action_mask, reduction=reduction)
 
-    if segment_objective_weights is None:
-        # Fallback path: derive w_row from tree_id + tree_total_segment_count.
-        # WARNING: this uses the LOCAL unique-tree count and therefore only
-        # matches the full-batch objective when the caller runs a single
-        # microbatch. For mini/microbatch splits the trainer must pass
-        # precomputed ``segment_objective_weights`` (attached by
-        # ``tree_data.edges_to_dataproto``); those weights encode the
-        # pre-split ``N_T`` and reproduce the full-batch objective under
-        # sums-of-splits.
-        if tree_group_ids is None or tree_total_segment_count is None:
+    if original_optimizer_batch_slot_count is not None:
+        # PLAN.md P0.4 canonical main path.
+        n_b = int(original_optimizer_batch_slot_count)
+        if n_b <= 0:
             raise ValueError(
-                "vdra_segment_mean_ppo requires segment_objective_weights OR "
-                "(tree_group_ids, tree_total_segment_count). Attach them via "
-                "tree_data.edges_to_dataproto (PLAN.md P0.4)."
+                "original_optimizer_batch_slot_count must be > 0 for the "
+                "batch-slot VDRA main loss (PLAN.md P0.4)."
             )
-        tids = tree_group_ids.to(dtype=torch.long, device=row_losses.device)
-        unique_trees = torch.unique(tids)
-        n_tree = float(unique_trees.numel())
-        counts = tree_total_segment_count.to(
-            dtype=row_losses.dtype, device=row_losses.device
-        )
-        safe_counts = torch.where(
-            counts > 0, counts, torch.ones_like(counts)
-        )
-        w = 1.0 / (n_tree * safe_counts)
-    else:
+        pg_loss = row_losses.sum() / float(n_b)
+    elif segment_objective_weights is not None:
+        # Legacy tree-average path. Retained for unit tests and the
+        # vdra_node_balanced_ppo ablation; NOT the main path.
         w = segment_objective_weights.to(
             dtype=row_losses.dtype, device=row_losses.device
         )
@@ -382,8 +395,26 @@ def compute_policy_loss_vdra_segment_mean(
                 "segment_objective_weights shape must match [batch]; got "
                 f"{tuple(w.shape)}"
             )
-
-    pg_loss = (w * row_losses).sum()
+        pg_loss = (w * row_losses).sum()
+    elif tree_group_ids is not None and tree_total_segment_count is not None:
+        # Legacy tree-average derived path — kept so pre-P0.4 tests without
+        # precomputed weights still exercise the analytic identity.
+        tids = tree_group_ids.to(dtype=torch.long, device=row_losses.device)
+        unique_trees = torch.unique(tids)
+        n_tree = float(unique_trees.numel())
+        counts = tree_total_segment_count.to(
+            dtype=row_losses.dtype, device=row_losses.device
+        )
+        safe_counts = torch.where(counts > 0, counts, torch.ones_like(counts))
+        w = 1.0 / (n_tree * safe_counts)
+        pg_loss = (w * row_losses).sum()
+    else:
+        raise ValueError(
+            "vdra_segment_mean_ppo requires either "
+            "original_optimizer_batch_slot_count (PLAN.md P0.4 main path) or "
+            "segment_objective_weights / (tree_group_ids, "
+            "tree_total_segment_count) for the legacy tree-average path."
+        )
 
     # Report ratio as a metric.
     avg_ratio = _masked_mean(ratio, action_mask)

@@ -35,12 +35,22 @@ class PolicyLossConfig(BaseConfig):
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
 
     Args:
-        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg'.
+        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg',
+            'treetune_ppo', 'vdra_segment_mean_ppo', 'vdra_node_balanced_ppo'.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
+        segment_token_reduction (str): Within-segment token reduction for the
+            VDRA segment-mean loss (PLAN.md P0.1). Must be exactly ``"mean"`` or
+            ``"sum"``. ``mean`` is the canonical main-run default; ``sum`` is a
+            supported first-class ablation. Any other value fails at startup.
+        use_prob_mask (bool): Apply the treetune-style probability mask on top of
+            the response mask before the PPO surrogate reduction (VDRA path).
+        ratio_threshold (float): Diagnostic ratio threshold for VDRA losses.
+            ``float('inf')`` disables the report (the canonical VDRA main path
+            never uses this to drop microbatches — see PLAN.md P0.4).
     """
 
     loss_mode: str = "vanilla"
@@ -49,6 +59,29 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    segment_token_reduction: str = "mean"
+    use_prob_mask: bool = True
+    ratio_threshold: float = float("inf")
+
+    def __post_init__(self):
+        """PLAN.md P0.1: fail loudly on invalid segment_token_reduction.
+
+        Only ``mean`` and ``sum`` are accepted (see PLAN.md §1.2 and P0.1). We
+        normalise to lowercase so YAML overrides like ``Mean`` do not silently
+        fall back to the default.
+        """
+        raw = self.segment_token_reduction
+        if raw is None:
+            raw = "mean"
+        normalised = str(raw).strip().lower()
+        if normalised not in {"mean", "sum"}:
+            raise ValueError(
+                f"segment_token_reduction={raw!r} is invalid; must be exactly "
+                "one of {'mean', 'sum'} (PLAN.md P0.1)."
+            )
+        # Field is a normal string on this frozen-ish dataclass wrapper; use
+        # object.__setattr__ so BaseConfig's mutability guards do not fight us.
+        object.__setattr__(self, "segment_token_reduction", normalised)
 
 
 @dataclass
