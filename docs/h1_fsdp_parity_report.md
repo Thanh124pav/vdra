@@ -1,10 +1,21 @@
 # H1 Report — Measured FSDP2 Distributed Semantics of the Gear-Tree Actor Losses
 
-Status: **EVIDENCE COMPLETE — STOP. Awaiting user decision before any
-production change** (CODEX_FIX_HARD.md §0 approval gate). No production code
-was modified for this report; all measurements come from the test-only
-harness `verl/recipe/gear_tree/tests/test_fsdp_canonical_parity.py`
-(commit `0e19dcd`).
+Status (original): **EVIDENCE COMPLETE — STOP** at commit `0e19dcd`; all
+measurements below come from the test-only harness
+`verl/recipe/gear_tree/tests/test_fsdp_canonical_parity.py`.
+
+> RESOLUTION (2026-07-21): the user reviewed this evidence and chose a
+> design beyond the Options A/B below — the CANONICAL objective now follows
+> the paper (`policy_aggregation=segment_mean` default / `token_mean`), and
+> the tree-balanced `1/(N_T·N_seg)` objective (whose measured non-parity is
+> documented in §4.2) is demoted to the labeled `tree_balanced_segment_mean`
+> ablation. The distributed handling is Option-A-style (trainer stamps the
+> global pre-filter denominators `M_B`/`T_B`; dp_actor compensates the
+> averaging reducer with `loss_scale_factor = dp_size`), extended with a
+> sparse logical-slot ledger. The contract is recorded in PLAN.md §1.2/§1.3
+> and implemented across commits H1-B1..H1-B6; the harness now asserts
+> segment_mean distributed PARITY through the real production path. See
+> `docs/pre_server_sweep_report.md` for the post-implementation status.
 
 ---
 

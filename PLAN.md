@@ -557,19 +557,34 @@ discuss the conflict instead of broadening the patch.
 # 7. Definition of done before GPU smoke
 
 ```text
-[ ] global_step increases by one per successful outer actor update
-[ ] total_training_steps remains in the same outer-update unit
-[ ] scheduler remains one step per successful update_actor call
-[ ] num_optimizer_steps_total is separate and observational
-[ ] rollout_iteration is restored and used for replay age
-[ ] canonical all-zero shortcut is disabled or removed
-[ ] replay rows are validated before tensorization
-[ ] validation/tensorization/actor-RPC failures rollback reservations
-[ ] canonical manifest does not depend on objective-weight normalization
-[ ] strict main requires canonical tree/edge identities
-[ ] edge-level replay/caps remain correct
-[ ] stored old log-probs remain in use
-[ ] CPU gate passes
+[x] global_step increases by one per successful outer actor update
+[x] total_training_steps remains in the same outer-update unit
+[x] scheduler remains one step per successful update_actor call
+[x] num_optimizer_steps_total is separate and observational
+[x] rollout_iteration is restored and used for replay age
+[x] canonical all-zero shortcut is disabled or removed
+[x] replay rows are validated before tensorization
+[x] validation/tensorization/actor-RPC failures rollback reservations
+[x] canonical manifest does not depend on objective-weight normalization
+[x] strict main requires canonical tree/edge identities
+[x] edge-level replay/caps remain correct
+[x] stored old log-probs remain in use
+[x] CPU gate passes
+```
+
+Hard-stage additions (§1.2/§1.3, 2026-07-21), all verified on CPU:
+
+```text
+[x] canonical objective = paper segment_mean (default) / token_mean over
+    pre-filter logical M_B / T_B; tree_balanced_segment_mean is ablation
+[x] sparse tensor execution over the logical-slot ledger; advantages from
+    the complete sibling set; zero slots count in reservation/caps/M_B/T_B
+[x] dp_actor loss_scale_factor = dp_size (measured average-reducer
+    compensation); real 2-rank FSDP2 segment_mean parity + no-hang
+[x] all-zero logical batch = explicit skipped update (no global_step, no
+    scheduler.step, no AdamW drift); strict fail-fast on missing denominator
+[x] batch_slot_mean_ablation flag retired; global_segment_mean rename gated
+[x] pre-server sweep clean (docs/pre_server_sweep_report.md)
 ```
 
 Then run a short GPU smoke and report separately:
