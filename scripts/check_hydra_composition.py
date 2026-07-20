@@ -85,6 +85,13 @@ def check_canonical(cfg) -> None:
         f"actor.policy_loss.segment_token_reduction="
         f"{actor.policy_loss.segment_token_reduction}",
     )
+    # Canonical normalization is the tree segment mean w_s = 1/(N_T*N_seg(T));
+    # the batch-slot mean is a labeled legacy ablation and must be OFF here.
+    _require(
+        not bool(actor.policy_loss.get("batch_slot_mean_ablation", False)),
+        "actor.policy_loss.batch_slot_mean_ablation must be false on the "
+        "canonical main path",
+    )
     _require(int(actor.ppo_mini_batch_size) == 128, "ppo_mini_batch_size != 128")
     _require(int(actor.ppo_epochs) == 1, "ppo_epochs != 1")
 

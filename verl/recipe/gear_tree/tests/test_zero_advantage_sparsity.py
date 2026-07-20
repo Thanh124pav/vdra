@@ -1,10 +1,10 @@
-"""PLAN.md P0.5 — zero-advantage sparse-vs-dense + unique ID tests.
+"""Zero-advantage sparse-vs-dense + unique ID tests.
 
-These legacy tests exercise the loss helper and replay uniqueness guards.
 Stage 1 production computes advantages before filtering, retains positive and
-negative advantages, and may remove exact-zero rows before replay insertion to
-save compute. ``tree_total_segment_count`` remains the pre-filter realized
-non-pruned count; these tests do not assert production loss normalization.
+negative advantages, and removes exact-zero rows before replay insertion to
+save compute. The canonical loss weights ``w_s = 1 / (N_T * N_seg(T))`` use
+the PRE-FILTER ``tree_total_segment_count``, so dropping zero rows leaves the
+loss unchanged — the (L1+L2+0+0)/4 parity asserted below.
 
 Additional invariant:
 * replay insertion rejects duplicate ``edge_id`` transactionally (unique
@@ -54,17 +54,22 @@ def _make_batch(n_rows: int, max_len: int = 6, zero_frac: float = 0.5, seed: int
 
 
 class TestDenseVsSparseParity:
-    """PLAN.md P0.5: dense and sparse execution must give identical loss and
-    gradients when zero slots are counted in N_B.
+    """Finish Medium Stage item 2: dense and sparse execution give identical
+    loss and gradients under the canonical weights
+    ``w_s = 1 / (N_T * N_seg(T))`` because ``N_seg(T)`` is the PRE-FILTER
+    ``tree_total_segment_count`` and ``N_T`` is fixed from the original
+    optimizer batch — never the retained replay-slot count.
     """
 
     @pytest.mark.parametrize("reduction", ["mean", "sum"])
-    def test_gradient_matches_when_N_B_preserved(self, reduction):
+    def test_gradient_matches_when_prefilter_counts_preserved(self, reduction):
         cfg = _actor_cfg(reduction)
-        n_rows = 128
+        n_rows, n_trees = 128, 16
         old_log_prob, log_prob, advantages, response_mask, zero_idx = _make_batch(
             n_rows, zero_frac=0.5
         )
+        # 16 trees of 8 pre-filter segments each.
+        seg_counts = torch.full((n_rows,), float(n_rows // n_trees))
 
         # DENSE path: all 128 rows go through the loss.
         theta_dense = nn.Parameter(torch.zeros(1))
@@ -74,12 +79,14 @@ class TestDenseVsSparseParity:
             advantages=advantages,
             response_mask=response_mask,
             config=cfg,
-            original_optimizer_batch_slot_count=n_rows,
+            tree_total_segment_count=seg_counts,
+            original_optimizer_batch_tree_count=n_trees,
         )[0]
         loss_dense.backward()
 
-        # SPARSE path: drop zero-advantage rows before the loss, but keep the
-        # original N_B in the denominator.
+        # SPARSE path: drop zero-advantage rows before the loss, keeping the
+        # pre-filter tree_total_segment_count on every retained row and the
+        # original batch's N_T.
         keep = torch.tensor(
             [i for i in range(n_rows) if i not in set(zero_idx.tolist())],
             dtype=torch.long,
@@ -91,7 +98,8 @@ class TestDenseVsSparseParity:
             advantages=advantages[keep],
             response_mask=response_mask[keep],
             config=cfg,
-            original_optimizer_batch_slot_count=n_rows,  # preserved N_B
+            tree_total_segment_count=seg_counts[keep],
+            original_optimizer_batch_tree_count=n_trees,  # preserved N_T
         )[0]
         loss_sparse.backward()
 
@@ -99,6 +107,44 @@ class TestDenseVsSparseParity:
             f"loss dense={loss_dense.item()} sparse={loss_sparse.item()}"
         )
         assert torch.allclose(theta_dense.grad, theta_sparse.grad, atol=1e-6)
+
+    def test_pos_neg_zero_zero_parity(self):
+        """The instruction's literal example: advantages [pos, neg, 0, 0] in
+        one tree of four pre-filter segments. After filtering the two zero
+        rows the loss must remain (L1 + L2 + 0 + 0) / 4 = (L1 + L2) / 4."""
+        cfg = _actor_cfg("mean")
+        max_len = 4
+        response_mask = torch.ones((4, max_len))
+        old_log_prob = torch.full((4, max_len), -0.2)
+        log_prob = torch.full((4, max_len), -0.2)
+        advantages = torch.zeros((4, max_len))
+        advantages[0] = 0.7   # positive
+        advantages[1] = -0.3  # negative
+        seg_counts = torch.full((4,), 4.0)
+
+        loss_dense = compute_policy_loss_vdra_segment_mean(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            config=cfg,
+            tree_total_segment_count=seg_counts,
+            original_optimizer_batch_tree_count=1,
+        )[0]
+        loss_sparse = compute_policy_loss_vdra_segment_mean(
+            old_log_prob=old_log_prob[:2],
+            log_prob=log_prob[:2],
+            advantages=advantages[:2],
+            response_mask=response_mask[:2],
+            config=cfg,
+            tree_total_segment_count=seg_counts[:2],
+            original_optimizer_batch_tree_count=1,
+        )[0]
+        # ratio == 1 -> L1 = -0.7, L2 = 0.3 (token means of -adv).
+        expected = torch.tensor((-0.7 + 0.3) / 4.0)
+        assert torch.allclose(loss_dense, expected, atol=1e-6)
+        assert torch.allclose(loss_sparse, expected, atol=1e-6)
+        assert torch.allclose(loss_dense, loss_sparse, atol=1e-6)
 
 
 class TestAllZeroBatchIsHandled:
@@ -121,7 +167,8 @@ class TestAllZeroBatchIsHandled:
             advantages=advantages,
             response_mask=response_mask,
             config=cfg,
-            original_optimizer_batch_slot_count=n_rows,
+            tree_total_segment_count=torch.full((n_rows,), 8.0),
+            original_optimizer_batch_tree_count=1,
         )[0]
         assert torch.allclose(loss, torch.zeros(()))
 

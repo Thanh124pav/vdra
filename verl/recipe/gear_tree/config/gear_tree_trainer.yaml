@@ -305,6 +305,13 @@ actor_rollout_ref:
       # in sync with `tree_policy.segment_token_reduction`.
       segment_token_reduction: mean
 
+      # Canonical normalization is the tree segment mean
+      # w_s = 1 / (N_T * N_seg(T)) with the PRE-FILTER
+      # tree_total_segment_count, so removing exact-zero-advantage rows
+      # leaves the loss unchanged. `true` selects the historical batch-slot
+      # mean over retained replay slots — a labeled LEGACY ablation only.
+      batch_slot_mean_ablation: false
+
     # No KL-in-loss by default (matches tree-family configs). KL coef = 0.
     use_kl_loss: false
 

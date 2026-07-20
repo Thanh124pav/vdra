@@ -116,13 +116,17 @@ class TestCanonicalLossUnchangedWithoutWeights:
             compute_segment_objective_weights(_edges()), dtype=torch.float32
         )
 
+        # Canonical path: one tree (N_T=1) of four pre-filter segments, so
+        # w_s = 1/(1*4) matches the precomputed segment_objective_weights.
+        seg_counts = torch.full((4,), 4.0)
         loss_without, *_ = compute_policy_loss_vdra_segment_mean(
             old_log_prob=old,
             log_prob=new,
             advantages=adv,
             response_mask=mask,
             config=self._Cfg(),
-            original_optimizer_batch_slot_count=4,
+            tree_total_segment_count=seg_counts,
+            original_optimizer_batch_tree_count=1,
         )
         (grad_without,) = torch.autograd.grad(loss_without, new, retain_graph=True)
 
@@ -133,7 +137,6 @@ class TestCanonicalLossUnchangedWithoutWeights:
             response_mask=mask,
             config=self._Cfg(),
             segment_objective_weights=weights,
-            original_optimizer_batch_slot_count=4,
         )
         (grad_with,) = torch.autograd.grad(loss_with, new)
 

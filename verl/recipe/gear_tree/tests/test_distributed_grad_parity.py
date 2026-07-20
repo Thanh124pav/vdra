@@ -1,11 +1,16 @@
-"""PLAN.md P0.I: REAL two-process distributed gradient parity.
+"""REAL two-process distributed gradient parity (batch-slot ablation).
 
-Production dispatch semantics being tested (verl FSDP/DDP data path):
+This exercises the preserved verl FSDP/DDP data-path contract on the labeled
+``batch_slot_mean_ablation`` loss (``L_B = sum_s L_s / N_B``), whose
+distributed scaling behavior is already verified and must NOT change during
+the medium stage. Real distributed parity for the CANONICAL tree-segment-mean
+weights ``w_s = 1/(N_T * N_seg(T))`` is a Hard-stage (H1) verification item.
+
+Production dispatch semantics being tested:
 
 * the 128-slot optimizer batch is sharded across DP ranks (disjoint rows);
-* each rank computes the vdra_segment_mean loss with its LOCAL slot count
-  as ``original_optimizer_batch_slot_count`` (dp_actor passes
-  ``len(mini_batch)``);
+* each rank computes the ablation loss with its LOCAL slot count as
+  ``original_optimizer_batch_slot_count`` (dp_actor passes ``len(mini_batch)``);
 * the reducer AVERAGES gradients across ranks (DDP semantics).
 
 Parity condition: average-of-rank-gradients == the single-process 128-slot
@@ -62,6 +67,7 @@ def _loss_config(reduction: str):
             loss_mode="vdra_segment_mean_ppo",
             segment_token_reduction=reduction,
             use_prob_mask=False,
+            batch_slot_mean_ablation=True,
         ),
     )
 

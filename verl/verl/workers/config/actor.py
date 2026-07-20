@@ -51,6 +51,13 @@ class PolicyLossConfig(BaseConfig):
         ratio_threshold (float): Diagnostic ratio threshold for VDRA losses.
             ``float('inf')`` disables the report (the canonical VDRA main path
             never uses this to drop microbatches — see PLAN.md P0.4).
+        batch_slot_mean_ablation (bool): Labeled LEGACY ablation for the VDRA
+            segment-mean loss. ``false`` (canonical) normalizes each row by
+            ``1 / (N_T * N_seg(T))`` using the pre-filter
+            ``tree_total_segment_count``, so removing exact-zero-advantage
+            rows leaves the loss unchanged. ``true`` selects the historical
+            batch-slot mean ``sum(L_s) / N_B`` over retained replay slots —
+            never the canonical denominator.
     """
 
     loss_mode: str = "vanilla"
@@ -62,6 +69,7 @@ class PolicyLossConfig(BaseConfig):
     segment_token_reduction: str = "mean"
     use_prob_mask: bool = True
     ratio_threshold: float = float("inf")
+    batch_slot_mean_ablation: bool = False
 
     def __post_init__(self):
         """PLAN.md P0.1: fail loudly on invalid segment_token_reduction.

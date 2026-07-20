@@ -182,22 +182,38 @@ Complete-tree replay remains an explicitly labeled ablation only.
 
 ## 1.3 Canonical policy objective
 
-For each internal PPO optimizer batch `B`:
+For each internal PPO optimizer batch `B`, every retained segment slot `s`
+is weighted by the tree it belongs to:
 
 \[
 L_B^{(r)}
 =
-\frac{1}{N_B}
-\sum_{s\in B}L_s^{(r)},
+\sum_{s\in B} w_s\, L_s^{(r)},
+\qquad
+w_s = \frac{1}{N_T \cdot N_{\mathrm{seg}}(T_s)},
 \qquad r\in\{\mathrm{mean},\mathrm{sum}\}.
 \]
 
-Normally `N_B=128`. Every selected replay slot has equal outer weight.
+`N_T` is the number of unique trees in the ORIGINAL optimizer batch (fixed
+before micro-batch splitting so the weight is split-invariant) and
+`N_seg(T)` is the PRE-FILTER `tree_total_segment_count` of the row's tree.
+Because `N_seg(T)` is the pre-filter count, removing exact-zero-advantage
+rows leaves the loss unchanged:
+
+```text
+advantages [pos, neg, 0, 0] -> retained [L1, L2]
+L_B = (L1 + L2 + 0 + 0) / 4 = (L1 + L2) / 4.
+```
+
+The batch-slot mean `L_B = (1/N_B) * sum_s L_s^{(r)}` over retained replay
+slots is a labeled LEGACY ablation
+(`actor.policy_loss.batch_slot_mean_ablation=true`) only — retained-slot
+counts shrink under zero filtering, so it is never the canonical
+denominator.
 
 The following must not affect canonical policy weight:
 
 ```text
-tree size
 parent group size
 allocated_k
 queue_flush_id
@@ -207,7 +223,10 @@ objective_weights
 segment_objective_weights
 ```
 
-Tree and queue counts remain construction/theory diagnostics.
+The canonical weight intentionally DOES depend on the pre-filter tree
+segment count `N_seg(T)` and the batch tree count `N_T`; these must never be
+reconnected to the manifest validity gate. Other tree and queue counts
+remain construction/theory diagnostics.
 
 ---
 

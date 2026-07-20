@@ -426,13 +426,22 @@ class DataParallelPPOActor(BasePPOActor):
         # PLAN.md P0.3: count actual optimizer.step() calls so the trainer can
         # advance ``global_step`` by the correct amount for this update.
         num_optimizer_steps = 0
-        # PLAN.md P0.3/P0.4: the original selected-slot count for this
-        # optimizer batch is used by the batch-slot mean loss (N_B) and must
-        # not shrink when micro/dynamic batching splits the mini_batch.
+        # The original selected-slot count for this optimizer batch feeds the
+        # labeled batch-slot ablation loss (N_B); the canonical VDRA loss uses
+        # the original batch's unique-tree count (N_T) instead. Both are fixed
+        # per mini_batch BEFORE micro/dynamic splitting so microbatch splits
+        # preserve the loss weights w_s = 1 / (N_T * N_seg(T)).
         original_optimizer_batch_slot_count = len(mini_batches[0]) if mini_batches else 0
+        original_optimizer_batch_tree_count = None
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 original_optimizer_batch_slot_count = len(mini_batch)
+                if "tree_group_ids" in mini_batch.batch.keys():
+                    original_optimizer_batch_tree_count = int(
+                        torch.unique(mini_batch.batch["tree_group_ids"]).numel()
+                    )
+                else:
+                    original_optimizer_batch_tree_count = None
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
@@ -532,16 +541,25 @@ class DataParallelPPOActor(BasePPOActor):
                         maybe = model_inputs.get(group_key, None)
                         if maybe is not None and group_key in policy_loss_fn.__code__.co_varnames:
                             loss_kwargs[group_key] = maybe
-                    # PLAN.md P0.4: batch-slot mean loss reads N_B from the
-                    # original optimizer batch's slot count (128 in the main
-                    # config), so microbatch splits do not shrink the
-                    # denominator.
+                    # The labeled batch-slot ablation reads N_B from the
+                    # original optimizer batch's slot count; the canonical
+                    # tree-segment-mean loss reads N_T from the original
+                    # batch's unique-tree count. Both are fixed before the
+                    # micro split so the denominators never shrink.
                     if (
                         "original_optimizer_batch_slot_count"
                         in policy_loss_fn.__code__.co_varnames
                     ):
                         loss_kwargs["original_optimizer_batch_slot_count"] = (
                             original_optimizer_batch_slot_count
+                        )
+                    if (
+                        original_optimizer_batch_tree_count is not None
+                        and "original_optimizer_batch_tree_count"
+                        in policy_loss_fn.__code__.co_varnames
+                    ):
+                        loss_kwargs["original_optimizer_batch_tree_count"] = (
+                            original_optimizer_batch_tree_count
                         )
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(**loss_kwargs)
 

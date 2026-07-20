@@ -342,13 +342,15 @@ class TestPolicyLossFieldReads:
                 ),
             )
 
+        seg_counts = torch.full((n,), float(t))
         loss_masked, *_ = compute_policy_loss_vdra_segment_mean(
             old_log_prob=old_log_prob,
             log_prob=log_prob,
             advantages=advantages,
             response_mask=response_mask,
             config=_cfg(True),
-            original_optimizer_batch_slot_count=n,
+            tree_total_segment_count=seg_counts,
+            original_optimizer_batch_tree_count=1,
         )
         loss_unmasked, *_ = compute_policy_loss_vdra_segment_mean(
             old_log_prob=old_log_prob,
@@ -356,7 +358,8 @@ class TestPolicyLossFieldReads:
             advantages=advantages,
             response_mask=response_mask,
             config=_cfg(False),
-            original_optimizer_batch_slot_count=n,
+            tree_total_segment_count=seg_counts,
+            original_optimizer_batch_tree_count=1,
         )
         assert torch.isclose(loss_masked, torch.tensor(0.0))
         assert not torch.isclose(loss_unmasked, loss_masked)
