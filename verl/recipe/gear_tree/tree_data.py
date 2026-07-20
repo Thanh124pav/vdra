@@ -651,16 +651,38 @@ def normalize_generated_edges(
             raise ValueError(
                 "Generated edge policy_snapshot_id mismatches rollout snapshot"
             )
-        response = list(record.get("response_token_ids") or [])
-        log_probs = record.get("actor_shifted_log_probs")
-        if log_probs is None:
-            raise ValueError(
-                "Generated edge is missing generation-time actor_shifted_log_probs"
-            )
-        if len(log_probs) != len(response):
-            raise ValueError(
-                "Generated edge log-probs do not align with response tokens"
-            )
+        is_slot = (
+            "trainable_edge_id" in record and record["trainable_edge_id"] is None
+        )
+        if is_slot:
+            # PLAN.md §1.2: metadata-only logical slot — same identity
+            # derivation as trainable edges, no payload checks. Its
+            # pre-filter response_token_count must already be stamped.
+            if int(record.get("response_token_count", 0) or 0) <= 0:
+                raise ValueError(
+                    "Generated logical slot is missing a positive "
+                    "response_token_count (PLAN.md §1.2)."
+                )
+            if float(record.get("advantage", 1.0) or 0.0) != 0.0:
+                raise ValueError(
+                    "Generated logical slot must carry exactly zero "
+                    "advantage (PLAN.md §1.2)."
+                )
+        else:
+            response = list(record.get("response_token_ids") or [])
+            log_probs = record.get("actor_shifted_log_probs")
+            if log_probs is None:
+                raise ValueError(
+                    "Generated edge is missing generation-time actor_shifted_log_probs"
+                )
+            if len(log_probs) != len(response):
+                raise ValueError(
+                    "Generated edge log-probs do not align with response tokens"
+                )
+            # PLAN.md §1.2: a trainable record that participates in the
+            # sparse ledger points at itself once its edge_id is final.
+            if "advantage_is_zero" in record:
+                record.setdefault("trainable_edge_id", record["edge_id"])
         record.setdefault("depth", int(record.get("depth", 0) or 0))
         record.setdefault("leaf", bool(record.get("leaf", False)))
         record.setdefault("pruned", bool(record.get("pruned", False)))

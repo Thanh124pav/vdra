@@ -220,6 +220,7 @@ async def build_tree_edges_async(
     treepo_global_weight: float = 0.5,
     treerl_gamma: float = 0.9,
     only_adv_greater_than_zero: bool = False,
+    emit_zero_slots: bool = False,
     vineppo_K: int = 0,
     unfinished_penalty: float = 0.0,
     demo_logger: Any = None,
@@ -270,6 +271,7 @@ async def build_tree_edges_async(
         tree_update_mode=tree_update_mode, treepo_global_weight=treepo_global_weight,
         treerl_gamma=treerl_gamma,
         emit_pruned_edges=False,
+        emit_zero_slots=emit_zero_slots,
         strict_fresh_iid=strict_fresh_iid,
         collect_construction_summaries=collect_construction_summaries,
     )

@@ -32,6 +32,35 @@ _REQUIRED_EDGE_FIELDS = (
     "reward",
 )
 
+# PLAN.md §1.2 (2026-07-21): a metadata-only logical slot for an exact-zero
+# advantage segment. It has no trainable payload but MUST carry enough
+# bookkeeping for reservation, per-question caps, divisibility and the
+# pre-filter M_B / T_B denominators.
+_REQUIRED_SLOT_FIELDS = (
+    "edge_id",
+    "question_id",
+    "tree_id",
+    "parent_group_id",
+    "advantage",
+    "response_token_count",
+)
+
+_SLOT_FORBIDDEN_PAYLOAD_FIELDS = (
+    "query_token_ids",
+    "response_token_ids",
+    "actor_shifted_log_probs",
+)
+
+
+def is_ledger_slot(edge: Mapping[str, Any]) -> bool:
+    """True for metadata-only zero-advantage logical slots (PLAN.md §1.2).
+
+    A slot is identified by an EXPLICIT ``trainable_edge_id=None`` marker —
+    dense zero-advantage rows (full payload, ``trainable_edge_id`` set to
+    their own id) are ordinary trainable records, never slots.
+    """
+    return "trainable_edge_id" in edge and edge["trainable_edge_id"] is None
+
 
 def compute_max_edges_per_question(
     tree_shape: Sequence[int],
@@ -852,6 +881,39 @@ class GearTreeReplayBuffer:
 
     @staticmethod
     def _validate_edge(edge: MutableMapping[str, Any]) -> None:
+        if is_ledger_slot(edge):
+            # PLAN.md §1.2: metadata-only logical slot for an exact-zero
+            # advantage segment. Strict bookkeeping, no trainable payload.
+            missing = [f for f in _REQUIRED_SLOT_FIELDS if f not in edge]
+            if missing:
+                raise ValueError(
+                    f"Replay logical slot is missing required fields: {missing}"
+                )
+            if float(edge["advantage"]) != 0.0:
+                raise ValueError(
+                    "Replay logical slot must carry exactly zero advantage "
+                    f"(PLAN.md §1.2); got {edge['advantage']!r}."
+                )
+            if not bool(edge.get("advantage_is_zero", False)):
+                raise ValueError(
+                    "Replay logical slot must stamp advantage_is_zero=True "
+                    "(PLAN.md §1.2)."
+                )
+            if int(edge.get("response_token_count", 0) or 0) <= 0:
+                raise ValueError(
+                    "Replay logical slot must record its positive pre-filter "
+                    "response_token_count — T_B cannot be reconstructed "
+                    "otherwise (PLAN.md §1.2)."
+                )
+            payload = [
+                f for f in _SLOT_FORBIDDEN_PAYLOAD_FIELDS if edge.get(f)
+            ]
+            if payload:
+                raise ValueError(
+                    "Replay logical slot must be metadata-only; found "
+                    f"trainable payload fields {payload} (PLAN.md §1.2)."
+                )
+            return
         missing = [field for field in _REQUIRED_EDGE_FIELDS if field not in edge]
         if missing:
             raise ValueError(f"Replay edge is missing required fields: {missing}")
