@@ -61,7 +61,7 @@ def _trainer_with_reservation(n_edges=2):
         actor_rollout_ref=_Cfg(
             actor=_Cfg(
                 ppo_mini_batch_size=1,
-                policy_loss={"loss_mode": "vdra_segment_mean_ppo"},
+                policy_loss={"loss_mode": "vdra_segment_mean_ppo", "policy_aggregation": "tree_balanced_segment_mean"},
             )
         ),
         gear_tree={
@@ -237,7 +237,7 @@ class TestFinalizeSuccessfulActorUpdate:
         trainer.config.actor_rollout_ref.actor = _Cfg(
             ppo_mini_batch_size=1,
             ppo_epochs=1,
-            policy_loss={"loss_mode": "vdra_segment_mean_ppo"},
+            policy_loss={"loss_mode": "vdra_segment_mean_ppo", "policy_aggregation": "tree_balanced_segment_mean"},
         )
         trainer._finalize_successful_actor_update(
             buffer,

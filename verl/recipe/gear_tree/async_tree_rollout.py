@@ -623,11 +623,17 @@ try:  # keep CPU-importable when agent_loop isn't installed
 
                 self._gate.set_terminal_reward_fn(_terminal_grader)
 
-            # Stage 1: the shipped main config sets only_adv_greater_than_zero
-            # to true, which removes exact-zero advantages after construction
-            # counts are stamped. The runtime fallback stays false only for
-            # legacy configs that omit the field.
+            # PLAN.md §1.2 (2026-07-21): only_adv_greater_than_zero=true now
+            # means SPARSE TENSOR EXECUTION — advantages are computed from
+            # the complete sibling set, then exact-zero children become
+            # metadata-only logical slots (emit_zero_slots) that stay in
+            # replay bookkeeping and the M_B/T_B denominators. The flag never
+            # removes slots from the objective. The runtime fallback stays
+            # false only for legacy configs that omit the field.
             construction_summaries: List[Dict[str, Any]] = []
+            _sparse_zero_execution = bool(
+                self._gt.get("only_adv_greater_than_zero", False)
+            )
             edges = await build_tree_edges_async(
                 prompt_text, prompt_ids, data_instance,
                 segment_generator=per_call_gen, reward_fn=self._reward_fn,
@@ -637,7 +643,8 @@ try:  # keep CPU-importable when agent_loop isn't installed
                 adv_method=self._gt.get("adv_method", "rloo"),
                 treepo_global_weight=self._gt.get("treepo_global_weight", 0.5),
                 treerl_gamma=self._gt.get("treerl_gamma", 0.9),
-                only_adv_greater_than_zero=self._gt.get("only_adv_greater_than_zero", False),
+                only_adv_greater_than_zero=_sparse_zero_execution,
+                emit_zero_slots=_sparse_zero_execution,
                 vineppo_K=self._gt.get("vineppo_K", 0),
                 gear_node_expander=self._node_expander,
                 policy_snapshot_id=snapshot_id,
@@ -672,11 +679,12 @@ try:  # keep CPU-importable when agent_loop isn't installed
                 metrics=AgentLoopMetrics(),
                 extra_fields={
                     "gear_tree_edges": edges,
-                    # Zero-filter contract: per-tree construction summaries
-                    # preserve realized/allocated facts even when a parent —
-                    # or the entire tree — retained no edges because every
-                    # child had exactly zero advantage. Zero rows themselves
-                    # never travel to replay.
+                    # Zero-filter contract (PLAN.md §1.2): per-tree
+                    # construction summaries preserve realized/allocated
+                    # facts. Under sparse execution the exact-zero children
+                    # travel to replay as metadata-only logical slots (never
+                    # as trainable rows), so reservation and the M_B/T_B
+                    # denominators keep the pre-filter counts.
                     "gear_tree_construction_summaries": construction_summaries,
                     # PLAN.md P1.R4: emit the resolved sampling params so
                     # downstream logging can prove which distribution the

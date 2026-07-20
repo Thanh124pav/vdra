@@ -8,6 +8,7 @@ instead of re-implementing it. This module stays engine-free (no torch / verl
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Mapping, Optional
 
 
@@ -47,6 +48,40 @@ def validate_policy_loss_consistency(
     tree_update_mode = str(gt.get("tree_update_mode", "spo"))
     tree_policy = config.get("tree_policy") or {}
     policy_agg = str(tree_policy.get("policy_aggregation", "legacy_token_mean"))
+    # PLAN.md §1.3 (2026-07-21): `global_segment_mean` was RENAMED to
+    # `tree_balanced_segment_mean` and its semantics stay the historical
+    # tree-balanced objective. Strict mode fails fast; non-strict legacy
+    # loading maps it with a deprecation warning. It NEVER maps to the new
+    # uniform `segment_mean` — that would silently change the objective of
+    # existing configs and checkpoints.
+    if policy_agg == "global_segment_mean":
+        if strict:
+            raise ValueError(
+                "`global_segment_mean` was renamed to "
+                "`tree_balanced_segment_mean`. Use `segment_mean` only if "
+                "uniform weighting over all original segment slots is "
+                "intended (PLAN.md §1.3)."
+            )
+        warnings.warn(
+            "tree_policy.policy_aggregation='global_segment_mean' is "
+            "deprecated; mapping to the tree_balanced_segment_mean ablation "
+            "(PLAN.md §1.3). Update the config to the new name.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        policy_agg = "tree_balanced_segment_mean"
+    _VALID_POLICY_AGGS = (
+        "token_mean",
+        "segment_mean",
+        "tree_balanced_segment_mean",
+        "legacy_token_mean",
+        "vdra_node_balanced",
+    )
+    if policy_agg not in _VALID_POLICY_AGGS:
+        raise ValueError(
+            f"tree_policy.policy_aggregation={policy_agg!r} is invalid; must "
+            f"be one of {_VALID_POLICY_AGGS} (PLAN.md §1.3)."
+        )
     actor_loss_mode = str(
         config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
     )
@@ -93,11 +128,16 @@ def validate_policy_loss_consistency(
             "actor_rollout_ref.actor.policy_loss.loss_mode=vdra_node_balanced_ppo "
             f"(PLAN.md M5); got {actor_loss_mode!r}."
         )
-    if policy_agg == "global_segment_mean" and actor_loss_mode != "vdra_segment_mean_ppo":
+    _SEGMENT_LOSS_AGGS = (
+        "token_mean",
+        "segment_mean",
+        "tree_balanced_segment_mean",
+    )
+    if policy_agg in _SEGMENT_LOSS_AGGS and actor_loss_mode != "vdra_segment_mean_ppo":
         raise ValueError(
-            "tree_policy.policy_aggregation=global_segment_mean requires "
+            f"tree_policy.policy_aggregation={policy_agg} requires "
             "actor_rollout_ref.actor.policy_loss.loss_mode=vdra_segment_mean_ppo "
-            f"(PLAN.md M5); got {actor_loss_mode!r}."
+            f"(PLAN.md §1.3/M5); got {actor_loss_mode!r}."
         )
     if actor_loss_mode == "vdra_node_balanced_ppo" and policy_agg != "vdra_node_balanced":
         raise ValueError(
@@ -105,11 +145,35 @@ def validate_policy_loss_consistency(
             "tree_policy.policy_aggregation=vdra_node_balanced "
             "(labeled ablation, PLAN.md M5)."
         )
+    # PLAN.md §1.3: `tree_policy.policy_aggregation` and
+    # `actor.policy_loss.policy_aggregation` are duplicates that MUST agree
+    # (same pattern as segment_token_reduction above), otherwise the actor
+    # loss silently optimizes a different objective than the manifest/logs
+    # advertise. The retired name is rejected at the actor level too.
+    if actor_loss_mode == "vdra_segment_mean_ppo":
+        actor_agg = str(
+            config.actor_rollout_ref.actor.policy_loss.get(
+                "policy_aggregation", "segment_mean"
+            )
+        ).strip().lower()
+        if actor_agg == "global_segment_mean":
+            raise ValueError(
+                "`global_segment_mean` was renamed to "
+                "`tree_balanced_segment_mean`. Use `segment_mean` only if "
+                "uniform weighting over all original segment slots is "
+                "intended (PLAN.md §1.3). (actor.policy_loss.policy_aggregation)"
+            )
+        if policy_agg in _SEGMENT_LOSS_AGGS and actor_agg != policy_agg:
+            raise ValueError(
+                f"tree_policy.policy_aggregation ({policy_agg!r}) must equal "
+                "actor_rollout_ref.actor.policy_loss.policy_aggregation "
+                f"({actor_agg!r}) (PLAN.md §1.3)."
+            )
 
     if strict:
-        # PLAN.md M5: the strict canonical main path must be the exact
-        # triple spo / global_segment_mean / vdra_segment_mean_ppo. This
-        # rejects the deprecated `_original` aliases AND the
+        # PLAN.md §1.3/M5: the strict canonical main path must be the exact
+        # triple spo / {segment_mean|token_mean} / vdra_segment_mean_ppo.
+        # This rejects the deprecated `_original` aliases AND the
         # `*_style_ablation` tree_update_modes on the canonical main path,
         # because neither is `spo`.
         if tree_update_mode != "spo":
@@ -119,11 +183,12 @@ def validate_policy_loss_consistency(
                 "treepo_style_ablation / treerl_style_ablation / *_original "
                 "modes are ablations — set strict_vdra=false to run them."
             )
-        if policy_agg != "global_segment_mean":
+        if policy_agg not in ("segment_mean", "token_mean"):
             raise ValueError(
                 "strict VDRA main runs require "
-                "tree_policy.policy_aggregation='global_segment_mean' "
-                f"(PLAN.md M5); got {policy_agg!r}. Set strict_vdra=false for "
+                "tree_policy.policy_aggregation in ('segment_mean', "
+                f"'token_mean') (PLAN.md §1.3); got {policy_agg!r}. Set "
+                "strict_vdra=false for the tree_balanced_segment_mean / "
                 "legacy_token_mean / vdra_node_balanced ablations."
             )
         if actor_loss_mode != "vdra_segment_mean_ppo":
@@ -131,4 +196,14 @@ def validate_policy_loss_consistency(
                 "strict VDRA main runs require "
                 "actor_rollout_ref.actor.policy_loss.loss_mode="
                 f"'vdra_segment_mean_ppo' (PLAN.md M5); got {actor_loss_mode!r}."
+            )
+        # PLAN.md §1.2 strict sparse-execution contract: exact-zero rows are
+        # filtered from TENSOR EXECUTION only, over the logical-slot ledger.
+        if not bool(gt.get("only_adv_greater_than_zero", False)):
+            raise ValueError(
+                "strict VDRA main runs require "
+                "gear_tree.only_adv_greater_than_zero=true — the sparse "
+                "tensor-execution policy over the logical-slot ledger "
+                "(corrected meaning, PLAN.md §1.2). Dense execution of zero "
+                "rows is not the canonical strict path."
             )

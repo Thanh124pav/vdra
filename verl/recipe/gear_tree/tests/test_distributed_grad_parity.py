@@ -1,16 +1,17 @@
-"""REAL two-process distributed gradient parity (batch-slot ablation).
+"""REAL two-process distributed gradient parity (canonical segment_mean).
 
-This exercises the preserved verl FSDP/DDP data-path contract on the labeled
-``batch_slot_mean_ablation`` loss (``L_B = sum_s L_s / N_B``), whose
-distributed scaling behavior is already verified and must NOT change during
-the medium stage. Real distributed parity for the CANONICAL tree-segment-mean
-weights ``w_s = 1/(N_T * N_seg(T))`` is a Hard-stage (H1) verification item.
+This exercises the verl FSDP/DDP data-path contract on the CANONICAL
+``policy_aggregation='segment_mean'`` loss (PLAN.md §1.3):
+``L_local = dp_size * sum_local(L_s) / M_B`` with the GLOBAL pre-filter
+logical-batch slot count ``M_B`` and the measured average reducer.
 
 Production dispatch semantics being tested:
 
-* the 128-slot optimizer batch is sharded across DP ranks (disjoint rows);
-* each rank computes the ablation loss with its LOCAL slot count as
-  ``original_optimizer_batch_slot_count`` (dp_actor passes ``len(mini_batch)``);
+* the 128-slot logical optimizer batch is sharded across DP ranks
+  (disjoint rows);
+* each rank divides its LOCAL numerator by the GLOBAL ``M_B`` (stamped by
+  the trainer) and multiplies by the dp size (dp_actor's
+  ``loss_scale_factor``) to cancel the averaging reducer;
 * the reducer AVERAGES gradients across ranks (DDP semantics).
 
 Parity condition: average-of-rank-gradients == the single-process 128-slot
@@ -76,12 +77,14 @@ def _loss_config(reduction: str):
             loss_mode="vdra_segment_mean_ppo",
             segment_token_reduction=reduction,
             use_prob_mask=False,
-            batch_slot_mean_ablation=True,
+            policy_aggregation="segment_mean",
         ),
     )
 
 
-def _compute_loss(model, rows, reduction: str):
+def _compute_loss(model, rows, reduction: str, *, dp_scale: float = 1.0):
+    """Canonical segment_mean: LOCAL numerator over the GLOBAL M_B, times
+    the dp-size reducer compensation (dp_actor's loss_scale_factor)."""
     from recipe.gear_tree.policy_loss import (
         compute_policy_loss_vdra_segment_mean,
     )
@@ -94,9 +97,9 @@ def _compute_loss(model, rows, reduction: str):
         advantages=advantages,
         response_mask=response_mask,
         config=_loss_config(reduction),
-        original_optimizer_batch_slot_count=features.shape[0],
+        original_logical_segment_count=N_ROWS,
     )
-    return loss
+    return loss * dp_scale
 
 
 def _reference_grads(reduction: str):
@@ -127,9 +130,9 @@ def _worker(rank: int, world_size: int, rdv_file: str, reduction: str):
             response_mask[shard],
         )
 
-        # Production denominator: the LOCAL slot count (dp_actor passes
-        # len(mini_batch) on each rank).
-        loss = _compute_loss(ddp_model, local_rows, reduction)
+        # Production semantics (PLAN.md §1.3): LOCAL numerator over the
+        # GLOBAL M_B, scaled by dp_size so the averaging reducer cancels.
+        loss = _compute_loss(ddp_model, local_rows, reduction, dp_scale=world_size)
         loss.backward()  # DDP averages gradients across ranks here.
 
         reference = _reference_grads(reduction)
@@ -175,31 +178,18 @@ def test_shards_are_disjoint_and_cover_the_batch():
     assert rows0 | rows1 == set(range(N_ROWS))
 
 
-def test_average_reducer_with_global_denominator_is_the_trap():
-    """Regression documentation (single process, no spawn): passing the
-    GLOBAL 128 as N_B on each rank while the reducer averages would halve
-    the gradient — production must pass the LOCAL slot count instead."""
+def test_unscaled_global_denominator_is_the_trap():
+    """Regression documentation (single process, no spawn): dividing the
+    LOCAL numerator by the GLOBAL M_B WITHOUT the dp-size factor would let
+    the averaging reducer halve the gradient — dp_actor must multiply by
+    the actual dp size (PLAN.md §1.3, measured in
+    docs/h1_fsdp_parity_report.md)."""
     model = _make_model()
     rows = _make_batch()
-    full_loss = _compute_loss(model, rows, "mean")
 
     half = slice(0, N_ROWS // 2)
     local_rows = tuple(t[half] for t in rows)
-    from recipe.gear_tree.policy_loss import (
-        compute_policy_loss_vdra_segment_mean,
-    )
-
-    features, old_log_prob, advantages, response_mask = local_rows
-    log_prob = model(features).squeeze(-1)
-    loss_global_nb, *_ = compute_policy_loss_vdra_segment_mean(
-        old_log_prob=old_log_prob,
-        log_prob=log_prob,
-        advantages=advantages,
-        response_mask=response_mask,
-        config=_loss_config("mean"),
-        original_optimizer_batch_slot_count=N_ROWS,  # WRONG under averaging
-    )
-    loss_local_nb = _compute_loss(model, local_rows, "mean")
-    # With the global denominator the local loss is half the local-N_B loss:
-    assert torch.allclose(loss_global_nb * 2, loss_local_nb, atol=1e-6)
-    del full_loss
+    unscaled = _compute_loss(model, local_rows, "mean", dp_scale=1.0)
+    scaled = _compute_loss(model, local_rows, "mean", dp_scale=WORLD_SIZE)
+    # Without the dp-size factor the local loss is half the compensated one:
+    assert torch.allclose(unscaled * 2, scaled, atol=1e-6)

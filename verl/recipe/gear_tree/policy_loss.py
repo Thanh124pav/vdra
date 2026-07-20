@@ -5,16 +5,17 @@ Three losses are registered here:
 * ``treetune_ppo`` — the byte-faithful port of treetune's
   ``PPOTrainer._compute_actor_loss`` used by SPO/TreeRL/TreePO/GEAR-*. Kept as
   the SPO baseline and legacy aggregation; see the module docstring below.
-* ``vdra_segment_mean_ppo`` — canonical main-run loss. It applies configurable
-  within-segment token reduction and normalizes each retained row by the tree
-  segment mean ``w_s = 1 / (N_T * N_seg(T))``, where ``N_T`` is the unique-tree
-  count of the ORIGINAL optimizer batch and ``N_seg(T)`` is the PRE-FILTER
-  ``tree_total_segment_count`` — so removing exact-zero-advantage rows leaves
-  the loss unchanged. The historical batch-slot mean over retained replay
-  slots survives only behind the labeled ``batch_slot_mean_ablation`` flag.
-  No float ``segment_objective_weights`` tensor is needed on the canonical
-  path (it is derived from the integer counts); that tensor belongs only to
-  the explicit node-balanced ablation.
+* ``vdra_segment_mean_ppo`` — canonical main-run loss family
+  (PLAN.md §1.3, 2026-07-21). ``policy_loss.policy_aggregation`` selects:
+  ``segment_mean`` (canonical DEFAULT — every original logical segment slot
+  weighs ``1/M_B``), ``token_mean`` (every original valid token weighs
+  ``1/T_B``), or ``tree_balanced_segment_mean`` (labeled ABLATION — the
+  historical ``w_s = 1 / (N_T * N_seg(T))`` tree-balanced objective). The
+  canonical denominators ``M_B``/``T_B`` are the PRE-FILTER logical-batch
+  counts stamped by the trainer (zero-advantage slots included), so sparse
+  tensor execution never changes the objective. No float
+  ``segment_objective_weights`` tensor is needed on any canonical path;
+  that tensor belongs only to the explicit node-balanced ablation.
 * ``vdra_node_balanced_ppo`` — legacy parent-balanced ablation. NOT the main
   VDRA path (PLAN.md P0.1). Kept for controlled comparison runs; it must not
   be selected by the main config.
@@ -403,17 +404,14 @@ def compute_policy_loss_vdra_segment_mean(
     ``L_s^r`` is either ``TokenMean(pg_row)`` (``r=mean``) or the raw token
     sum (``r=sum``).
 
-    Labeled legacy batch-slot ablation
-    ---------------------------------
-    ``policy_loss.batch_slot_mean_ablation=true`` selects the pre-zero-filter
-    batch-slot mean ``L_B = (1/N_B) * sum_s L_s^r`` with
-    ``N_B = original_optimizer_batch_slot_count`` (the retained replay-slot
-    count). It is NOT the canonical denominator — retained-slot counts shrink
-    under zero filtering — and exists only as an explicitly labeled ablation.
+    Retired ``batch_slot_mean_ablation`` flag
+    -----------------------------------------
+    The flag's mathematics IS the canonical ``segment_mean``; configs that
+    still set it fail fast with a migration message (PLAN.md §1.3).
 
     Legacy tree-average fallbacks
     -----------------------------
-    When neither the canonical inputs nor the ablation flag are present,
+    When the tree-balanced ablation inputs are absent,
     ``segment_objective_weights`` (precomputed ``w_s``) or
     ``(tree_group_ids, tree_total_segment_count)`` reproduce the same
     tree-average identity for unit tests; the derived fallback computes
@@ -447,9 +445,7 @@ def compute_policy_loss_vdra_segment_mean(
     row_losses = _segment_row_losses(pg_losses, action_mask, reduction=reduction)
 
     policy_aggregation = str(
-        _resolve_policy_loss_field(
-            config, "policy_aggregation", "tree_balanced_segment_mean"
-        )
+        _resolve_policy_loss_field(config, "policy_aggregation", "segment_mean")
     ).strip().lower()
     if policy_aggregation == "global_segment_mean":
         raise ValueError(
@@ -468,19 +464,19 @@ def compute_policy_loss_vdra_segment_mean(
             "'tree_balanced_segment_mean'} (PLAN.md §1.3)."
         )
 
-    batch_slot_mean_ablation = bool(
-        _resolve_policy_loss_field(config, "batch_slot_mean_ablation", False)
-    )
+    # PLAN.md §1.3: the batch_slot_mean_ablation flag was RETIRED — its
+    # mathematics IS the canonical segment_mean. Reject configs that still
+    # set it instead of silently ignoring them.
+    if bool(_resolve_policy_loss_field(config, "batch_slot_mean_ablation", False)):
+        raise ValueError(
+            "policy_loss.batch_slot_mean_ablation was retired (PLAN.md §1.3): "
+            "its mathematics is exactly policy_aggregation='segment_mean'. "
+            "Remove the flag and set policy_aggregation explicitly."
+        )
     if policy_aggregation in ("segment_mean", "token_mean"):
         # Canonical paper objectives — pre-filter LOGICAL batch denominators
-        # only. No retained-row fallback, no tree-count approximation, no
-        # interplay with the legacy ablation flag (PLAN.md §1.3).
-        if batch_slot_mean_ablation:
-            raise ValueError(
-                "policy_loss.batch_slot_mean_ablation is a legacy ablation "
-                "flag and cannot be combined with the canonical "
-                f"policy_aggregation={policy_aggregation!r} (PLAN.md §1.3)."
-            )
+        # only. No retained-row fallback, no tree-count approximation
+        # (PLAN.md §1.3).
         if policy_aggregation == "segment_mean":
             if original_logical_segment_count is None:
                 raise ValueError(
@@ -532,34 +528,20 @@ def compute_policy_loss_vdra_segment_mean(
         pg_clipfrac_lower = torch.zeros((), dtype=pg_loss.dtype, device=pg_loss.device)
         return pg_loss, pg_clipfrac, approx_kl, pg_clipfrac_lower
 
-    if batch_slot_mean_ablation:
-        # Labeled legacy batch-slot ablation — NOT the canonical denominator.
-        # Retained-slot counts shrink under zero-advantage filtering, so this
-        # path is reachable only via the explicit config flag.
-        if original_optimizer_batch_slot_count is None:
-            raise ValueError(
-                "policy_loss.batch_slot_mean_ablation=true requires "
-                "original_optimizer_batch_slot_count from the actor."
-            )
-        n_b = int(original_optimizer_batch_slot_count)
-        if n_b <= 0:
-            raise ValueError(
-                "original_optimizer_batch_slot_count must be > 0 for the "
-                "batch-slot ablation loss."
-            )
-        pg_loss = row_losses.sum() / float(n_b)
-    elif (
+    if (
         original_optimizer_batch_tree_count is not None
         and tree_total_segment_count is not None
     ):
-        # Canonical main path: w_s = 1 / (N_T * N_seg(T)) with N_T fixed from
-        # the ORIGINAL optimizer batch (microbatch-split invariant) and
-        # N_seg(T) the pre-filter tree_total_segment_count per row.
+        # tree_balanced_segment_mean ABLATION: w_s = 1 / (N_T * N_seg(T))
+        # with N_T fixed from the ORIGINAL optimizer batch (microbatch-split
+        # invariant) and N_seg(T) the pre-filter tree_total_segment_count per
+        # row. Measured NON-parity under multi-rank FSDP dispatch
+        # (docs/h1_fsdp_parity_report.md) — never a main-run objective.
         n_tree = int(original_optimizer_batch_tree_count)
         if n_tree <= 0:
             raise ValueError(
                 "original_optimizer_batch_tree_count must be > 0 for the "
-                "canonical VDRA tree-segment-mean loss."
+                "VDRA tree-balanced segment-mean ablation."
             )
         counts = tree_total_segment_count.to(
             dtype=row_losses.dtype, device=row_losses.device
@@ -594,13 +576,15 @@ def compute_policy_loss_vdra_segment_mean(
         pg_loss = (w * row_losses).sum()
     else:
         raise ValueError(
-            "vdra_segment_mean_ppo requires either "
+            "vdra_segment_mean_ppo with "
+            "policy_aggregation='tree_balanced_segment_mean' requires either "
             "(original_optimizer_batch_tree_count, tree_total_segment_count) "
-            "for the canonical tree-segment-mean path, "
-            "policy_loss.batch_slot_mean_ablation=true with "
-            "original_optimizer_batch_slot_count for the labeled legacy "
-            "ablation, or segment_objective_weights / (tree_group_ids, "
-            "tree_total_segment_count) for the legacy tree-average fallback."
+            "for the split-invariant ablation path, or "
+            "segment_objective_weights / (tree_group_ids, "
+            "tree_total_segment_count) for the legacy tree-average fallback. "
+            "The canonical paper objectives use "
+            "policy_aggregation='segment_mean'/'token_mean' with the "
+            "trainer-stamped logical denominators (PLAN.md §1.3)."
         )
 
     # Report ratio as a metric.

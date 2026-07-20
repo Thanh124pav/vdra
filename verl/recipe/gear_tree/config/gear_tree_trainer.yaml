@@ -231,17 +231,25 @@ tree_policy:
   # Values: spo_local | configured_ablation.
   advantage_mode: spo_local
 
-  # policy_aggregation selects the actor loss reduction. Main VDRA is
-  # `global_segment_mean` (PLAN.md P0.1): segment contributions use the
-  # canonical 1/(N_T * N_seg(T)) objective. Tree/queue count tensors remain
-  # diagnostics and validation inputs until the Medium manifest cleanup.
+  # policy_aggregation selects the actor loss reduction (PLAN.md §1.3,
+  # user decision 2026-07-21 — the paper objective).
   #
   # Values:
-  #   * global_segment_mean  — canonical main-run (PLAN.md P0.1).
+  #   * segment_mean         — canonical DEFAULT: every original logical
+  #                             segment slot has equal weight 1/M_B
+  #                             (pre-filter logical-batch slot count).
+  #   * token_mean           — canonical option: every original valid token
+  #                             has equal weight 1/T_B (pre-filter
+  #                             logical-batch token count).
+  #   * tree_balanced_segment_mean — labeled ABLATION: the historical
+  #                             1/(N_T * N_seg(T)) tree-balanced objective
+  #                             (formerly named `global_segment_mean`; the
+  #                             old name fails fast in strict mode).
   #   * vdra_node_balanced   — legacy parent-balanced ablation. Do NOT use
   #                             for main runs; kept for controlled ablations.
-  #   * legacy_token_mean    — SPO baseline / ablation.
-  policy_aggregation: global_segment_mean
+  #   * legacy_token_mean    — SPO baseline / ablation (verl-native
+  #                             token-mean; NOT the paper token_mean).
+  policy_aggregation: segment_mean
 
   # PLAN.md P0.1: within-segment token reduction. Must be exactly `mean` or
   # `sum`. `mean` is the canonical/default main setting; `sum` is a supported
@@ -304,12 +312,13 @@ actor_rollout_ref:
       # in sync with `tree_policy.segment_token_reduction`.
       segment_token_reduction: mean
 
-      # Canonical normalization is the tree segment mean
-      # w_s = 1 / (N_T * N_seg(T)) with the PRE-FILTER
-      # tree_total_segment_count, so removing exact-zero-advantage rows
-      # leaves the loss unchanged. `true` selects the historical batch-slot
-      # mean over retained replay slots — a labeled LEGACY ablation only.
-      batch_slot_mean_ablation: false
+      # PLAN.md §1.3: the same aggregation must be visible on
+      # `actor.policy_loss` because the loss reads it via `config`
+      # (ActorConfig). Keep it in sync with `tree_policy.policy_aggregation`.
+      # Canonical: uniform segment mean over the PRE-FILTER logical-batch
+      # slot count M_B (zero-advantage slots stay in the denominator even
+      # though they carry no tensor rows — sparse execution, PLAN.md §1.2).
+      policy_aggregation: segment_mean
 
     # No KL-in-loss by default (matches tree-family configs). KL coef = 0.
     use_kl_loss: false

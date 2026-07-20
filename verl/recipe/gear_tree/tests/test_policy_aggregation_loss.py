@@ -122,14 +122,15 @@ class TestSegmentMean:
                 original_logical_segment_count=0,
             )
 
-    def test_legacy_flag_conflict_fails(self):
+    def test_retired_batch_slot_flag_on_dict_config_fails(self):
+        # PLAN.md §1.3: the retired flag is rejected (its math IS
+        # segment_mean). PolicyLossConfig no longer has the field, so this
+        # simulates a dict-shaped config that still carries it.
         rows = _rows([0.7], lengths=[2])
+        cfg = _config(aggregation="segment_mean")
+        object.__setattr__(cfg.policy_loss, "batch_slot_mean_ablation", True)
         with pytest.raises(ValueError, match="batch_slot_mean_ablation"):
-            _loss(
-                _config(aggregation="segment_mean", batch_slot_mean_ablation=True),
-                rows,
-                original_logical_segment_count=4,
-            )
+            _loss(cfg, rows, original_logical_segment_count=4)
 
 
 class TestTokenMean:
@@ -222,10 +223,10 @@ class TestAggregationModesDiffer:
 
 
 class TestSchemaGuards:
-    def test_default_aggregation_is_still_tree_balanced_until_flip(self):
+    def test_default_aggregation_is_segment_mean(self):
         from verl.workers.config.actor import PolicyLossConfig
 
-        assert PolicyLossConfig().policy_aggregation == "tree_balanced_segment_mean"
+        assert PolicyLossConfig().policy_aggregation == "segment_mean"
 
     def test_retired_global_segment_mean_rejected_with_rename_message(self):
         from verl.workers.config.actor import PolicyLossConfig

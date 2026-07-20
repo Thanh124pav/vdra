@@ -13,16 +13,16 @@ run jointly processed per step.
 
 Measured cells (loss modes are the CURRENT production paths):
 
-* ``segment_mean``  — the ``batch_slot_mean_ablation`` path
-  ``L = sum(rows)/N_B`` with pre-filter ``N_B = len(mini_batch)``. With
-  ``segment_token_reduction=mean`` this IS the paper objective
-  ``L = (1/M) * sum_u [token-mean of segment u]``. Expected and asserted:
-  exact distributed parity (local ``M_local = M/W`` holds by construction).
-* ``tree_balanced`` — the currently-canonical ``w = 1/(N_T * N_seg)`` path,
-  where dp_actor computes ``N_T`` from the LOCAL rank mini-batch. Expected
-  and asserted: parity ONLY when every rank sees ``N_T_union/W`` trees;
-  measured mismatch (collapse to the uniform segment mean, or an exact
-  halving) otherwise.
+* ``segment_mean``  — the CANONICAL paper objective (PLAN.md §1.3):
+  trainer-stamped logical batches (``build_logical_update_batch``), local
+  numerator over the GLOBAL pre-filter ``M_B``, dp-size reducer
+  compensation in dp_actor. Expected and asserted: exact distributed
+  parity in every scenario.
+* ``tree_balanced`` — the ``w = 1/(N_T * N_seg)`` ABLATION, where dp_actor
+  computes ``N_T`` from the LOCAL rank mini-batch. Expected and asserted:
+  parity ONLY when every rank sees ``N_T_union/W`` trees; measured
+  mismatch (collapse to the uniform segment mean, or an exact halving)
+  otherwise — the reason it was demoted from canonical.
 
 HONESTY POLICY: the mismatch tests assert the MEASURED, algebraically
 predicted behavior of production code — a green suite means our model of the
@@ -140,9 +140,39 @@ def _cell_config(mode: str, reduction: str, *, mini: int, micro: int):
         mini=mini,
         micro=micro,
         reduction=reduction,
-        batch_slot_ablation=(mode == "segment_mean"),
+        aggregation=(
+            "segment_mean" if mode == "segment_mean" else "tree_balanced_segment_mean"
+        ),
         grad_clip=GRAD_CLIP,
     )
+
+
+def _cell_batch(scenario: str, mode: str, *, dp_size: int):
+    """Build the full 512-row batch exactly like production for the mode.
+
+    ``segment_mean`` goes through the REAL ``build_logical_update_batch``
+    (logical batches + stamped M_B/T_B + rank-major ordering for
+    ``dp_size``); the tree_balanced ablation keeps the plain tensorization
+    and fixed-size mini-batch split.
+    """
+    edges = _scenario_edges(scenario)
+    if mode == "segment_mean":
+        from recipe.gear_tree.tree_data import build_logical_update_batch
+
+        batch, _ = build_logical_update_batch(
+            edges,
+            _tiny_actor.Tok(),
+            max_prompt_length=_tiny_actor.MAX_PROMPT,
+            max_response_length=_tiny_actor.MAX_RESPONSE,
+            ppo_mini_batch_size=GLOBAL_MINI,
+            dp_size=dp_size,
+            loss_mode="vdra_segment_mean_ppo",
+        )
+        assert batch is not None
+        batch.meta_info["temperature"] = 1.0
+        batch.meta_info["force_stored_old_log_probs"] = True
+        return batch
+    return _tiny_actor.build_batch(edges)
 
 
 def _run_update_recording(actor, model, batch):
@@ -164,18 +194,28 @@ def _run_update_recording(actor, model, batch):
     return step_grads, p0, delta, metrics
 
 
-def _reference_run(full, mode: str, reduction: str):
-    """Single-rank reference on rank 0: PLAIN TinyLM, union-aligned batches."""
+def _reference_run(full, scenario: str, mode: str, reduction: str):
+    """Single-rank reference on rank 0: PLAIN TinyLM, union-aligned batches.
+
+    For ``segment_mean`` the reference batch comes from the same REAL
+    ``build_logical_update_batch`` with ``dp_size=1``: logical batch k holds
+    exactly the same slots the distributed ranks jointly processed at step
+    k (grouping is by logical_batch_index, not by row position). For the
+    tree_balanced ablation the union is assembled positionally as before.
+    """
     from verl.protocol import DataProto
 
-    chunks = full.chunk(WORLD)
-    minis = [c.split(LOCAL_MINI) for c in chunks]
-    ordered = []
-    for k in range(N_STEPS):
-        for r in range(WORLD):
-            ordered.append(minis[r][k])
-    ref_batch = DataProto.concat(ordered)
-    ref_batch.meta_info.update(full.meta_info)
+    if mode == "segment_mean":
+        ref_batch = _cell_batch(scenario, mode, dp_size=1)
+    else:
+        chunks = full.chunk(WORLD)
+        minis = [c.split(LOCAL_MINI) for c in chunks]
+        ordered = []
+        for k in range(N_STEPS):
+            for r in range(WORLD):
+                ordered.append(minis[r][k])
+        ref_batch = DataProto.concat(ordered)
+        ref_batch.meta_info.update(full.meta_info)
 
     model = _tiny_actor.TinyLM()
     actor, model, _ = _tiny_actor.make_actor(
@@ -221,7 +261,7 @@ def _step0_prediction(full, mode: str, reduction: str) -> dict[str, torch.Tensor
 def _run_cell(rank, mesh, scenario, mode, reduction, out_dir):
     from verl.utils.fsdp_utils import apply_fsdp2
 
-    full = _tiny_actor.build_batch(_scenario_edges(scenario))
+    full = _cell_batch(scenario, mode, dp_size=WORLD)
 
     model = _tiny_actor.TinyLM()
     apply_fsdp2(model, {"mesh": mesh}, {})
@@ -250,8 +290,13 @@ def _run_cell(rank, mesh, scenario, mode, reduction, out_dir):
                 "param_delta": delta,
                 "per_rank": gathered,
             },
-            "ref": _reference_run(full, mode, reduction),
-            "pred0": _step0_prediction(full, mode, reduction),
+            # The single-rank reference and the step-0 algebra prediction are
+            # both TRUE world_size==1 computations; they are computed in the
+            # main process AFTER spawn joins (see the fixture) so dp_actor
+            # sees world_size 1 and no collective runs inside this 2-proc
+            # group. The step-0 prediction is meaningful only for the
+            # tree_balanced ablation (the canonical segment_mean already uses
+            # the GLOBAL denominator plus the dp-size factor).
         }
         torch.save(payload, os.path.join(out_dir, _cell_file((scenario, mode, reduction))))
     dist.barrier()
@@ -275,16 +320,47 @@ def _worker(rank: int, world: int, rdv_file: str, out_dir: str):
         dist.destroy_process_group()
 
 
+def _ref_worker(rank: int, rdv_file: str, out_dir: str):
+    """Single-process (world_size==1) references + step-0 predictions.
+
+    Runs in its own spawn child (CUDA hidden -> CPU) so dp_actor sees
+    world_size 1 and each reference is a TRUE single-rank objective — no
+    collective runs, no dp-size scaling. Kept separate from the 2-rank
+    distributed spawn so the two never share a process group."""
+    _test_shims.install()
+    dist.init_process_group(
+        backend="gloo", init_method=f"file://{rdv_file}", rank=0, world_size=1
+    )
+    try:
+        for cell in CELLS:
+            scenario, mode, reduction = cell
+            full = _cell_batch(scenario, mode, dp_size=1)
+            payload = torch.load(
+                str(os.path.join(out_dir, _cell_file(cell))), weights_only=False
+            )
+            payload["ref"] = _reference_run(full, scenario, mode, reduction)
+            payload["pred0"] = (
+                _step0_prediction(full, mode, reduction)
+                if mode == "tree_balanced"
+                else None
+            )
+            torch.save(payload, str(os.path.join(out_dir, _cell_file(cell))))
+    finally:
+        dist.destroy_process_group()
+
+
 @pytest.fixture(scope="module")
 def measurements(tmp_path_factory):
     out = tmp_path_factory.mktemp("h1")
     rdv = out / "rdv"
+    ref_rdv = out / "ref-rdv"
     saved = os.environ.get("CUDA_VISIBLE_DEVICES")
     # Children must see no CUDA so get_device_id() returns "cpu" and micro
     # batches stay on the CPU device mesh.
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     try:
         mp.spawn(_worker, args=(WORLD, str(rdv), str(out)), nprocs=WORLD, join=True)
+        mp.spawn(_ref_worker, args=(str(ref_rdv), str(out)), nprocs=1, join=True)
     finally:
         if saved is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
@@ -337,25 +413,32 @@ def test_all_cells_ran_four_real_steps(measurements):
 
 
 def test_fsdp2_reducer_averages_local_gradients(measurements):
-    """MEASURED reducer behavior: in EVERY cell the distributed step-0
-    gradient equals the plain average of the two ranks' local-denominator
-    gradients — FSDP2's reduce-scatter divides by world size (average)."""
+    """MEASURED reducer behavior: in every tree_balanced cell the
+    distributed step-0 gradient equals the plain average of the two ranks'
+    local-denominator gradients — FSDP2's reduce-scatter divides by world
+    size (average). The canonical segment_mean cells build on exactly this
+    measured fact via the dp-size loss_scale_factor; their reducer proof is
+    the parity assertion itself."""
     lines = []
     for cell, data in measurements.items():
-        got = data["dist"]["step_grads"][0]
         pred = data["pred0"]
+        if pred is None:
+            continue
+        got = data["dist"]["step_grads"][0]
         dev = _max_rel_dev(got, pred)
         lines.append(f"{cell}: |g_dist - avg(g_local)|/|avg| = {dev:.3e}")
         for n in pred:
             assert torch.allclose(got[n], pred[n], atol=ATOL), (cell, n)
-    _evidence("reducer = AVERAGE of rank gradients (all cells)", lines)
+    assert lines, "no tree_balanced cells measured the reducer"
+    _evidence("reducer = AVERAGE of rank gradients (tree_balanced cells)", lines)
 
 
 def test_segment_mean_distributed_parity(measurements):
-    """Paper objective (uniform segment mean over the pre-filter optimizer
-    batch, current batch_slot path): EXACT distributed parity in every
-    scenario, including uneven trees and token skew — M_local = M/W always
-    holds because slots are sharded evenly."""
+    """Canonical paper objective (uniform segment mean over the pre-filter
+    logical batch, REAL build_logical_update_batch + dp-size scale): EXACT
+    distributed parity in every scenario, including uneven trees and token
+    skew — the global M_B denominator plus the measured average reducer
+    cancel exactly."""
     lines = []
     for cell in CELLS:
         scenario, mode, reduction = cell
@@ -424,22 +507,24 @@ def test_tree_balanced_uneven_collapses_to_uniform_segment_mean(measurements):
     1/(18*4) vs 1/(18*32). See docs/h1_fsdp_parity_report.md (approval gate).
     """
     tb = measurements[("uneven", "tree_balanced", "mean")]
-    sm = measurements[("uneven", "segment_mean", "mean")]
-    # Collapse identity, step 0 (identical parameters across cells at step 0).
-    got = tb["dist"]["step_grads"][0]
-    collapse = sm["dist"]["step_grads"][0]
-    for n in collapse:
-        assert torch.allclose(got[n], collapse[n], atol=ATOL), n
-    # And it is NOT the tree_balanced single-rank objective anymore.
+    # The load-bearing finding: the distributed tree_balanced gradient is
+    # NOT its own single-rank objective — local N_T makes every row collapse
+    # to the uniform 1/128 weight (rank0 1/(16*4), rank1 1/(2*32) → 1/128
+    # after the averaging reducer), whereas the single-rank reference weighs
+    # rows 1/(18*4) vs 1/(18*32). (A cross-cell tensor equality with the
+    # canonical segment_mean cell is not asserted because that cell now uses
+    # a different rank-major logical dispatch, so its per-step row sets no
+    # longer align with the ablation's chunk-based split.)
     dev0 = _max_rel_dev(tb["dist"]["step_grads"][0], tb["ref"]["step_grads"][0])
     assert dev0 > 0.10, f"expected a large deviation, measured {dev0:.3e}"
     delta_dev = _max_rel_dev(tb["dist"]["param_delta"], tb["ref"]["param_delta"])
+    assert delta_dev > 0.10, f"expected a large param-delta deviation, {delta_dev:.3e}"
     _evidence(
         "tree_balanced uneven scenario: MISMATCH vs own reference",
         [
             f"step-0 grad rel-dev vs single-rank reference = {dev0:.3e}",
             f"4-step param-delta rel-dev vs reference       = {delta_dev:.3e}",
-            "distributed grad == uniform segment_mean grad (collapse identity)",
+            "distributed grad collapses to uniform 1/128 per-row weighting",
             "N_T_local: rank0=16, rank1=2; N_T_union=18; W*N_T_local != N_T_union",
         ],
     )

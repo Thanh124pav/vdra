@@ -21,10 +21,13 @@ from typing import Any, Dict, Optional
 
 
 # Canonical values used by the manifest — mirror the tree_policy config.
-# PLAN.md P0.1 / P0.6: the main VDRA path uses `global_segment_mean`; the
-# legacy parent-balanced value is preserved for ablation runs but is NOT a
-# valid main-run choice.
-POLICY_AGGREGATION_SEGMENT_MEAN = "global_segment_mean"
+# PLAN.md §1.3 (2026-07-21): the main VDRA path uses the paper objectives
+# `segment_mean` (default) or `token_mean`. The historical tree-balanced
+# objective (formerly named `global_segment_mean`) and the parent-balanced
+# value are preserved for ablation runs but are NOT valid main-run choices.
+POLICY_AGGREGATION_SEGMENT_MEAN = "segment_mean"
+POLICY_AGGREGATION_TOKEN_MEAN = "token_mean"
+POLICY_AGGREGATION_TREE_BALANCED = "tree_balanced_segment_mean"  # ablation
 POLICY_AGGREGATION_VDRA = "vdra_node_balanced"  # deprecated main; kept as ablation
 POLICY_AGGREGATION_LEGACY = "legacy_token_mean"
 
@@ -168,7 +171,9 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
     main run.
 
     A main run is invalid when:
-      * policy_aggregation != global_segment_mean;
+      * policy_aggregation is neither segment_mean nor token_mean
+        (the tree_balanced_segment_mean / vdra_node_balanced /
+        legacy_token_mean ablations never validate as main);
       * no successful outer actor update was observed
         (``global_step < 1``);
       * segment_token_reduction is not exactly ``mean`` or ``sum``;
@@ -192,9 +197,14 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
     accordingly and reported as an ablation.
     """
     failures = []
-    if manifest.policy_aggregation != POLICY_AGGREGATION_SEGMENT_MEAN:
+    if manifest.policy_aggregation not in (
+        POLICY_AGGREGATION_SEGMENT_MEAN,
+        POLICY_AGGREGATION_TOKEN_MEAN,
+    ):
         failures.append(
-            f"policy_aggregation={manifest.policy_aggregation!r} != {POLICY_AGGREGATION_SEGMENT_MEAN!r}"
+            f"policy_aggregation={manifest.policy_aggregation!r} not in "
+            f"({POLICY_AGGREGATION_SEGMENT_MEAN!r}, "
+            f"{POLICY_AGGREGATION_TOKEN_MEAN!r})"
         )
     # PLAN.md P0.J: canonical replay is edge-level; a complete_tree run is a
     # labeled ablation, never a valid main run.

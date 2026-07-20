@@ -33,7 +33,15 @@ def _trainer(balance_batch=False, target_edges=512, mini_batch=128, default_loca
             actor=_Cfg(
                 ppo_mini_batch_size=mini_batch,
                 # PLAN.md P0.C: tensorization reads the configured loss mode.
-                policy_loss={"loss_mode": "vdra_segment_mean_ppo"},
+                # These contracts exercise the plain edges_to_dataproto path
+                # (metadata / overlength / edge_weights); the canonical
+                # logical-batch tensorization is covered by
+                # test_logical_update_batch.py, so use the tree_balanced
+                # ablation aggregation which keeps the plain path.
+                policy_loss={
+                    "loss_mode": "vdra_segment_mean_ppo",
+                    "policy_aggregation": "tree_balanced_segment_mean",
+                },
             )
         ),
         gear_tree={

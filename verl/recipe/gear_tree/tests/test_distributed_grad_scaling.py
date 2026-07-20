@@ -1,32 +1,34 @@
-"""Distributed gradient-scaling parity for the batch-slot mean (ablation).
+"""Distributed gradient-scaling algebra for the canonical segment_mean.
 
-This algebra check covers the labeled ``batch_slot_mean_ablation`` loss whose
-distributed scaling is a preserved contract; canonical tree-segment-mean
-distributed parity is a Hard-stage (H1) verification item.
+This algebra check covers the CANONICAL ``policy_aggregation='segment_mean'``
+loss (PLAN.md §1.3): local numerator over the GLOBAL pre-filter logical
+denominator ``M_B``, with the dp-size compensation for the measured
+averaging reducer (docs/h1_fsdp_parity_report.md).
 
-``ppo_mini_batch_size=128`` is the GLOBAL optimizer batch size. Multi-rank
-sharding must reproduce the single-rank 128-row reference gradient after the
-DDP/FSDP reducer averages gradients across ranks.
+``ppo_mini_batch_size=128`` is the GLOBAL logical optimizer batch size.
+Multi-rank sharding must reproduce the single-rank 128-row reference
+gradient after the DDP/FSDP reducer averages gradients across ranks.
 
-The batch-slot mean loss is
+The canonical segment_mean loss is
 
-    L_B^{local} = sum(rows_on_this_rank) / N_B_global.
+    L_B^{local} = sum(rows_on_this_rank) / M_B_global.
 
 If the reducer averages gradients across ``W`` ranks, then
 
     grad = (1/W) * sum_r grad_r
-         = (1/W) * sum_r ( d/dtheta sum(rows_r) / N_B_global )
-         = ( sum_all_rows / (W * N_B_global) )
+         = (1/W) * sum_r ( d/dtheta sum(rows_r) / M_B_global )
+         = ( sum_all_rows / (W * M_B_global) )
          = grad_single_rank / W.
 
-To match the single-rank reference we therefore multiply the local loss by
-``W`` OR use gradient sum instead of average. This test proves the
-equivalence numerically without spawning ``torch.distributed`` processes:
+To match the single-rank reference, dp_actor multiplies the local loss by
+``W`` (its ``loss_scale_factor``), equivalently a gradient-sum reduction.
+This test proves the equivalence numerically without spawning
+``torch.distributed`` processes:
 
-  * baseline: one rank sees all 128 rows, N_B = 128 → grad_ref.
-  * sharded:  two "ranks" each see 64 rows with N_B = 128 (global), local
+  * baseline: one rank sees all 128 rows, M_B = 128 → grad_ref.
+  * sharded:  two "ranks" each see 64 rows with M_B = 128 (global), local
     losses summed (== gradient sum reduction) → should equal grad_ref.
-  * sharded avg: two "ranks" each see 64 rows with N_B = 128 and local
+  * sharded avg: two "ranks" each see 64 rows with M_B = 128 and local
     losses averaged → gives grad_ref/2 UNLESS we compensate by multiplying
     the local loss by W. This test documents that trap.
 """
@@ -52,7 +54,7 @@ def _actor_cfg(reduction: str = "mean") -> ActorConfig:
         policy_loss=PolicyLossConfig(
             loss_mode="vdra_segment_mean_ppo",
             segment_token_reduction=reduction,
-            batch_slot_mean_ablation=True,
+            policy_aggregation="segment_mean",
         ),
     )
 
@@ -79,7 +81,7 @@ def _single_rank_grad(cfg, rows):
         advantages=adv,
         response_mask=mask,
         config=cfg,
-        original_optimizer_batch_slot_count=n_rows,
+        original_logical_segment_count=n_rows,
     )[0]
     loss.backward()
     return theta.grad.detach().clone()
@@ -98,7 +100,7 @@ def _sharded_grad_summed(cfg, rows, world_size: int):
             advantages=adv[s],
             response_mask=mask[s],
             config=cfg,
-            original_optimizer_batch_slot_count=n_rows,  # GLOBAL N_B
+            original_logical_segment_count=n_rows,  # GLOBAL M_B
         )[0]
         # Emulate a gradient-sum reduction across ranks (each rank calls
         # backward, gradients accumulate on theta).
@@ -122,7 +124,7 @@ def _sharded_grad_averaged(cfg, rows, world_size: int):
             advantages=adv[s],
             response_mask=mask[s],
             config=cfg,
-            original_optimizer_batch_slot_count=n_rows,
+            original_logical_segment_count=n_rows,
         )[0]
         (local_loss / world_size).backward()
     return theta.grad.detach().clone()
@@ -176,7 +178,7 @@ class TestAverageReductionRegressionGuard:
                 advantages=adv[s],
                 response_mask=mask[s],
                 config=cfg,
-                original_optimizer_batch_slot_count=128,
+                original_logical_segment_count=128,
             )[0]
             # Compensate: * world, then reducer / world → net factor 1.
             ((local_loss * world) / world).backward()

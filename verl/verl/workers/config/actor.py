@@ -61,14 +61,8 @@ class PolicyLossConfig(BaseConfig):
             historical ``w = 1/(N_T * N_seg(T))`` tree-balanced objective.
             The retired name ``"global_segment_mean"`` fails fast with a
             rename error (it must never silently mean the new uniform
-            ``segment_mean``).
-        batch_slot_mean_ablation (bool): Labeled LEGACY ablation for the VDRA
-            segment-mean loss. ``false`` (canonical) normalizes each row by
-            ``1 / (N_T * N_seg(T))`` using the pre-filter
-            ``tree_total_segment_count``, so removing exact-zero-advantage
-            rows leaves the loss unchanged. ``true`` selects the historical
-            batch-slot mean ``sum(L_s) / N_B`` over retained replay slots —
-            never the canonical denominator.
+            ``segment_mean``). The former ``batch_slot_mean_ablation`` flag
+            was retired: its mathematics IS ``segment_mean``.
     """
 
     loss_mode: str = "vanilla"
@@ -80,12 +74,9 @@ class PolicyLossConfig(BaseConfig):
     segment_token_reduction: str = "mean"
     use_prob_mask: bool = True
     ratio_threshold: float = float("inf")
-    # NOTE (migration): the temporary default preserves the pre-decision
-    # behavior until the canonical flip lands with the trainer-side logical
-    # batching (PLAN.md §3.3); the canonical default then becomes
-    # ``segment_mean``.
-    policy_aggregation: str = "tree_balanced_segment_mean"
-    batch_slot_mean_ablation: bool = False
+    # PLAN.md §1.3 (2026-07-21): the canonical default is the paper's
+    # uniform segment mean over the pre-filter logical-batch slot count.
+    policy_aggregation: str = "segment_mean"
 
     _VALID_POLICY_AGGREGATIONS = ("token_mean", "segment_mean", "tree_balanced_segment_mean")
 

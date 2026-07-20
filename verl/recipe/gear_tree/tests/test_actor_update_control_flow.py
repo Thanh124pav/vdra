@@ -80,9 +80,17 @@ def _build_batch(n: int = N_EDGES, advantage: float = 1.0):
 
 
 def _make_actor():
+    # The tree-balanced ablation path keeps verl's fixed-size mini-batch
+    # split, which is exactly the 512/128 -> 4-step control flow this file
+    # pins. The canonical aggregations' logical-batch grouping is covered by
+    # test_logical_update_batch.py / the FSDP2 parity harness.
     return make_actor(
         config=_tiny_actor.make_actor_config(
-            strategy="fsdp", mini=MINI, micro=MICRO, reduction="mean"
+            strategy="fsdp",
+            mini=MINI,
+            micro=MICRO,
+            reduction="mean",
+            aggregation="tree_balanced_segment_mean",
         )
     )
 

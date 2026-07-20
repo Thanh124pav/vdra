@@ -25,10 +25,16 @@ from recipe.gear_tree.policy_loss import (  # noqa: E402
 )
 
 
-def _make_policy_loss_cfg(reduction: str = "mean") -> PolicyLossConfig:
+def _make_policy_loss_cfg(
+    reduction: str = "mean",
+    aggregation: str = "tree_balanced_segment_mean",
+) -> PolicyLossConfig:
+    # The loss-invoking tests below pass tree_total_segment_count + N_T, i.e.
+    # the tree_balanced ablation inputs (PLAN.md §1.3).
     return PolicyLossConfig(
         loss_mode="vdra_segment_mean_ppo",
         segment_token_reduction=reduction,
+        policy_aggregation=aggregation,
     )
 
 
@@ -228,7 +234,7 @@ class TestHydraComposition:
         assert actor.policy_loss.loss_mode == "vdra_segment_mean_ppo"
         assert actor.policy_loss.segment_token_reduction == "mean"
         assert cfg.tree_policy.segment_token_reduction == "mean"
-        assert cfg.tree_policy.policy_aggregation == "global_segment_mean"
+        assert cfg.tree_policy.policy_aggregation == "segment_mean"
 
     def test_real_compose_sum_override_reaches_actor_policy_loss(self):
         cfg = self._compose_real(
@@ -338,6 +344,9 @@ class TestPolicyLossFieldReads:
                 ppo_micro_batch_size_per_gpu=32,
                 policy_loss=PolicyLossConfig(
                     loss_mode="vdra_segment_mean_ppo",
+                    # This test drives the tree-balanced ablation inputs
+                    # (tree_total_segment_count + N_T).
+                    policy_aggregation="tree_balanced_segment_mean",
                     use_prob_mask=use_prob_mask,
                 ),
             )
@@ -379,17 +388,22 @@ class TestStartupConsistencyCheck:
                 "gear_tree": {
                     "tree_shape": [6, 6, 6],
                     "segment_length": 100,
-                    "gear": {"strict_vdra": True},
+                    "gear": {
+                        "strict_vdra": True,
+                        "only_adv_greater_than_zero": True,
+                    },
                     "replay_buffer": {},
+                    "only_adv_greater_than_zero": True,
                 },
                 "tree_policy": {
-                    "policy_aggregation": "global_segment_mean",
+                    "policy_aggregation": "segment_mean",
                     "segment_token_reduction": tree_reduction,
                 },
                 "actor_rollout_ref": {
                     "actor": {
                         "policy_loss": {
                             "loss_mode": "vdra_segment_mean_ppo",
+                            "policy_aggregation": "segment_mean",
                             "segment_token_reduction": actor_reduction,
                         }
                     }
@@ -463,8 +477,8 @@ class TestStartupConsistencyCheck:
 
 
 class TestM5StrictCanonicalTriple:
-    """PLAN.md M5: strict_vdra=true requires the exact canonical triple
-    tree_update_mode=spo / policy_aggregation=global_segment_mean /
+    """PLAN.md §1.3/M5: strict_vdra=true requires the exact canonical triple
+    tree_update_mode=spo / policy_aggregation in {segment_mean, token_mean} /
     loss_mode=vdra_segment_mean_ppo, and the node-balanced aggregation/loss
     mapping is enforced in both directions regardless of strict mode."""
 
@@ -473,30 +487,38 @@ class TestM5StrictCanonicalTriple:
         *,
         strict=True,
         tree_update_mode="spo",
-        policy_aggregation="global_segment_mean",
+        policy_aggregation="segment_mean",
         loss_mode="vdra_segment_mean_ppo",
         reduction="mean",
     ):
+        actor_policy_loss = {
+            "loss_mode": loss_mode,
+            "segment_token_reduction": reduction,
+        }
+        # PLAN.md §1.3: the segment losses carry the must-agree aggregation
+        # on the actor block too.
+        if loss_mode == "vdra_segment_mean_ppo":
+            actor_policy_loss["policy_aggregation"] = policy_aggregation
         return OmegaConf.create(
             {
                 "gear_tree": {
                     "tree_shape": [6, 6, 6],
                     "segment_length": 100,
                     "tree_update_mode": tree_update_mode,
-                    "gear": {"strict_vdra": strict},
+                    "gear": {
+                        "strict_vdra": strict,
+                        # §1.2 strict sparse-execution contract.
+                        "only_adv_greater_than_zero": True,
+                    },
                     "replay_buffer": {},
+                    "only_adv_greater_than_zero": True,
                 },
                 "tree_policy": {
                     "policy_aggregation": policy_aggregation,
                     "segment_token_reduction": reduction,
                 },
                 "actor_rollout_ref": {
-                    "actor": {
-                        "policy_loss": {
-                            "loss_mode": loss_mode,
-                            "segment_token_reduction": reduction,
-                        }
-                    }
+                    "actor": {"policy_loss": actor_policy_loss}
                 },
             }
         )
@@ -532,7 +554,7 @@ class TestM5StrictCanonicalTriple:
     def test_strict_rejects_legacy_token_mean_aggregation(self):
         # legacy_token_mean uses treetune_ppo; strict must reject the whole
         # non-canonical config (reported via the aggregation requirement).
-        with pytest.raises(ValueError, match="global_segment_mean"):
+        with pytest.raises(ValueError, match="segment_mean"):
             self._validate(
                 self._config(
                     policy_aggregation="legacy_token_mean",
@@ -541,13 +563,29 @@ class TestM5StrictCanonicalTriple:
             )
 
     def test_strict_rejects_node_balanced_aggregation(self):
-        with pytest.raises(ValueError, match="global_segment_mean"):
+        with pytest.raises(ValueError, match="segment_mean"):
             self._validate(
                 self._config(
                     policy_aggregation="vdra_node_balanced",
                     loss_mode="vdra_node_balanced_ppo",
                 )
             )
+
+    def test_strict_rejects_tree_balanced_aggregation(self):
+        # PLAN.md §1.3: the historical tree-balanced objective is an
+        # ablation and must not run as a strict main path.
+        with pytest.raises(ValueError, match="segment_mean"):
+            self._validate(
+                self._config(policy_aggregation="tree_balanced_segment_mean")
+            )
+
+    def test_token_mean_canonical_triple_passes(self):
+        assert self._validate(self._config(policy_aggregation="token_mean")) is None
+
+    def test_strict_rejects_renamed_global_segment_mean(self):
+        # The retired name must fail fast with the rename message.
+        with pytest.raises(ValueError, match="renamed"):
+            self._validate(self._config(policy_aggregation="global_segment_mean"))
 
     def test_node_balanced_requires_node_balanced_loss(self):
         # Reverse mapping, non-strict ablation: vdra_node_balanced aggregation

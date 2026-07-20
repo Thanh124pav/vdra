@@ -14,7 +14,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Optional
 
 import numpy as np
 
@@ -451,8 +451,13 @@ class RayGearTreeTrainer(RayPPOTrainer):
             edges, snapshot_id=snapshot_id, strict=strict
         )
 
-    def _edges_to_update_batch(self, sampled_edges: List[Dict[str, Any]], metrics: Dict[str, Any]) -> DataProto:
-        from recipe.gear_tree.tree_data import edges_to_dataproto
+    def _edges_to_update_batch(
+        self, sampled_edges: List[Dict[str, Any]], metrics: Dict[str, Any]
+    ) -> Optional[DataProto]:
+        from recipe.gear_tree.tree_data import (
+            build_logical_update_batch,
+            edges_to_dataproto,
+        )
 
         # P0.2: use the same L_edge_max the startup validator resolved so a
         # config that clears validation cannot then fail here on a deep edge.
@@ -463,16 +468,69 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 "loss_mode", "vdra_segment_mean_ppo"
             )
         )
-        edge_batch = edges_to_dataproto(
-            sampled_edges,
-            self.tokenizer,
-            max_prompt_length=self._resolved_max_edge_prompt_length(),
-            max_response_length=self.config.data.max_response_length,
-            include_old_log_probs=True,
-            loss_mode=loss_mode,
+        aggregation = str(
+            self.config.actor_rollout_ref.actor.policy_loss.get(
+                "policy_aggregation", "segment_mean"
+            )
+        ).strip().lower()
+        canonical_aggregation = loss_mode == "vdra_segment_mean_ppo" and aggregation in (
+            "segment_mean",
+            "token_mean",
         )
-        if self.config.trainer.get("balance_batch", False):
-            self._balance_batch(edge_batch, metrics=metrics)
+        if canonical_aggregation:
+            # PLAN.md §1.2: the reservation is a list of LOGICAL slots in
+            # reservation order; logical optimizer batches and their
+            # pre-filter M_B/T_B denominators are fixed HERE, before tensor
+            # filtering. Returns None for a fully-zero reservation (explicit
+            # skipped update, PLAN.md §1.3).
+            if self.config.trainer.get("balance_batch", False):
+                raise ValueError(
+                    "trainer.balance_batch reorders rows and would break the "
+                    "rank-major logical-batch layout required by the "
+                    "canonical VDRA aggregations (PLAN.md §1.2); disable it."
+                )
+            sp = int(
+                self.config.actor_rollout_ref.actor.get(
+                    "ulysses_sequence_parallel_size", 1
+                )
+                or 1
+            )
+            if sp > 1:
+                raise NotImplementedError(
+                    "canonical VDRA aggregations are only specified for "
+                    "ulysses_sequence_parallel_size == 1 (PLAN.md §1.3)."
+                )
+            dp_size = max(
+                int(self.config.trainer.nnodes)
+                * int(self.config.trainer.n_gpus_per_node),
+                1,
+            )
+            edge_batch, logical_stats = build_logical_update_batch(
+                sampled_edges,
+                self.tokenizer,
+                max_prompt_length=self._resolved_max_edge_prompt_length(),
+                max_response_length=self.config.data.max_response_length,
+                ppo_mini_batch_size=int(
+                    self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                ),
+                dp_size=dp_size,
+                loss_mode=loss_mode,
+                include_old_log_probs=True,
+            )
+            metrics.update(logical_stats)
+            if edge_batch is None:
+                return None
+        else:
+            edge_batch = edges_to_dataproto(
+                sampled_edges,
+                self.tokenizer,
+                max_prompt_length=self._resolved_max_edge_prompt_length(),
+                max_response_length=self.config.data.max_response_length,
+                include_old_log_probs=True,
+                loss_mode=loss_mode,
+            )
+            if self.config.trainer.get("balance_batch", False):
+                self._balance_batch(edge_batch, metrics=metrics)
         edge_batch.meta_info["global_token_num"] = edge_batch.batch["attention_mask"].sum(dim=-1).tolist()
         edge_batch.meta_info["multi_turn"] = False
         # P0.4: replay tree edges carry stored generation-time behavior
@@ -695,6 +753,14 @@ class RayGearTreeTrainer(RayPPOTrainer):
         except Exception:
             replay_buffer.rollback(reservation)
             raise
+        if edge_batch is None:
+            # PLAN.md §1.3: every logical batch of this reservation is
+            # all-zero — an EXPLICIT skipped update, not an RPC failure. The
+            # model is never touched and neither global_step nor the
+            # scheduler advances (update_actor is never called). Per the M2
+            # contract this helper does NOT commit or mutate outer counters;
+            # the fit loop consumes the reservation and records the skip.
+            return None, None, 0.0
         # PLAN.md P0.J: strict tensorization refuses truncation with a
         # ValueError, so REACHING this line is the observed no-truncation
         # event for this batch.
@@ -876,6 +942,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
         self.successful_actor_updates = 0
         self.postponed_updates = 0
         self.failed_updates = 0
+        # PLAN.md §1.3: observational counter for explicit all-zero skipped
+        # updates (session-local diagnostic; never drives the outer loop).
+        self.skipped_zero_gradient_updates = 0
         # PLAN.md M1: keep rollout iteration, outer global_step, and
         # internal optimizer-step diagnostics as distinct counters.
         self.optimizer_steps_this_iteration = 0
@@ -1009,6 +1078,20 @@ class RayGearTreeTrainer(RayPPOTrainer):
                         manifest_strict=manifest_strict,
                     )
                 )
+                if edge_batch is None:
+                    # PLAN.md §1.3: explicit skipped update (all-zero
+                    # reservation). Consume the reservation (the zero signal
+                    # was processed), record the skip, and move on — no
+                    # global_step, no scheduler.step, no actor RPC.
+                    removed = replay_buffer.commit(reservation)
+                    metrics["buffer/removed_edges"] = float(len(removed))
+                    metrics["buffer/size_after"] = float(len(replay_buffer))
+                    self.skipped_zero_gradient_updates += 1
+                    metrics["vdra/skipped_zero_gradient_updates"] = float(
+                        self.skipped_zero_gradient_updates
+                    )
+                    logger.log(data=metrics, step=self.global_steps)
+                    continue
                 actor_updated = True
                 # PLAN.md M2 (item 3): commit + outer counters are secured
                 # unconditionally on actor success; the diagnostic actor

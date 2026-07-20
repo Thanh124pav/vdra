@@ -106,6 +106,9 @@ class TestCanonicalLossUnchangedWithoutWeights:
 
         class policy_loss:
             segment_token_reduction = "mean"
+            # This test drives the tree_balanced ablation inputs
+            # (tree_total_segment_count + N_T / segment_objective_weights).
+            policy_aggregation = "tree_balanced_segment_mean"
 
         def get(self, key, default=None):
             return {"use_prob_mask": False}.get(key, default)

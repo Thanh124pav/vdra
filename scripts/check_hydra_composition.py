@@ -53,7 +53,7 @@ def compose_main(overrides: list[str] | None = None):
 def check_canonical(cfg) -> None:
     tree_policy = cfg.tree_policy
     _require(
-        tree_policy.policy_aggregation == "global_segment_mean",
+        tree_policy.policy_aggregation == "segment_mean",
         f"tree_policy.policy_aggregation={tree_policy.policy_aggregation}",
     )
     _require(
@@ -95,10 +95,11 @@ def check_canonical(cfg) -> None:
         f"{actor.policy_loss.segment_token_reduction}",
     )
     # Canonical normalization is the tree segment mean w_s = 1/(N_T*N_seg(T));
-    # the batch-slot mean is a labeled legacy ablation and must be OFF here.
+    # PLAN.md §1.3: the actor-level aggregation must advertise the canonical
+    # paper objective and agree with tree_policy.policy_aggregation.
     _require(
-        not bool(actor.policy_loss.get("batch_slot_mean_ablation", False)),
-        "actor.policy_loss.batch_slot_mean_ablation must be false on the "
+        str(actor.policy_loss.get("policy_aggregation", "")) == "segment_mean",
+        "actor.policy_loss.policy_aggregation must be 'segment_mean' on the "
         "canonical main path",
     )
     _require(int(actor.ppo_mini_batch_size) == 128, "ppo_mini_batch_size != 128")

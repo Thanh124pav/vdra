@@ -169,7 +169,6 @@ def make_actor_config(
     micro: int = 64,
     reduction: str = "mean",
     aggregation: str | None = None,
-    batch_slot_ablation: bool = False,
     grad_clip: float = 1.0,
 ):
     from verl.workers.config.actor import FSDPActorConfig, PolicyLossConfig
@@ -178,7 +177,6 @@ def make_actor_config(
         loss_mode="vdra_segment_mean_ppo",
         segment_token_reduction=reduction,
         use_prob_mask=False,
-        batch_slot_mean_ablation=batch_slot_ablation,
     )
     if aggregation is not None:
         policy_loss_kwargs["policy_aggregation"] = aggregation
