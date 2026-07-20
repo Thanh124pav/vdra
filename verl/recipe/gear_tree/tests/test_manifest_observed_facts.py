@@ -99,7 +99,8 @@ def test_clean_synthetic_update_produces_valid_manifest_mean():
     # PLAN.md P0.7: trainer flips this after observing the correct number of
     # optimizer.step() calls (see P0.3). Simulate here.
     manifest.optimizer_step_accounting_valid = True
-    manifest.num_optimizer_steps_total = 4  # PLAN.md P0.J: >=1 observed step
+    manifest.num_optimizer_steps_total = 4  # diagnostic only
+    manifest.global_step = 1  # PLAN.md M4: >=1 successful outer update
     assert validate_main_run(manifest) is None
 
 
@@ -115,7 +116,8 @@ def test_clean_synthetic_update_produces_valid_manifest_sum():
     manifest.rollout_scorer_weights_verified = True
     manifest.record_invariant_pass()
     manifest.optimizer_step_accounting_valid = True
-    manifest.num_optimizer_steps_total = 4  # PLAN.md P0.J: >=1 observed step
+    manifest.num_optimizer_steps_total = 4  # diagnostic only
+    manifest.global_step = 1  # PLAN.md M4: >=1 successful outer update
     assert manifest.segment_token_reduction == SEGMENT_TOKEN_REDUCTION_SUM
     assert validate_main_run(manifest) is None
 
@@ -131,7 +133,8 @@ def test_later_failure_keeps_run_invalid():
     manifest.rollout_scorer_weights_verified = True
     manifest.record_invariant_pass()
     manifest.optimizer_step_accounting_valid = True
-    manifest.num_optimizer_steps_total = 4  # PLAN.md P0.J: >=1 observed step
+    manifest.num_optimizer_steps_total = 4  # diagnostic only
+    manifest.global_step = 1  # PLAN.md M4: >=1 successful outer update
     assert validate_main_run(manifest) is None
 
     # Second batch — inject a broken parent group so group-integrity fails.
@@ -155,7 +158,8 @@ def test_manifest_save_load_preserves_all_fields(tmp_path):
     manifest.rollout_scorer_weights_verified = True
     manifest.record_invariant_pass()
     manifest.optimizer_step_accounting_valid = True
-    manifest.num_optimizer_steps_total = 4  # PLAN.md P0.J: >=1 observed step
+    manifest.num_optimizer_steps_total = 4  # diagnostic only
+    manifest.global_step = 1  # PLAN.md M4: >=1 successful outer update
 
     p = tmp_path / "manifest.json"
     manifest.save(p)
@@ -210,20 +214,24 @@ class TestObservedFactsP0J:
         manifest.record_segment_invariant_pass()
         manifest.optimizer_step_accounting_valid = True
         manifest.num_optimizer_steps_total = 4
+        manifest.global_step = 1
         assert validate_main_run(manifest) is None
         manifest.replay_sampling_unit = "complete_tree"
         reason = validate_main_run(manifest)
         assert reason is not None and "complete_tree" in reason
 
-    def test_main_manifest_invalid_before_first_optimizer_step(self):
+    def test_main_manifest_invalid_before_first_outer_update(self):
+        # PLAN.md M4: canonical validity requires global_step >= 1 (a
+        # successful outer actor update), not the optimizer-step diagnostics.
         manifest = self._manifest()
         update_manifest_from_edges(manifest, _clean_edges(), strict=True)
         manifest.rollout_scorer_weights_verified = True
         manifest.record_segment_invariant_pass()
         manifest.optimizer_step_accounting_valid = True
-        assert manifest.num_optimizer_steps_total == 0
+        manifest.num_optimizer_steps_total = 4  # diagnostic, does not gate
+        assert manifest.global_step == 0
         reason = validate_main_run(manifest)
-        assert reason is not None and "num_optimizer_steps_total" in reason
+        assert reason is not None and "global_step" in reason
 
     def test_trainer_and_actor_wiring_for_observed_facts(self):
         from pathlib import Path

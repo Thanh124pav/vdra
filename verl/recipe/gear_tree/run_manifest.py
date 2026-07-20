@@ -169,6 +169,8 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
 
     A main run is invalid when:
       * policy_aggregation != global_segment_mean;
+      * no successful outer actor update was observed
+        (``global_step < 1``);
       * segment_token_reduction is not exactly ``mean`` or ``sum``;
       * complete-tree replay was ever violated;
       * segment-count invariants failed
@@ -178,6 +180,11 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
         (``stored_old_log_probs_used=False``);
       * rollout/scorer weight versions were not independently verified;
       * silent truncation was observed (``no_truncation=False``).
+
+    Canonical validity hinges on ``global_step`` — the host VERL outer-update
+    unit. The internal PPO ``num_optimizer_steps_total`` and the derived
+    ``optimizer_step_accounting_valid`` are DIAGNOSTICS only and never gate
+    the main run (PLAN.md M1/M4).
 
     The legacy ``vdra_node_balanced`` aggregation remains a supported
     ablation configuration but never validates as a canonical main run —
@@ -195,12 +202,12 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
         failures.append(
             f"replay_sampling_unit={manifest.replay_sampling_unit!r} != 'edge'"
         )
-    # PLAN.md P0.J: the main manifest becomes valid only after at least one
-    # successful canonical optimizer step has been observed.
-    if manifest.num_optimizer_steps_total < 1:
-        failures.append(
-            f"num_optimizer_steps_total={manifest.num_optimizer_steps_total} < 1"
-        )
+    # PLAN.md M4: canonical validity requires at least one successful OUTER
+    # actor update (global_step >= 1) — the host-framework training unit.
+    # num_optimizer_steps_total and optimizer_step_accounting_valid are
+    # diagnostics and must NOT gate the main run.
+    if manifest.global_step < 1:
+        failures.append(f"global_step={manifest.global_step} < 1")
     if manifest.segment_token_reduction not in _VALID_SEGMENT_TOKEN_REDUCTIONS:
         failures.append(
             f"segment_token_reduction={manifest.segment_token_reduction!r} not in {_VALID_SEGMENT_TOKEN_REDUCTIONS}"
@@ -237,8 +244,8 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
     # PLAN.md P0.7 canonical bits.
     if not manifest.replay_age_uses_rollout_iteration:
         failures.append("replay_age_uses_rollout_iteration=False")
-    if not manifest.optimizer_step_accounting_valid:
-        failures.append("optimizer_step_accounting_valid=False")
+    # PLAN.md M4: optimizer_step_accounting_valid is a DIAGNOSTIC, not a
+    # validity requirement — intentionally NOT checked here.
     if not manifest.unique_tree_ids_verified:
         failures.append("unique_tree_ids_verified=False")
     if failures:
