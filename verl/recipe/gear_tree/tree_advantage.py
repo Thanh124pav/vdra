@@ -311,6 +311,8 @@ def extract_edges_from_tree(
         retained_by_parent[pgid] = retained_by_parent.get(pgid, 0) + 1
     tree_summary = {
         "tree_id": str(tree_id),
+        "policy_snapshot_id": policy_snapshot_id,
+        "rollout_iteration": data_instance.get("rollout_iteration"),
         "question_id": str(question_id),
         "expanded_parent_group_count": len(expanded_parent_group_ids),
         "trainable_child_count": int(trainable_child_count),

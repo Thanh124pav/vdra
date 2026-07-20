@@ -334,6 +334,37 @@ class TestManifestCollisionDetection:
         assert not ok
         assert any("ambiguous" in d for d in details)
 
+    def _summary_record(self, tree_id: str) -> dict:
+        return {
+            "tree_summary": {
+                "tree_id": tree_id,
+                "policy_snapshot_id": "snap0",
+                "rollout_iteration": 1,
+                "question_id": "q0",
+            }
+        }
+
+    def test_summary_only_rejects_wrong_snapshot(self):
+        ok, details = verify_tree_instance_id_uniqueness(
+            [self._summary_record("wrong_snapshot|iter:1|q:q0|t:abc")]
+        )
+        assert not ok
+        assert any("snapshot" in d for d in details)
+
+    def test_summary_only_rejects_wrong_iteration(self):
+        ok, details = verify_tree_instance_id_uniqueness(
+            [self._summary_record("snap0|iter:999|q:q0|t:abc")]
+        )
+        assert not ok
+        assert any("rollout iteration" in d for d in details)
+
+    def test_summary_only_rejects_wrong_question(self):
+        ok, details = verify_tree_instance_id_uniqueness(
+            [self._summary_record("snap0|iter:1|q:wrong_question|t:abc")]
+        )
+        assert not ok
+        assert any("question" in d for d in details)
+
     def test_strict_manifest_update_raises_on_collision(self):
         from recipe.gear_tree.manifest_lifecycle import (
             build_run_manifest,

@@ -669,6 +669,85 @@ def normalize_generated_edges(
     return normalized
 
 
+def _parse_canonical_tree_instance_id(tree_id: str) -> Tuple[str, int, str]:
+    """Parse ``snapshot|iter:<n>|q:<question>|...`` tree identities."""
+    parts = str(tree_id).split("|")
+    if len(parts) < 4:
+        raise ValueError(
+            f"tree_id {tree_id!r} is not a canonical tree_instance_id"
+        )
+    snapshot = parts[0]
+    iteration_part = parts[1]
+    question_part = parts[2]
+    if not snapshot:
+        raise ValueError(f"tree_id {tree_id!r} has an empty snapshot")
+    if not iteration_part.startswith("iter:"):
+        raise ValueError(
+            f"tree_id {tree_id!r} is missing the iter:<n> component"
+        )
+    if not question_part.startswith("q:"):
+        raise ValueError(
+            f"tree_id {tree_id!r} is missing the q:<question> component"
+        )
+    try:
+        rollout_iteration = int(iteration_part.split(":", 1)[1])
+    except ValueError as exc:
+        raise ValueError(
+            f"tree_id {tree_id!r} has a non-integer rollout iteration"
+        ) from exc
+    return snapshot, rollout_iteration, question_part.split(":", 1)[1]
+
+
+def _summary_tree_identity_failures(record: Dict[str, Any]) -> List[str]:
+    """Validate summary-only tree identity against rollout metadata."""
+    summary = record.get("tree_summary") or {}
+    if not summary:
+        return []
+    tree_id = str(record.get("tree_id") or summary.get("tree_id") or "")
+    missing = [
+        name
+        for name in (
+            "tree_id",
+            "policy_snapshot_id",
+            "rollout_iteration",
+            "question_id",
+        )
+        if summary.get(name) is None and not (name == "tree_id" and tree_id)
+    ]
+    if missing:
+        return [
+            "tree_summary is missing canonical identity metadata "
+            f"{missing}; cannot verify summary-only tree identity"
+        ]
+    try:
+        tid_snapshot, tid_iteration, tid_question = _parse_canonical_tree_instance_id(
+            tree_id
+        )
+    except ValueError as exc:
+        return [str(exc)]
+
+    failures: List[str] = []
+    expected_snapshot = str(summary["policy_snapshot_id"])
+    if tid_snapshot != expected_snapshot:
+        failures.append(
+            f"tree_id snapshot {tid_snapshot!r} != summary.policy_snapshot_id "
+            f"{expected_snapshot!r}"
+        )
+    expected_iteration = int(summary["rollout_iteration"])
+    if tid_iteration != expected_iteration:
+        failures.append(
+            f"tree_id rollout iteration {tid_iteration!r} != "
+            f"summary.rollout_iteration {expected_iteration!r}"
+        )
+    expected_question = str(summary["question_id"])
+    if tid_question != expected_question:
+        failures.append(
+            f"tree_id question {tid_question!r} != summary.question_id "
+            f"{expected_question!r}"
+        )
+    return failures
+
+
 def verify_tree_instance_id_uniqueness(
     edges: Sequence[Dict[str, Any]],
 ) -> Tuple[bool, List[str]]:
@@ -678,6 +757,8 @@ def verify_tree_instance_id_uniqueness(
 
     * a collision between two stochastic trees merged under one ``tree_id``
       shows up as duplicate ``(tree_id, child_segment_id)`` pairs;
+    * summary-only tree records must have a canonical ``tree_id`` whose
+      snapshot, rollout iteration and question match ``tree_summary``;
     * a ``tree_id`` equal to the ambiguous ``snapshot:question`` fallback of
       its own edge is a forbidden identity in main runs.
 
@@ -700,6 +781,7 @@ def verify_tree_instance_id_uniqueness(
                 f"{count} times — two stochastic trees collided under one id"
             )
     for e in edges:
+        details.extend(_summary_tree_identity_failures(e))
         tid = str(e.get("tree_id", ""))
         fallback = (
             f"{e.get('policy_snapshot_id', '')}:{e.get('question_id', '')}"
