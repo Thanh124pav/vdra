@@ -526,6 +526,35 @@ def derive_edge_id(
     return f"{snapshot_id}:{digest}"
 
 
+def is_canonical_tree_instance_id(
+    tree_instance_id: Any, *, snapshot_id: Any
+) -> bool:
+    """PLAN.md M3: True iff ``tree_instance_id`` has the exact structure the
+    canonical builder (:func:`tree_rollout.make_tree_instance_id`) produces:
+
+        "{policy_snapshot}|iter:{rollout_iteration}|q:{question}|{tiebreaker}"
+
+    A generic value such as ``"t0"`` — truthy but structureless — is NOT a
+    canonical identity. The policy-snapshot component must match the rollout
+    snapshot, the rollout-iteration and question markers must be present, and
+    the per-tree tiebreaker must be non-empty. This validates structure only;
+    it does not change the ``derive_edge_id`` digest for well-formed ids.
+    """
+    if not tree_instance_id:
+        return False
+    parts = str(tree_instance_id).split("|")
+    if len(parts) < 4:
+        return False
+    if parts[0] != str(snapshot_id):
+        return False
+    if not parts[1].startswith("iter:") or parts[1] == "iter:":
+        return False
+    if not parts[2].startswith("q:") or parts[2] == "q:":
+        return False
+    tiebreaker = "|".join(parts[3:])
+    return bool(tiebreaker)
+
+
 def normalize_generated_edges(
     edges: Sequence[Dict[str, Any]],
     *,
@@ -565,6 +594,19 @@ def normalize_generated_edges(
                     f"{missing} on generated edge {idx} (PLAN.md P0.H). "
                     "Generation must stamp make_tree_instance_id-derived "
                     "tree identities and explicit parent/child segment ids."
+                )
+            # PLAN.md M3: reject a generic tree_instance_id (e.g. "t0"). Strict
+            # mode requires the canonical builder structure — policy snapshot +
+            # rollout iteration + stable question + unique tiebreaker.
+            if not is_canonical_tree_instance_id(
+                tree_instance_id, snapshot_id=snapshot_id
+            ):
+                raise ValueError(
+                    f"Strict VDRA requires a canonical tree_instance_id on "
+                    f"generated edge {idx}; got {tree_instance_id!r} (PLAN.md "
+                    "M3). It must be produced by make_tree_instance_id: "
+                    "'{snapshot}|iter:{n}|q:{qid}|{tiebreaker}' with the "
+                    "policy snapshot matching the rollout snapshot."
                 )
             derived = derive_edge_id(
                 snapshot_id=snapshot_id,

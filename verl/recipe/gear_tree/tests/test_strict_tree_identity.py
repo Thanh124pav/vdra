@@ -192,6 +192,60 @@ class TestStrictNormalizer:
         with pytest.raises(ValueError, match="tree_instance_id"):
             normalize_generated_edges([edge], snapshot_id="snap0", strict=True)
 
+    def test_strict_rejects_generic_tree_instance_id(self):
+        # PLAN.md M3: a present-but-generic tree_instance_id like "t0" is
+        # truthy but structureless — strict mode must reject it.
+        with pytest.raises(ValueError, match="canonical tree_instance_id"):
+            normalize_generated_edges(
+                [self._edge(tree_instance_id="t0")],
+                snapshot_id="snap0",
+                strict=True,
+            )
+
+    @pytest.mark.parametrize(
+        "bad_id",
+        [
+            "t0",
+            "snap0",  # snapshot only
+            "snap0|iter:1|q:q0",  # missing tiebreaker
+            "snap0|q:q0|t:abc",  # missing iter marker
+            "snap0|iter:1|t:abc",  # missing question marker
+            "wrong|iter:1|q:q0|t:abc",  # snapshot mismatch
+            "snap0|iter:|q:q0|t:abc",  # empty iteration
+            "snap0|iter:1|q:|t:abc",  # empty question
+        ],
+    )
+    def test_strict_rejects_non_canonical_ids(self, bad_id):
+        with pytest.raises(ValueError, match="canonical tree_instance_id"):
+            normalize_generated_edges(
+                [self._edge(tree_instance_id=bad_id)],
+                snapshot_id="snap0",
+                strict=True,
+            )
+
+    def test_strict_accepts_canonical_builder_id(self):
+        tid = make_tree_instance_id(
+            policy_snapshot_id="snap0",
+            rollout_iteration=1,
+            stable_question_id="q0",
+        )
+        [edge] = normalize_generated_edges(
+            [self._edge(tree_instance_id=tid)],
+            snapshot_id="snap0",
+            strict=True,
+        )
+        assert edge["edge_id"].startswith("snap0:")
+
+    def test_generic_id_survives_in_non_strict_mode(self):
+        # Non-strict compatibility path keeps the legacy fallback for old
+        # fixtures — a generic id is not rejected there.
+        [edge] = normalize_generated_edges(
+            [self._edge(tree_instance_id="t0")],
+            snapshot_id="snap0",
+            strict=False,
+        )
+        assert edge["edge_id"].startswith("snap0:")
+
     def test_mismatching_supplied_edge_id_raises(self):
         with pytest.raises(ValueError, match="does not match"):
             normalize_generated_edges(
