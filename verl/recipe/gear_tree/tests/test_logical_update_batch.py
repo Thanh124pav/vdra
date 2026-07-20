@@ -278,6 +278,59 @@ class TestActorLogicalExecution:
         loss_m8 = sum(m2["actor/pg_loss"])
         assert loss_m4 == pytest.approx(2.0 * loss_m8, rel=1e-5)
 
+    def test_mixed_trainable_and_all_zero_batches_step_only_trainable(self):
+        """Required test 14: 3 logical batches, one all-zero → exactly 2
+        optimizer steps, and the two skip reasons are reported separately."""
+        slots = (
+            [_edge(0, 0.5), _edge(1, -0.5), _slot(0), _slot(1)]        # batch 0
+            + [_slot(2 + i) for i in range(4)]                          # batch 1
+            + [_edge(2, 0.3), _edge(3, -0.3), _slot(6), _slot(7)]       # batch 2
+        )
+        metrics, stats = self._run(slots, "segment_mean")
+        assert metrics["actor/num_optimizer_steps"] == [2]
+        assert metrics["actor/all_zero_advantage_logical_batches"] == [1]
+        assert metrics["actor/zero_active_token_logical_batches"] == [0]
+        assert stats["vdra/trainable_logical_batches"] == 2.0
+
+    def test_mixed_trainable_and_zero_active_token_batches(self):
+        """Required test 15: a batch whose trainable rows have NO active
+        token under the probability mask is skipped for the
+        zero_active_tokens reason — never conflated with all_zero_advantage."""
+        from recipe.gear_tree.tree_data import build_logical_update_batch
+
+        # Batch 0 trainable; batch 1 has nonzero-advantage rows whose tokens
+        # are all masked out (old prob >= threshold), so it has no signal.
+        inactive = [_edge(2, 0.3), _edge(3, -0.3)]
+        for e in inactive:
+            e["actor_shifted_log_probs"] = [-0.02, -0.02]  # exp ~= 0.98 > 0.9
+            e["prob_mask_token_count"] = 0
+        slots = (
+            [_edge(0, 0.5), _edge(1, -0.5), _slot(0), _slot(1)]
+            + inactive
+            + [_slot(2), _slot(3)]
+        )
+        batch, stats = build_logical_update_batch(
+            slots,
+            _tiny_actor.Tok(),
+            max_prompt_length=6,
+            max_response_length=4,
+            ppo_mini_batch_size=MINI,
+            dp_size=1,
+            loss_mode="vdra_segment_mean_ppo",
+            use_prob_mask=True,
+            probability_mask_threshold=0.9,
+        )
+        assert batch is not None
+        assert stats["vdra/zero_active_token_logical_batches"] == 1.0
+        assert stats["vdra/all_zero_advantage_logical_batches"] == 0.0
+        assert stats["vdra/trainable_logical_batches"] == 1.0
+        assert batch.meta_info["logical_batch_status"] == [
+            "trainable",
+            "zero_active_tokens",
+        ]
+        # The skipped batch contributes no tensor rows on any rank.
+        assert batch.batch["logical_batch_index"].tolist() == [0, 0]
+
     def test_canonical_aggregation_without_logical_structure_fails(self):
         """Required test 12: strict fail-fast when the logical denominator
         metadata is missing — no retained-row fallback."""

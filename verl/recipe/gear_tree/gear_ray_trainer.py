@@ -137,6 +137,18 @@ class RayGearTreeTrainer(RayPPOTrainer):
             trees_per_question=self._resolve_trees_per_question(),
             underfill_policy=replay_cfg.get("underfill_policy", "use_available"),
             sampling_seed=replay_cfg.get("sampling_seed", 0),
+            # PLAN.md §13: persist the objective-mask identity the stored
+            # zero-slot active counts are computed under.
+            use_prob_mask=bool(
+                self.config.actor_rollout_ref.actor.policy_loss.get(
+                    "use_prob_mask", True
+                )
+            ),
+            probability_mask_threshold=float(
+                self.config.actor_rollout_ref.actor.policy_loss.get(
+                    "probability_mask_threshold", 0.9
+                )
+            ),
         )
 
     def _ensure_replay_buffer(self) -> GearTreeReplayBuffer:
@@ -239,7 +251,20 @@ class RayGearTreeTrainer(RayPPOTrainer):
         ckpt_dir = Path(self._checkpoint_dir_for_step(self.global_steps))
         meta_path = ckpt_dir / "gear_tree_replay_buffer_meta.json"
         if replay_cfg.get("checkpoint", True) and meta_path.exists():
-            self.replay_buffer = GearTreeReplayBuffer.load(ckpt_dir)
+            # PLAN.md §13: a restored zero slot's active-token count was
+            # computed under a specific objective-mask configuration and can
+            # never be recomputed — verify compatibility or fail fast.
+            _pl = self.config.actor_rollout_ref.actor.policy_loss
+            self.replay_buffer = GearTreeReplayBuffer.load(
+                ckpt_dir,
+                expected_use_prob_mask=bool(_pl.get("use_prob_mask", True)),
+                expected_probability_mask_threshold=float(
+                    _pl.get("probability_mask_threshold", 0.9)
+                ),
+                reset_replay_on_objective_mismatch=bool(
+                    replay_cfg.get("reset_replay_on_objective_mismatch", False)
+                ),
+            )
             metrics["buffer/checkpoint_restored"] = 1.0
             metrics["buffer/restored_edges"] = float(len(self.replay_buffer))
         else:

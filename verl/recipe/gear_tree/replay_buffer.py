@@ -249,7 +249,13 @@ class GearTreeReplayBuffer:
         max_edges_per_question: Union[int, str, None] = None,
         underfill_policy: str = "use_available",
         sampling_seed: int = 0,
+        # PLAN.md §13: objective-mask identity persisted with the buffer so a
+        # resume can prove the stored zero-slot active counts still apply.
+        use_prob_mask: bool = True,
+        probability_mask_threshold: float = 0.9,
     ) -> None:
+        self.use_prob_mask = bool(use_prob_mask)
+        self.probability_mask_threshold = float(probability_mask_threshold)
         # PLAN.md P0.2: accept both the new canonical names and the deprecated
         # aliases. Prefer the new name if both are set to a non-default value.
         resolved_target = self._resolve_alias(
@@ -816,6 +822,13 @@ class GearTreeReplayBuffer:
             json.dumps(
                 {
                     "schema_version": self.schema_version,
+                    # PLAN.md §13: the objective-mask identity the stored zero
+                    # slots' active-token counts were computed under. A zero
+                    # slot's old-log-prob payload is gone, so those counts can
+                    # NEVER be recomputed for a different threshold.
+                    "logical_slot_schema_version": LOGICAL_SLOT_SCHEMA_VERSION,
+                    "use_prob_mask": self.use_prob_mask,
+                    "probability_mask_threshold": self.probability_mask_threshold,
                     # PLAN.md P0.2 canonical names.
                     "target_edges_per_iteration": self.target_edges_per_iteration,
                     "max_edge_age_iterations": self.max_edge_age_iterations,
@@ -850,9 +863,66 @@ class GearTreeReplayBuffer:
         tmp_meta.replace(meta_path)
 
     @classmethod
-    def load(cls, checkpoint_dir: str | Path) -> "GearTreeReplayBuffer":
+    def load(
+        cls,
+        checkpoint_dir: str | Path,
+        *,
+        expected_use_prob_mask: Optional[bool] = None,
+        expected_probability_mask_threshold: Optional[float] = None,
+        reset_replay_on_objective_mismatch: bool = False,
+    ) -> "GearTreeReplayBuffer":
+        """Restore a replay buffer, verifying objective-mask compatibility.
+
+        PLAN.md §13: stored zero slots are metadata-only — their
+        ``prob_mask_token_count`` was computed at extraction under a specific
+        threshold and can NEVER be recomputed (the old-log-prob payload was
+        intentionally discarded). Restoring such a buffer into a run with a
+        different mask configuration would silently reuse counts from another
+        objective, so it FAILS FAST unless the caller explicitly opts into
+        ``reset_replay_on_objective_mismatch``, which discards the rows
+        instead.
+
+        Passing no ``expected_*`` values skips the check (tooling/read-only
+        inspection); the trainer always passes them.
+        """
         source = Path(checkpoint_dir)
         meta = json.loads((source / "gear_tree_replay_buffer_meta.json").read_text(encoding="utf-8"))
+        saved_mask = meta.get("use_prob_mask")
+        saved_threshold = meta.get("probability_mask_threshold")
+        saved_slot_schema = int(meta.get("logical_slot_schema_version", 1))
+        objective_mismatch: Optional[str] = None
+        if expected_use_prob_mask is not None:
+            if saved_mask is None or saved_threshold is None:
+                objective_mismatch = (
+                    "replay checkpoint predates the logical-slot mask metadata "
+                    f"(logical_slot_schema_version={saved_slot_schema} < "
+                    f"{LOGICAL_SLOT_SCHEMA_VERSION}); its zero slots carry no "
+                    "verifiable active-token counts"
+                )
+            elif bool(saved_mask) != bool(expected_use_prob_mask):
+                objective_mismatch = (
+                    f"replay was built with use_prob_mask={bool(saved_mask)} "
+                    f"but this run uses {bool(expected_use_prob_mask)}"
+                )
+            elif (
+                expected_probability_mask_threshold is not None
+                and float(saved_threshold) != float(expected_probability_mask_threshold)
+            ):
+                objective_mismatch = (
+                    "replay was built with probability_mask_threshold="
+                    f"{float(saved_threshold)} but this run uses "
+                    f"{float(expected_probability_mask_threshold)}"
+                )
+        if objective_mismatch is not None and not reset_replay_on_objective_mismatch:
+            raise ValueError(
+                f"cannot restore replay: {objective_mismatch}. A zero slot's "
+                "prob_mask_token_count cannot be recomputed because its "
+                "old-log-prob payload was removed at extraction (PLAN.md "
+                "§13). Either resume with the original objective-mask "
+                "configuration, or set "
+                "replay_buffer.reset_replay_on_objective_mismatch=true to "
+                "DISCARD the replay and start collecting under the new one."
+            )
         # PLAN.md P0.2: prefer the new canonical field names when present so
         # that a resume-after-migration reads the new schema first; fall back
         # to the deprecated aliases for older checkpoints.
@@ -875,9 +945,30 @@ class GearTreeReplayBuffer:
             trees_per_question=int(meta.get("trees_per_question", 1) or 1),
             underfill_policy=meta.get("underfill_policy", "use_available"),
             sampling_seed=meta.get("sampling_seed", 0),
+            use_prob_mask=(
+                bool(expected_use_prob_mask)
+                if expected_use_prob_mask is not None
+                else bool(saved_mask if saved_mask is not None else True)
+            ),
+            probability_mask_threshold=(
+                float(expected_probability_mask_threshold)
+                if expected_probability_mask_threshold is not None
+                else float(saved_threshold if saved_threshold is not None else 0.9)
+            ),
         )
         buffer.metrics = dict(meta.get("metrics", {}))
         buffer._next_reservation_id = int(meta.get("next_reservation_id", 1))
+        if objective_mismatch is not None:
+            # PLAN.md §13: explicit opt-in — DISCARD the incompatible rows
+            # rather than silently reusing counts from another objective.
+            warnings.warn(
+                f"discarding replay rows: {objective_mismatch} "
+                "(reset_replay_on_objective_mismatch=true).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            buffer.metrics["replay_reset_on_objective_mismatch"] = 1
+            return buffer
         edge_file = source / "gear_tree_replay_buffer.jsonl"
         if edge_file.exists():
             for line in edge_file.read_text(encoding="utf-8").splitlines():

@@ -19,9 +19,28 @@ smoke_{a,b,c,d} Hydra compose + cross-level        validate cleanly
 Canonical contract exercised end to end on CPU:
 
 - `policy_aggregation=segment_mean` (default) and `token_mean` compute the
-  paper objectives with the trainer-stamped pre-filter `M_B`/`T_B`
-  denominators; the tree-balanced `1/(N_T·N_seg)` objective is a labeled
+  paper objectives with the trainer-stamped pre-filter denominators
+  (`M_B`, and for token_mean the mask-MATCHING `T_B_response` or
+  `T_B_prob_mask`); the tree-balanced `1/(N_T·N_seg)` objective is a labeled
   ablation (`tree_balanced_segment_mean`).
+- `use_prob_mask` is first-class in BOTH values with an authoritative
+  `probability_mask_threshold` (strict `<`, default 0.9). One shared
+  predicate (`recipe/gear_tree/prob_mask.py`) serves the actor mask and
+  extraction-time active-token counting, so they cannot drift; the trainer
+  propagates the resolved values to every rollout request.
+- Dummy padding rows are masked EXPLICITLY and contribute to no
+  denominator, numerator, or diagnostic under either `use_prob_mask` value.
+- Logical batches carry a status (`trainable` / `all_zero_advantage` /
+  `zero_active_tokens`); both skip reasons are reported separately and
+  `expected_optimizer_steps` counts only TRAINABLE batches, so a mixed
+  update is not marked accounting-invalid.
+- Strict canonical sparse mode requires `entropy_coeff == 0`,
+  `use_kl_loss == false`, `kl_loss_coef == 0` — sparse omission preserves
+  the policy-gradient term exactly but not a dense auxiliary objective.
+- Replay checkpoints persist the objective-mask identity (logical-slot
+  schema v2); restore fails fast on a mask/threshold mismatch or a legacy
+  checkpoint lacking active-token counts, with an explicit
+  `reset_replay_on_objective_mismatch` opt-out that DISCARDS the rows.
 - Sparse tensor execution over the logical-slot ledger: advantages from the
   complete sibling set, zero-advantage segments become metadata-only slots
   that count toward reservation / caps / `target_edges_per_iteration` /
