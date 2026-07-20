@@ -5,12 +5,16 @@ Three losses are registered here:
 * ``treetune_ppo`` — the byte-faithful port of treetune's
   ``PPOTrainer._compute_actor_loss`` used by SPO/TreeRL/TreePO/GEAR-*. Kept as
   the SPO baseline and legacy aggregation; see the module docstring below.
-* ``vdra_segment_mean_ppo`` — PLAN.md P0.1 / P0.4 canonical main-run loss.
-  It applies configurable within-segment token reduction and, in the preserved
-  host contract, one equal outer weight per selected replay slot. Stage 1 does
-  not change policy-loss normalization: tree and queue counts remain
-  diagnostics/validation inputs, and ``segment_objective_weights`` belongs
-  only to the explicit node-balanced ablation path.
+* ``vdra_segment_mean_ppo`` — canonical main-run loss. It applies configurable
+  within-segment token reduction and normalizes each retained row by the tree
+  segment mean ``w_s = 1 / (N_T * N_seg(T))``, where ``N_T`` is the unique-tree
+  count of the ORIGINAL optimizer batch and ``N_seg(T)`` is the PRE-FILTER
+  ``tree_total_segment_count`` — so removing exact-zero-advantage rows leaves
+  the loss unchanged. The historical batch-slot mean over retained replay
+  slots survives only behind the labeled ``batch_slot_mean_ablation`` flag.
+  No float ``segment_objective_weights`` tensor is needed on the canonical
+  path (it is derived from the integer counts); that tensor belongs only to
+  the explicit node-balanced ablation.
 * ``vdra_node_balanced_ppo`` — legacy parent-balanced ablation. NOT the main
   VDRA path (PLAN.md P0.1). Kept for controlled comparison runs; it must not
   be selected by the main config.

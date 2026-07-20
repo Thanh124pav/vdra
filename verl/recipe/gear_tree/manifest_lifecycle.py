@@ -22,6 +22,7 @@ from recipe.gear_tree.run_manifest import (
 from recipe.gear_tree.tree_data import (
     compute_group_metrics,
     compute_objective_weights,
+    is_canonical_tree_instance_id,
     validate_group_integrity,
     validate_objective_weights,
     validate_replay_batch,
@@ -166,17 +167,50 @@ def update_manifest_from_generated_edges(
             integrity_metrics["vdra/objective_weight_normalization_failed"] = 1.0
             # Non-fatal for the segment-mean main path.
 
-    # PLAN.md P0.H: REAL tree-identity verification at construction time —
-    # detects two stochastic trees for the same (question, snapshot)
-    # colliding under one tree_id, and forbids the ambiguous
-    # snapshot:question fallback identity. Far stronger than the old
-    # "tree-id set is non-empty" check.
-    tree_ids = {str(e.get("tree_id", "")) for e in generated_edges}
+    # PLAN.md P0.H / M4: REAL tree-identity verification at construction time.
+    # Edge-bearing trees are checked from their edges (duplicate
+    # (tree_id, child_segment_id) pairs and the ambiguous snapshot:question
+    # fallback). A tree whose every child had zero advantage retains NO edges,
+    # so its identity is invisible to the edge-based check — verify it from
+    # its construction summary instead, otherwise a legitimate all-zero tree
+    # would falsely leave unique_tree_ids_verified=False and invalidate the
+    # run. Both sources contribute to the verified identity set.
+    edge_tree_ids = {str(e.get("tree_id", "")) for e in generated_edges}
     ids_ok, id_failures = verify_tree_instance_id_uniqueness(generated_edges)
-    manifest.extras["unique_tree_ids_verified"] = ids_ok and bool(tree_ids)
-    manifest.extras["unique_tree_ids_count"] = len(tree_ids)
-    manifest.unique_tree_ids_verified = ids_ok and bool(tree_ids)
-    integrity_metrics["vdra/unique_tree_ids"] = float(len(tree_ids))
+    summary_only_tree_ids: set = set()
+    for summary in construction_summaries or []:
+        if int(summary.get("retained_edge_count", 0) or 0) != 0:
+            # Edge-bearing tree: its id already rides on its edges above.
+            continue
+        tid = str(summary.get("tree_id", ""))
+        if not tid:
+            id_failures.append(
+                "all-zero tree construction summary is missing a tree_id"
+            )
+            continue
+        # PLAN.md M3: an all-zero tree never passes strict edge normalization,
+        # so its canonical structure is validated here instead.
+        if strict and not is_canonical_tree_instance_id(
+            tid, snapshot_id=tid.split("|", 1)[0]
+        ):
+            id_failures.append(
+                f"all-zero tree summary tree_id {tid!r} is not a canonical "
+                "tree identity"
+            )
+            continue
+        if tid in edge_tree_ids or tid in summary_only_tree_ids:
+            id_failures.append(
+                f"all-zero tree summary tree_id {tid!r} collides with another "
+                "tree"
+            )
+            continue
+        summary_only_tree_ids.add(tid)
+    ids_ok = not id_failures
+    all_tree_ids = edge_tree_ids | summary_only_tree_ids
+    manifest.extras["unique_tree_ids_verified"] = ids_ok and bool(all_tree_ids)
+    manifest.extras["unique_tree_ids_count"] = len(all_tree_ids)
+    manifest.unique_tree_ids_verified = ids_ok and bool(all_tree_ids)
+    integrity_metrics["vdra/unique_tree_ids"] = float(len(all_tree_ids))
     integrity_metrics["vdra/tree_id_collisions"] = float(len(id_failures))
     if not ids_ok:
         manifest.extras["tree_id_collision_details"] = id_failures[:5]

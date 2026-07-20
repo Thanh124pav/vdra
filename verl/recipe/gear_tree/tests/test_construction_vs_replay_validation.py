@@ -266,7 +266,9 @@ def _zero_filter_tree(num_children=3, zero_mask=(False, False, True)):
             "_treetune__idx": "q1",
             "policy_snapshot_id": "snap",
             "rollout_iteration": 3,
-            "tree_instance_id": "T-zero-filter-1",
+            # Canonical make_tree_instance_id shape so an all-zero tree passes
+            # strict manifest identity verification.
+            "tree_instance_id": "snap|iter:3|q:q1|t:zf1",
         },
         "reward": 0.0,
         "full_text": "root",
@@ -376,3 +378,85 @@ class TestZeroFilterConstructionContract:
         assert {e["queue_flush_id"] for e in edges} == {0}
         metrics = validate_tree_construction(edges, strict_fresh_iid=True)
         assert metrics["vdra/queue_segment_identity_failures"] == 0.0
+
+
+def _all_zero_summary(tree_id="snap0|iter:1|q:q0|t:abcd", *, k=3, tid_pg="pg0"):
+    """A construction summary for a tree whose every child had zero advantage:
+    zero retained edges, but the pre-filter facts are intact."""
+    return {
+        "tree_id": tree_id,
+        "question_id": "q0",
+        "tree_total_segment_count": k,
+        "retained_edge_count": 0,
+        "queue_released_segment_count": {"0": k},
+        "parent_construction": {
+            tid_pg: {"realized": k, "allocated_k": k, "retained": 0}
+        },
+    }
+
+
+class TestAllZeroTreeManifestIdentity:
+    """Finish Medium Stage / M4 follow-up: a tree whose every child had zero
+    advantage retains no edges, so its identity lives only in the construction
+    summary. Manifest identity verification must count it — otherwise a valid
+    all-zero tree falsely leaves unique_tree_ids_verified=False."""
+
+    def test_all_zero_only_batch_verifies_tree_identity(self):
+        manifest = _manifest()
+        update_manifest_from_generated_edges(
+            manifest,
+            [],  # every tree fully zero-filtered
+            strict=True,
+            construction_summaries=[_all_zero_summary()],
+        )
+        assert manifest.unique_tree_ids_verified is True
+        assert manifest.group_integrity_failures == 0
+        assert manifest.segment_count_invariants_passed is True
+
+    def test_generic_all_zero_tree_id_is_rejected_strict(self):
+        manifest = _manifest()
+        with pytest.raises(ValueError, match="canonical"):
+            update_manifest_from_generated_edges(
+                manifest,
+                [],
+                strict=True,
+                construction_summaries=[_all_zero_summary(tree_id="t0")],
+            )
+        assert manifest.unique_tree_ids_verified is False
+
+    def test_two_all_zero_trees_sharing_id_is_a_collision(self):
+        manifest = _manifest()
+        dup = _all_zero_summary()
+        with pytest.raises(ValueError, match="collides"):
+            update_manifest_from_generated_edges(
+                manifest,
+                [],
+                strict=True,
+                construction_summaries=[dup, dict(dup)],
+            )
+        assert manifest.unique_tree_ids_verified is False
+
+    def test_all_zero_tree_colliding_with_edge_tree_is_a_collision(self):
+        manifest = _manifest()
+        shared = "snap0|iter:1|q:q0|t:abcd"
+        edges = _full_tree(k=2)
+        for e in edges:
+            e["tree_id"] = shared
+        with pytest.raises(ValueError, match="collides"):
+            update_manifest_from_generated_edges(
+                manifest,
+                edges,
+                strict=True,
+                construction_summaries=[_all_zero_summary(tree_id=shared)],
+            )
+
+    def test_mixed_batch_counts_both_edge_and_all_zero_trees(self):
+        manifest = _manifest()
+        edges = _full_tree(k=2)  # tree_id "t0" (legacy, fine for edges)
+        update_manifest_from_generated_edges(
+            manifest,
+            edges,
+            strict=True,
+            construction_summaries=[_all_zero_summary()],
+        )
+        assert manifest.unique_tree_ids_verified is True
