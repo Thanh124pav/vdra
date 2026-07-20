@@ -7,6 +7,10 @@
 # This isolates the effect of adaptive tree construction under the old
 # token-mean optimizer. It is an ablation, not a canonical VDRA run — the
 # manifest labels it as such (policy_aggregation != vdra_node_balanced).
+#
+# PLAN.md M5: the strict canonical main path requires the exact triple
+# spo / global_segment_mean / vdra_segment_mean_ppo, so this legacy-loss
+# ablation must run with strict_vdra=false.
 
 tree_policy:
   advantage_mode: spo_local
@@ -17,7 +21,7 @@ tree_policy:
 gear_tree:
   gear:
     enabled: true
-    strict_vdra: true
+    strict_vdra: false
     k_algorithm: budget_allocation
     allocation_runtime: online_timeout
     pilot_execution_mode: fresh_iid

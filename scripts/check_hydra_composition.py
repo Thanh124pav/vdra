@@ -74,6 +74,15 @@ def check_canonical(cfg) -> None:
         gear.allocation_runtime == "online_timeout",
         f"gear.allocation_runtime={gear.allocation_runtime}",
     )
+    # PLAN.md M5: the strict canonical triple requires tree_update_mode=spo.
+    _require(
+        str(cfg.gear_tree.tree_update_mode) == "spo",
+        f"gear_tree.tree_update_mode={cfg.gear_tree.tree_update_mode}",
+    )
+    _require(
+        bool(gear.get("strict_vdra", True)),
+        "gear.strict_vdra must be true on the canonical main path",
+    )
 
     actor = cfg.actor_rollout_ref.actor
     _require(

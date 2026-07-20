@@ -81,35 +81,54 @@ def validate_policy_loss_consistency(
             "actor_rollout_ref.actor.policy_loss.segment_token_reduction "
             f"({actor_reduction!r}) (PLAN.md P0.1)."
         )
+
+    # PLAN.md M5: the node-balanced aggregation and its loss are a matched
+    # pair — enforce the mapping in BOTH directions regardless of strict mode.
+    # The canonical global_segment_mean aggregation always needs its
+    # segment-mean loss; check the aggregation->loss direction first so a
+    # misconfigured canonical run reports the segment-mean requirement.
+    if policy_agg == "vdra_node_balanced" and actor_loss_mode != "vdra_node_balanced_ppo":
+        raise ValueError(
+            "tree_policy.policy_aggregation=vdra_node_balanced requires "
+            "actor_rollout_ref.actor.policy_loss.loss_mode=vdra_node_balanced_ppo "
+            f"(PLAN.md M5); got {actor_loss_mode!r}."
+        )
+    if policy_agg == "global_segment_mean" and actor_loss_mode != "vdra_segment_mean_ppo":
+        raise ValueError(
+            "tree_policy.policy_aggregation=global_segment_mean requires "
+            "actor_rollout_ref.actor.policy_loss.loss_mode=vdra_segment_mean_ppo "
+            f"(PLAN.md M5); got {actor_loss_mode!r}."
+        )
+    if actor_loss_mode == "vdra_node_balanced_ppo" and policy_agg != "vdra_node_balanced":
+        raise ValueError(
+            "loss_mode=vdra_node_balanced_ppo is only valid when "
+            "tree_policy.policy_aggregation=vdra_node_balanced "
+            "(labeled ablation, PLAN.md M5)."
+        )
+
     if strict:
-        if tree_update_mode in {"treepo_original", "treerl_original"}:
+        # PLAN.md M5: the strict canonical main path must be the exact
+        # triple spo / global_segment_mean / vdra_segment_mean_ppo. This
+        # rejects the deprecated `_original` aliases AND the
+        # `*_style_ablation` tree_update_modes on the canonical main path,
+        # because neither is `spo`.
+        if tree_update_mode != "spo":
             raise ValueError(
-                "strict VDRA main runs must not use the deprecated "
-                "tree_update_mode aliases (PLAN.md P1.R7); rename to "
-                "'*_style_ablation' or set strict_vdra=false."
+                "strict VDRA main runs require tree_update_mode='spo' "
+                f"(PLAN.md M5); got {tree_update_mode!r}. The "
+                "treepo_style_ablation / treerl_style_ablation / *_original "
+                "modes are ablations — set strict_vdra=false to run them."
             )
-        if (
-            policy_agg == "vdra_node_balanced"
-            and tree_update_mode
-            in {"treepo_style_ablation", "treerl_style_ablation"}
-        ):
+        if policy_agg != "global_segment_mean":
             raise ValueError(
-                "The style-ablation tree_update_modes are not main-paper "
-                "advantage estimators (PLAN.md P1.R7)."
+                "strict VDRA main runs require "
+                "tree_policy.policy_aggregation='global_segment_mean' "
+                f"(PLAN.md M5); got {policy_agg!r}. Set strict_vdra=false for "
+                "legacy_token_mean / vdra_node_balanced ablations."
             )
-        # PLAN.md P0.1: the canonical main policy_aggregation is
-        # global_segment_mean, which requires vdra_segment_mean_ppo. The
-        # legacy vdra_node_balanced_ppo must not appear in the strict main
-        # config; keep it available only when strict_vdra=false (ablation).
-        if policy_agg == "global_segment_mean" and actor_loss_mode != "vdra_segment_mean_ppo":
+        if actor_loss_mode != "vdra_segment_mean_ppo":
             raise ValueError(
-                "tree_policy.policy_aggregation=global_segment_mean requires "
-                "actor_rollout_ref.actor.policy_loss.loss_mode=vdra_segment_mean_ppo "
-                f"(PLAN.md P0.1); got {actor_loss_mode!r}."
-            )
-        if actor_loss_mode == "vdra_node_balanced_ppo" and policy_agg != "vdra_node_balanced":
-            raise ValueError(
-                "loss_mode=vdra_node_balanced_ppo is only valid when "
-                "tree_policy.policy_aggregation=vdra_node_balanced "
-                "(labeled ablation, PLAN.md P0.1)."
+                "strict VDRA main runs require "
+                "actor_rollout_ref.actor.policy_loss.loss_mode="
+                f"'vdra_segment_mean_ppo' (PLAN.md M5); got {actor_loss_mode!r}."
             )

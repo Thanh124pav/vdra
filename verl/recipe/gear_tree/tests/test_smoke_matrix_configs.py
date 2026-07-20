@@ -168,3 +168,28 @@ def test_smoke_b_and_c_are_labelled_as_ablations():
         c["actor_rollout_ref"]["actor"]["policy_loss"]["loss_mode"]
         == "vdra_node_balanced_ppo"
     )
+    # PLAN.md M5: non-canonical loss/aggregation ablations must NOT run under
+    # strict_vdra (the strict canonical triple would reject them at startup).
+    assert b["gear_tree"]["gear"]["strict_vdra"] is False
+    assert c["gear_tree"]["gear"]["strict_vdra"] is False
+
+
+def test_smoke_ablations_pass_config_consistency_validation():
+    # PLAN.md M5: every shipped smoke overlay must pass the same startup
+    # config validation the trainer runs, so none of them can be launched into
+    # an inconsistent aggregation/loss pairing.
+    from omegaconf import OmegaConf
+
+    from recipe.gear_tree.config_validation import (
+        validate_policy_loss_consistency,
+    )
+
+    for name in (
+        "smoke_a_spo_baseline",
+        "smoke_b_vdra_alloc_legacy_loss",
+        "smoke_c_uniform_alloc_node_balanced",
+        "smoke_d_full_vdra",
+    ):
+        cfg = OmegaConf.create(_resolved(name))
+        # Should not raise.
+        assert validate_policy_loss_consistency(cfg) is None, name

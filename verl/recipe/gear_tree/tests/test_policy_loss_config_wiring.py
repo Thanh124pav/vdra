@@ -460,3 +460,140 @@ class TestStartupConsistencyCheck:
             gear_ray_trainer.RayGearTreeTrainer._validate_replay_startup
         )
         assert "validate_policy_loss_consistency(" in source
+
+
+class TestM5StrictCanonicalTriple:
+    """PLAN.md M5: strict_vdra=true requires the exact canonical triple
+    tree_update_mode=spo / policy_aggregation=global_segment_mean /
+    loss_mode=vdra_segment_mean_ppo, and the node-balanced aggregation/loss
+    mapping is enforced in both directions regardless of strict mode."""
+
+    def _config(
+        self,
+        *,
+        strict=True,
+        tree_update_mode="spo",
+        policy_aggregation="global_segment_mean",
+        loss_mode="vdra_segment_mean_ppo",
+        reduction="mean",
+    ):
+        return OmegaConf.create(
+            {
+                "gear_tree": {
+                    "tree_shape": [6, 6, 6],
+                    "segment_length": 100,
+                    "tree_update_mode": tree_update_mode,
+                    "gear": {"strict_vdra": strict},
+                    "replay_buffer": {},
+                },
+                "tree_policy": {
+                    "policy_aggregation": policy_aggregation,
+                    "segment_token_reduction": reduction,
+                },
+                "actor_rollout_ref": {
+                    "actor": {
+                        "policy_loss": {
+                            "loss_mode": loss_mode,
+                            "segment_token_reduction": reduction,
+                        }
+                    }
+                },
+            }
+        )
+
+    def _validate(self, cfg):
+        from recipe.gear_tree.config_validation import (
+            validate_policy_loss_consistency,
+        )
+
+        return validate_policy_loss_consistency(cfg)
+
+    def test_canonical_triple_passes(self):
+        assert self._validate(self._config()) is None
+
+    def test_strict_rejects_treepo_style_ablation(self):
+        with pytest.raises(ValueError, match="tree_update_mode"):
+            self._validate(self._config(tree_update_mode="treepo_style_ablation"))
+
+    def test_strict_rejects_treerl_style_ablation(self):
+        with pytest.raises(ValueError, match="tree_update_mode"):
+            self._validate(self._config(tree_update_mode="treerl_style_ablation"))
+
+    def test_strict_rejects_original_aliases(self):
+        with pytest.raises(ValueError, match="tree_update_mode"):
+            self._validate(self._config(tree_update_mode="treepo_original"))
+        with pytest.raises(ValueError, match="tree_update_mode"):
+            self._validate(self._config(tree_update_mode="treerl_original"))
+
+    def test_strict_rejects_non_spo_tree_update_mode(self):
+        with pytest.raises(ValueError, match="tree_update_mode"):
+            self._validate(self._config(tree_update_mode="something_else"))
+
+    def test_strict_rejects_legacy_token_mean_aggregation(self):
+        # legacy_token_mean uses treetune_ppo; strict must reject the whole
+        # non-canonical config (reported via the aggregation requirement).
+        with pytest.raises(ValueError, match="global_segment_mean"):
+            self._validate(
+                self._config(
+                    policy_aggregation="legacy_token_mean",
+                    loss_mode="treetune_ppo",
+                )
+            )
+
+    def test_strict_rejects_node_balanced_aggregation(self):
+        with pytest.raises(ValueError, match="global_segment_mean"):
+            self._validate(
+                self._config(
+                    policy_aggregation="vdra_node_balanced",
+                    loss_mode="vdra_node_balanced_ppo",
+                )
+            )
+
+    def test_node_balanced_requires_node_balanced_loss(self):
+        # Reverse mapping, non-strict ablation: vdra_node_balanced aggregation
+        # with the wrong loss is rejected even when strict_vdra=false.
+        with pytest.raises(ValueError, match="vdra_node_balanced_ppo"):
+            self._validate(
+                self._config(
+                    strict=False,
+                    tree_update_mode="spo",
+                    policy_aggregation="vdra_node_balanced",
+                    loss_mode="vdra_segment_mean_ppo",
+                )
+            )
+
+    def test_node_balanced_loss_requires_node_balanced_aggregation(self):
+        with pytest.raises(ValueError, match="vdra_node_balanced"):
+            self._validate(
+                self._config(
+                    strict=False,
+                    policy_aggregation="legacy_token_mean",
+                    loss_mode="vdra_node_balanced_ppo",
+                )
+            )
+
+    def test_node_balanced_ablation_passes_non_strict(self):
+        # smoke_c cell: strict_vdra=false + matched node-balanced pair.
+        assert (
+            self._validate(
+                self._config(
+                    strict=False,
+                    policy_aggregation="vdra_node_balanced",
+                    loss_mode="vdra_node_balanced_ppo",
+                )
+            )
+            is None
+        )
+
+    def test_legacy_loss_ablation_passes_non_strict(self):
+        # smoke_b cell: strict_vdra=false + legacy_token_mean + treetune_ppo.
+        assert (
+            self._validate(
+                self._config(
+                    strict=False,
+                    policy_aggregation="legacy_token_mean",
+                    loss_mode="treetune_ppo",
+                )
+            )
+            is None
+        )
