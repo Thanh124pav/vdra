@@ -26,6 +26,15 @@ import os
 
 import pytest
 
+try:  # namespace-package import under PYTHONPATH=verl
+    from recipe.gear_tree.tests import _test_shims
+except ImportError:  # flat import when mp.spawn re-imports this module
+    import _test_shims
+
+# mp.spawn children re-import this module (to unpickle ``_worker``) without
+# running conftest.py, so the transformers shim must install here too.
+_test_shims.install()
+
 torch = pytest.importorskip("torch")
 
 import torch.distributed as dist  # noqa: E402
