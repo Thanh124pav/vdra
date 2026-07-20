@@ -416,10 +416,19 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 "so raw generation-time log-probability edges are available."
             )
 
-        from recipe.gear_tree.async_tree_rollout import collect_tree_edges
+        from recipe.gear_tree.async_tree_rollout import (
+            collect_tree_construction_summaries,
+            collect_tree_edges,
+        )
 
         rollout_out = self.actor_rollout_wg.generate_sequences(gen_batch)
         edges = collect_tree_edges(rollout_out)
+        # Zero-filter contract: per-tree construction summaries preserve the
+        # realized/allocated facts of parents (or whole trees) whose retained
+        # edge set is empty because every child had exactly zero advantage.
+        self._last_construction_summaries = collect_tree_construction_summaries(
+            rollout_out
+        )
         return self._normalize_generated_edges(edges, snapshot_id=snapshot_id)
 
     def _normalize_generated_edges(
@@ -604,11 +613,17 @@ class RayGearTreeTrainer(RayPPOTrainer):
         generated_edges: List[Dict[str, Any]],
         *,
         strict: bool,
+        construction_summaries: List[Dict[str, Any]] | None = None,
     ) -> Dict[str, Any]:
         """PLAN.md P0.B: construction-stage validation of the COMPLETE
-        generated batch, before replay insertion."""
+        generated batch, before replay insertion. ``construction_summaries``
+        carry the pre-filter facts of parents/trees whose every child was
+        zero-filtered away (they have no rows in ``generated_edges``)."""
         return update_manifest_from_generated_edges(
-            manifest, generated_edges, strict=strict
+            manifest,
+            generated_edges,
+            strict=strict,
+            construction_summaries=construction_summaries,
         )
 
     def _update_manifest_from_replay_batch(
@@ -776,10 +791,16 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 # complete generated batch, before replay insertion. This is
                 # the only stage that may require complete parent groups and
                 # full-tree queue identities.
-                if new_edges:
+                construction_summaries = list(
+                    getattr(self, "_last_construction_summaries", []) or []
+                )
+                if new_edges or construction_summaries:
                     construction_metrics = (
                         self._update_manifest_from_generated_edges(
-                            self.run_manifest, new_edges, strict=manifest_strict
+                            self.run_manifest,
+                            new_edges,
+                            strict=manifest_strict,
+                            construction_summaries=construction_summaries,
                         )
                     )
                     metrics.update(construction_metrics)

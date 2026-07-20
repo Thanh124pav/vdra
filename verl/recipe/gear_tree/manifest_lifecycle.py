@@ -91,6 +91,7 @@ def update_manifest_from_generated_edges(
     generated_edges: List[Dict[str, Any]],
     *,
     strict: bool,
+    construction_summaries: List[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     """PLAN.md P0.B: CONSTRUCTION-stage manifest update.
 
@@ -100,12 +101,21 @@ def update_manifest_from_generated_edges(
     canonical path validates observed accounting facts only; objective
     weights are computed/validated solely for the node-balanced ablation
     (PLAN.md M4).
+
+    ``construction_summaries`` are the extraction-time per-tree summaries.
+    They carry the construction facts of parents (or whole trees) whose
+    every child had exactly zero advantage — those rows are intentionally
+    absent from ``generated_edges`` and never re-enter replay, so the
+    summary is the only place their ``realized == allocated_k`` contract
+    can still be checked.
     """
     integrity_metrics: Dict[str, Any] = {}
     raised: Exception | None = None
     try:
         integrity_metrics = validate_tree_construction(
-            generated_edges, strict_fresh_iid=strict
+            generated_edges,
+            strict_fresh_iid=strict,
+            construction_summaries=construction_summaries,
         )
     except ValueError as exc:
         raised = exc
@@ -118,8 +128,11 @@ def update_manifest_from_generated_edges(
     group_failures = int(
         integrity_metrics.get("vdra/group_integrity_failures", 0) or 0
     )
-    if group_failures:
-        manifest.record_integrity_failure(group_failures)
+    summary_failures = int(
+        float(integrity_metrics.get("vdra/construction_summary_failures", 0) or 0)
+    )
+    if group_failures or summary_failures:
+        manifest.record_integrity_failure(group_failures + summary_failures)
         manifest.fresh_iid_row_count_matches_allocated_k = False
     else:
         manifest.fresh_iid_row_count_matches_allocated_k = True
@@ -202,6 +215,7 @@ def update_manifest_from_generated_edges(
     if (
         queue_failures == 0
         and allocation_failures == 0
+        and summary_failures == 0
         and duplicate_edge_ids == 0
         and missing_edge_ids == 0
         and pruned_rows == 0

@@ -142,13 +142,47 @@ def test_validate_group_integrity_accepts_well_formed_fresh_iid_tree():
     assert stats["vdra/fresh_iid_parent_groups"] == 2
 
 
-def test_validate_group_integrity_rejects_partial_parent_group():
-    # Drop one of parent A's children — group becomes partial.
+def test_validate_group_integrity_allows_zero_filtered_subset():
+    # Zero-filter contract: rows stamped with realized_child_count ==
+    # allocated_k may legitimately be a strict subset of the realized
+    # children (exact-zero advantages are removed), so a partial retained
+    # group must PASS as long as the pre-filter facts hold.
     edges = extract_edges_from_tree(_tree_two_parents(), only_adv_greater_than_zero=False)
+    a_edges = [e for e in edges if e["parent_segment_id"] == "root/0/0"]
+    partial_edges = [e for e in edges if e is not a_edges[0]]
+    stats = validate_group_integrity(partial_edges, strict_fresh_iid=True)
+    assert stats["vdra/group_integrity_failures"] == 0
+
+
+def test_validate_group_integrity_rejects_construction_shortfall():
+    # A parent that genuinely realized fewer children than allocated_k at
+    # construction time must still fail — the pre-filter realized stamp
+    # (or, for unstamped legacy rows, the retained count) is compared
+    # against the allocation.
+    edges = extract_edges_from_tree(_tree_two_parents(), only_adv_greater_than_zero=False)
+    a_edges = [e for e in edges if e["parent_segment_id"] == "root/0/0"]
+    for e in a_edges:
+        e["realized_child_count"] = 1
+    with pytest.raises(ValueError, match="allocated_k"):
+        validate_group_integrity(edges, strict_fresh_iid=True)
+    # Legacy rows without the stamp: dropping a sibling means realized falls
+    # back to the retained count and the shortfall is still detected.
+    edges = extract_edges_from_tree(_tree_two_parents(), only_adv_greater_than_zero=False)
+    for e in edges:
+        e.pop("realized_child_count", None)
     a_edges = [e for e in edges if e["parent_segment_id"] == "root/0/0"]
     partial_edges = [e for e in edges if e is not a_edges[0]]
     with pytest.raises(ValueError, match="allocated_k"):
         validate_group_integrity(partial_edges, strict_fresh_iid=True)
+
+
+def test_validate_group_integrity_rejects_retained_overflow():
+    # More retained rows than allocated_k is always a defect.
+    edges = extract_edges_from_tree(_tree_two_parents(), only_adv_greater_than_zero=False)
+    a_edges = [e for e in edges if e["parent_segment_id"] == "root/0/0"]
+    extra = dict(a_edges[0])
+    with pytest.raises(ValueError, match="exceeds allocated_k"):
+        validate_group_integrity(edges + [extra], strict_fresh_iid=True)
 
 
 def test_validate_group_integrity_ignores_multiplicity_for_weighted_reuse():

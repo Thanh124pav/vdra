@@ -431,8 +431,17 @@ def validate_group_integrity(
       * every row sharing a ``parent_group_id`` shares one ``tree_group_id``;
       * every row sharing a ``parent_group_id`` shares one ``allocated_k``;
       * fresh_iid groups (sample_multiplicity == 1 across every row of the
-        group) have row_count == allocated_k;
-      * no parent group is silently split or partially dropped.
+        group) satisfy the PRE-FILTER construction contract
+        ``realized_child_count == allocated_k`` and the retained-row bound
+        ``row_count <= allocated_k``.
+
+    The retained row count is deliberately NOT required to equal
+    ``allocated_k``: exact-zero-advantage edges are intentionally removed by
+    the Stage 1 zero filter, so a fresh_iid group may legitimately retain a
+    strict subset of its realized children. Rows stamped with
+    ``realized_child_count`` at extraction time carry the pre-filter fact;
+    legacy rows without the stamp fall back to the retained row count
+    (retained == realized by construction for pre-zero-filter fixtures).
 
     Returns a small diagnostics dict for logging.
     """
@@ -458,13 +467,31 @@ def validate_group_integrity(
         mults = [int(e.get("sample_multiplicity", 1) or 1) for e in group]
         if all(m == 1 for m in mults):
             fresh_iid_group_count += 1
-            # PLAN.md P0.N4: always detect a partial fresh_iid parent group;
-            # ``strict_fresh_iid`` only decides whether to raise.
             expected = next(iter(allocated_values), 0)
-            if expected and len(group) != expected:
+            # Zero-filter contract: validate the PRE-FILTER realized count
+            # against the allocation and bound the retained rows by it —
+            # never require retained == allocated_k, because exact-zero
+            # advantage edges are intentionally removed.
+            realized_values = {
+                int(e["realized_child_count"])
+                for e in group
+                if e.get("realized_child_count") is not None
+            }
+            if len(realized_values) > 1:
                 failures.append(
-                    f"fresh_iid parent_group_id={pgid!r} has {len(group)} rows "
-                    f"but allocated_k={expected}"
+                    f"fresh_iid parent_group_id={pgid!r} has inconsistent "
+                    f"realized_child_count={sorted(realized_values)}"
+                )
+            realized = next(iter(realized_values), len(group))
+            if expected and realized != expected:
+                failures.append(
+                    f"fresh_iid parent_group_id={pgid!r} realized {realized} "
+                    f"children but allocated_k={expected}"
+                )
+            if expected and len(group) > expected:
+                failures.append(
+                    f"fresh_iid parent_group_id={pgid!r} retained {len(group)} "
+                    f"rows which exceeds allocated_k={expected}"
                 )
         else:
             weighted_group_count += 1
@@ -652,17 +679,31 @@ def _queue_segment_identity_failures(
 
     Only meaningful on a COMPLETE generated tree — a partial replay sample
     is missing queues by design, so this must never run on sampled batches.
+
+    Zero-filter contract: when the tree carries its extraction-time
+    ``tree_summary`` the full PRE-FILTER queue map from that summary is used,
+    because a queue whose every edge had exactly zero advantage retains no
+    rows at all and would otherwise be miscounted as a construction failure.
     """
     from collections import defaultdict
 
     tree_totals: Dict[str, int] = {}
     queue_totals: Dict[str, int] = defaultdict(int)
     tree_queue_seen: Dict[Tuple[str, str], bool] = {}
+    summary_trees: set = set()
     for edge in edges:
         tid = str(edge.get("tree_id", ""))
         total = int(edge.get("tree_total_segment_count", 0) or 0)
         if total > 0:
             tree_totals[tid] = total
+        summary = edge.get("tree_summary")
+        if tid not in summary_trees and isinstance(summary, dict):
+            queue_map = summary.get("queue_released_segment_count")
+            if isinstance(queue_map, dict) and queue_map:
+                summary_trees.add(tid)
+                queue_totals[tid] = sum(int(v or 0) for v in queue_map.values())
+        if tid in summary_trees:
+            continue
         qid = str(edge.get("queue_flush_id", "0"))
         q_key = (tid, qid)
         if not tree_queue_seen.get(q_key):
@@ -683,6 +724,7 @@ def validate_tree_construction(
     edges: Sequence[Dict[str, Any]],
     *,
     strict_fresh_iid: bool = True,
+    construction_summaries: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """PLAN.md P0.B: full generated-tree construction validation.
 
@@ -692,13 +734,23 @@ def validate_tree_construction(
     complete parent groups and full-tree queue identities:
 
       * every parent group: one tree_id, one allocated_k;
-      * fresh_iid parent groups: row_count == allocated_k and
-        sample_multiplicity == 1 on every row;
+      * fresh_iid parent groups: pre-filter realized_child_count ==
+        allocated_k, retained row_count <= allocated_k, and
+        sample_multiplicity == 1 on every row (zero-filtered subsets are
+        legitimate — retained == allocated_k is NOT required);
       * edge IDs unique within the generated batch;
       * no pruned placeholder appears as a trainable edge;
       * per tree: sum_q queue_released_segment_count[q] ==
         tree_total_segment_count;
       * stored old log-probs align with response tokens.
+
+    ``construction_summaries``: extraction-time per-tree summaries (see
+    ``extract_edges_from_tree(collect_construction_summaries=...)``). They
+    are the only record of a parent — or an entire tree — whose every child
+    had exactly zero advantage: such rows are intentionally absent from
+    ``edges`` and must never be re-inserted into replay. When provided,
+    the summaries' pre-filter ``realized == allocated_k`` facts are
+    validated even for parents with zero retained rows.
 
     Raises ``ValueError`` on any failure when ``strict_fresh_iid``; returns
     a diagnostics dict either way.
@@ -741,6 +793,14 @@ def validate_tree_construction(
     queue_failures, queue_details = _queue_segment_identity_failures(edges)
     failures.extend(queue_details)
 
+    # Extraction-time construction summaries: the only construction record
+    # for parents/trees whose every child was zero-filtered away.
+    summary_failure_count = 0
+    if construction_summaries:
+        summary_details = _construction_summary_failures(construction_summaries)
+        summary_failure_count = len(summary_details)
+        failures.extend(summary_details)
+
     # Stored old log-probs must align with response tokens row by row.
     misaligned = 0
     for e in edges:
@@ -761,6 +821,7 @@ def validate_tree_construction(
             "vdra/queue_segment_identity_failures": float(queue_failures),
             "vdra/generated_duplicate_edge_ids": float(len(duplicate_ids)),
             "vdra/generated_pruned_rows": float(pruned_rows),
+            "vdra/construction_summary_failures": float(summary_failure_count),
         }
     )
     if failures and strict_fresh_iid:
@@ -769,6 +830,47 @@ def validate_tree_construction(
             + "\n  ".join(failures)
         )
     return metrics
+
+
+def _construction_summary_failures(
+    construction_summaries: Sequence[Dict[str, Any]],
+) -> List[str]:
+    """Validate extraction-time construction summaries.
+
+    Covers the facts that retained edges cannot represent: a parent (or a
+    whole tree) whose every child had exactly zero advantage retains no rows,
+    so its pre-filter ``realized == allocated_k`` contract and its queue
+    identity can only be checked here. Zero-filtered rows themselves are
+    never re-inserted into replay.
+    """
+    details: List[str] = []
+    for summary in construction_summaries:
+        tid = str(summary.get("tree_id", ""))
+        parent_facts = summary.get("parent_construction") or {}
+        for pgid, facts in parent_facts.items():
+            realized = int(facts.get("realized", 0) or 0)
+            allocated = int(facts.get("allocated_k", 0) or 0)
+            retained = int(facts.get("retained", 0) or 0)
+            if allocated and realized != allocated:
+                details.append(
+                    f"tree {tid!r} parent_group_id={pgid!r} realized "
+                    f"{realized} children but allocated_k={allocated}"
+                )
+            if allocated and retained > allocated:
+                details.append(
+                    f"tree {tid!r} parent_group_id={pgid!r} retained "
+                    f"{retained} rows which exceeds allocated_k={allocated}"
+                )
+        total = int(summary.get("tree_total_segment_count", 0) or 0)
+        queue_map = summary.get("queue_released_segment_count") or {}
+        if total and queue_map:
+            queue_sum = sum(int(v or 0) for v in queue_map.values())
+            if queue_sum != total:
+                details.append(
+                    f"tree {tid!r}: summary sum_q queue_released_segment_count"
+                    f" = {queue_sum} != tree_total_segment_count = {total}"
+                )
+    return details
 
 
 def validate_replay_batch(

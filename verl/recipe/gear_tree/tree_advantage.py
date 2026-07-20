@@ -38,6 +38,7 @@ def extract_edges_from_tree(
     treerl_gamma: float = 0.9,
     emit_pruned_edges: bool = False,
     strict_fresh_iid: bool = False,
+    collect_construction_summaries: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Extract treetune-compatible training edges from a generated tree.
 
@@ -50,6 +51,13 @@ def extract_edges_from_tree(
     and negative advantages are retained. Administrative ``pruned=True``
     placeholder rows must NOT enter replay; ``emit_pruned_edges`` defaults to
     ``False`` and is only for diagnostic dumps.
+
+    ``collect_construction_summaries``: when a list is passed, the per-tree
+    construction summary (pre-filter counts and per-parent
+    ``realized``/``allocated_k``/``retained`` facts) is appended to it even
+    when every edge of the tree is zero-filtered away. This is the only
+    channel that preserves construction facts for a parent/tree whose every
+    child has exactly zero advantage — such rows never enter replay.
 
     ``strict_fresh_iid`` enforces the fresh_iid invariants right at edge
     extraction:
@@ -297,18 +305,39 @@ def extract_edges_from_tree(
     # without another tree walk. ``tree_total_segment_count`` is the pre-filter
     # realized non-pruned segment count; queue_released_segment_count[q] is the
     # matching pre-filter queue count for logging / theoretical validation.
+    retained_by_parent: dict[str, int] = {}
+    for edge in edges:
+        pgid = str(edge.get("parent_group_id", ""))
+        retained_by_parent[pgid] = retained_by_parent.get(pgid, 0) + 1
     tree_summary = {
         "tree_id": str(tree_id),
+        "question_id": str(question_id),
         "expanded_parent_group_count": len(expanded_parent_group_ids),
         "trainable_child_count": int(trainable_child_count),
         "tree_total_segment_count": int(tree_total_segment_count),
+        "retained_edge_count": len(edges),
         "queue_to_parent_group_counts": {
             str(k): len(v) for k, v in queue_to_parent_group_counts.items()
         },
         "queue_released_segment_count": {
             str(k): int(v) for k, v in queue_released_segment_count.items()
         },
+        # Per-parent PRE-FILTER construction facts. This is the only record
+        # that survives for a parent whose every child was zero-filtered
+        # (retained == 0): such parents have no rows in ``edges`` at all.
+        "parent_construction": {
+            pgid: {
+                "realized": int(slot["realized"]),
+                "allocated_k": int(slot["allocated_k"]),
+                "retained": int(retained_by_parent.get(pgid, 0)),
+            }
+            for pgid, slot in realized_by_parent.items()
+        },
     }
+    if collect_construction_summaries is not None:
+        collect_construction_summaries.append(
+            json.loads(json.dumps(tree_summary))
+        )
     for edge in edges:
         edge.setdefault("tree_summary", tree_summary)
         # Preserve on every row so downstream splits do not lose it.

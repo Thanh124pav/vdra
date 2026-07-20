@@ -244,3 +244,135 @@ class TestManifestStageSplit:
             update_manifest_from_replay_batch(manifest, sampled, strict=True)
         assert manifest.replay_batch_failures == 1
         assert manifest.group_integrity_failures == 0
+
+
+def _zero_filter_tree(num_children=3, zero_mask=(False, False, True)):
+    """One-parent tree; children with zero_mask=True get exactly zero
+    advantage (reward equal to the root baseline)."""
+    children = []
+    for i in range(num_children):
+        children.append(
+            {
+                "reward": 0.0 if zero_mask[i] else 1.0,
+                "gear_segment_id": f"c{i}",
+                "response_token_ids": [i + 1],
+                "actor_shifted_log_probs": [-0.1],
+                "leaf": True,
+                "text": "x",
+            }
+        )
+    return {
+        "_request_object": {
+            "_treetune__idx": "q1",
+            "policy_snapshot_id": "snap",
+            "rollout_iteration": 3,
+            "tree_instance_id": "T-zero-filter-1",
+        },
+        "reward": 0.0,
+        "full_text": "root",
+        "full_token_ids": [1],
+        "vdra_allocated_k": num_children,
+        "vdra_queue_flush_id": 0,
+        "children": children,
+    }
+
+
+class TestZeroFilterConstructionContract:
+    """Finish Medium Stage item 1: fresh-IID construction validation must
+    require ``realized_child_count == allocated_k`` and
+    ``retained_row_count <= allocated_k`` — never
+    ``retained_row_count == allocated_k`` — because exact-zero-advantage
+    edges are intentionally removed."""
+
+    def _extract(self, tree, summaries=None):
+        from recipe.gear_tree.tree_advantage import extract_edges_from_tree
+
+        edges = extract_edges_from_tree(
+            tree,
+            only_adv_greater_than_zero=True,
+            strict_fresh_iid=True,
+            collect_construction_summaries=summaries,
+        )
+        for i, e in enumerate(edges):
+            e["edge_id"] = f"zf/e{i}"
+        return edges
+
+    def test_strict_three_realized_one_zero_removed_passes(self):
+        summaries: list = []
+        edges = self._extract(_zero_filter_tree(), summaries)
+        assert len(edges) == 2  # one zero edge removed
+        assert all(e["realized_child_count"] == 3 for e in edges)
+        assert all(e["allocated_k"] == 3 for e in edges)
+        metrics = validate_tree_construction(
+            edges, strict_fresh_iid=True, construction_summaries=summaries
+        )
+        assert metrics["vdra/construction_failures"] == 0
+        manifest = _manifest()
+        update_manifest_from_generated_edges(
+            manifest, edges, strict=True, construction_summaries=summaries
+        )
+        assert manifest.group_integrity_failures == 0
+        assert manifest.fresh_iid_row_count_matches_allocated_k is True
+        assert manifest.segment_count_invariants_passed is True
+
+    def test_all_zero_parent_preserves_construction_summary(self):
+        # Every child has exactly zero advantage: zero retained edges, but
+        # the construction facts survive in the separate summary and pass.
+        summaries: list = []
+        edges = self._extract(
+            _zero_filter_tree(zero_mask=(True, True, True)), summaries
+        )
+        assert edges == []  # zero edges never re-enter replay
+        assert len(summaries) == 1
+        facts = summaries[0]["parent_construction"]
+        assert len(facts) == 1
+        (parent_facts,) = facts.values()
+        assert parent_facts["realized"] == 3
+        assert parent_facts["allocated_k"] == 3
+        assert parent_facts["retained"] == 0
+        metrics = validate_tree_construction(
+            [], strict_fresh_iid=True, construction_summaries=summaries
+        )
+        assert metrics["vdra/construction_failures"] == 0
+        manifest = _manifest()
+        update_manifest_from_generated_edges(
+            manifest, [], strict=True, construction_summaries=summaries
+        )
+        assert manifest.group_integrity_failures == 0
+        assert manifest.fresh_iid_row_count_matches_allocated_k is True
+
+    def test_summary_construction_shortfall_still_fails(self):
+        # A summary showing realized != allocated_k is a real construction
+        # defect and must fail even with zero retained edges.
+        summaries: list = []
+        self._extract(_zero_filter_tree(zero_mask=(True, True, True)), summaries)
+        (facts,) = summaries[0]["parent_construction"].values()
+        facts["realized"] = 2
+        with pytest.raises(ValueError, match="allocated_k"):
+            validate_tree_construction(
+                [], strict_fresh_iid=True, construction_summaries=summaries
+            )
+        manifest = _manifest()
+        with pytest.raises(ValueError):
+            update_manifest_from_generated_edges(
+                manifest, [], strict=True, construction_summaries=summaries
+            )
+        assert manifest.group_integrity_failures >= 1
+        assert manifest.fresh_iid_row_count_matches_allocated_k is False
+
+    def test_whole_queue_zero_filtered_does_not_fail_queue_identity(self):
+        # All edges of one queue removed by the zero filter: the retained
+        # rows carry the full pre-filter queue map in tree_summary, so the
+        # queue identity must not report a false mismatch.
+        from recipe.gear_tree.tree_advantage import extract_edges_from_tree
+
+        tree = _zero_filter_tree(zero_mask=(False, False, True))
+        tree["children"][2]["vdra_queue_flush_id"] = 1
+        edges = extract_edges_from_tree(
+            tree, only_adv_greater_than_zero=True, strict_fresh_iid=True
+        )
+        for i, e in enumerate(edges):
+            e["edge_id"] = f"zfq/e{i}"
+        assert {e["queue_flush_id"] for e in edges} == {0}
+        metrics = validate_tree_construction(edges, strict_fresh_iid=True)
+        assert metrics["vdra/queue_segment_identity_failures"] == 0.0
