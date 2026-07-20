@@ -51,6 +51,17 @@ class PolicyLossConfig(BaseConfig):
         ratio_threshold (float): Diagnostic ratio threshold for VDRA losses.
             ``float('inf')`` disables the report (the canonical VDRA main path
             never uses this to drop microbatches — see PLAN.md P0.4).
+        policy_aggregation (str): Objective aggregation for the VDRA
+            segment-mean loss (PLAN.md §1.3, user decision 2026-07-21):
+            ``"segment_mean"`` — every original logical segment slot has equal
+            weight ``1/M_B`` (pre-filter logical-batch slot count);
+            ``"token_mean"`` — every original valid token has equal weight
+            ``1/T_B`` (pre-filter logical-batch token count);
+            ``"tree_balanced_segment_mean"`` — labeled ABLATION: the
+            historical ``w = 1/(N_T * N_seg(T))`` tree-balanced objective.
+            The retired name ``"global_segment_mean"`` fails fast with a
+            rename error (it must never silently mean the new uniform
+            ``segment_mean``).
         batch_slot_mean_ablation (bool): Labeled LEGACY ablation for the VDRA
             segment-mean loss. ``false`` (canonical) normalizes each row by
             ``1 / (N_T * N_seg(T))`` using the pre-filter
@@ -69,12 +80,21 @@ class PolicyLossConfig(BaseConfig):
     segment_token_reduction: str = "mean"
     use_prob_mask: bool = True
     ratio_threshold: float = float("inf")
+    # NOTE (migration): the temporary default preserves the pre-decision
+    # behavior until the canonical flip lands with the trainer-side logical
+    # batching (PLAN.md §3.3); the canonical default then becomes
+    # ``segment_mean``.
+    policy_aggregation: str = "tree_balanced_segment_mean"
     batch_slot_mean_ablation: bool = False
 
-    def __post_init__(self):
-        """PLAN.md P0.1: fail loudly on invalid segment_token_reduction.
+    _VALID_POLICY_AGGREGATIONS = ("token_mean", "segment_mean", "tree_balanced_segment_mean")
 
-        Only ``mean`` and ``sum`` are accepted (see PLAN.md §1.2 and P0.1). We
+    def __post_init__(self):
+        """PLAN.md P0.1/§1.3: fail loudly on invalid VDRA loss knobs.
+
+        Only ``mean`` and ``sum`` are accepted for
+        ``segment_token_reduction`` (see PLAN.md §1.2 and P0.1), and only the
+        three explicit aggregation names for ``policy_aggregation``. We
         normalise to lowercase so YAML overrides like ``Mean`` do not silently
         fall back to the default.
         """
@@ -90,6 +110,31 @@ class PolicyLossConfig(BaseConfig):
         # Field is a normal string on this frozen-ish dataclass wrapper; use
         # object.__setattr__ so BaseConfig's mutability guards do not fight us.
         object.__setattr__(self, "segment_token_reduction", normalised)
+
+        raw_agg = self.policy_aggregation
+        if raw_agg is None:
+            raw_agg = "tree_balanced_segment_mean"
+        agg = str(raw_agg).strip().lower()
+        if agg == "global_segment_mean":
+            raise ValueError(
+                "`global_segment_mean` was renamed to "
+                "`tree_balanced_segment_mean`. Use `segment_mean` only if "
+                "uniform weighting over all original segment slots is "
+                "intended (PLAN.md §1.3)."
+            )
+        if agg not in self._VALID_POLICY_AGGREGATIONS:
+            raise ValueError(
+                f"policy_aggregation={raw_agg!r} is invalid; must be exactly "
+                f"one of {self._VALID_POLICY_AGGREGATIONS} (PLAN.md §1.3)."
+            )
+        if agg == "token_mean" and normalised == "sum":
+            raise ValueError(
+                "policy_aggregation='token_mean' has no within-segment "
+                "reduction; segment_token_reduction='sum' would be silently "
+                "ignored, which strict VDRA forbids (PLAN.md §1.3). Leave "
+                "segment_token_reduction='mean'."
+            )
+        object.__setattr__(self, "policy_aggregation", agg)
 
 
 @dataclass

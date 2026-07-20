@@ -361,12 +361,34 @@ def compute_policy_loss_vdra_segment_mean(
     tree_total_segment_count: torch.Tensor | None = None,
     original_optimizer_batch_slot_count: int | None = None,
     original_optimizer_batch_tree_count: int | None = None,
+    original_logical_segment_count: float | None = None,
+    original_logical_token_count: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Canonical VDRA main-run loss (tree segment mean).
+    """VDRA main-run loss family (PLAN.md §1.3, user decision 2026-07-21).
 
-    Canonical semantics (main path)
-    ------------------------------
-    Per-row weights are computed over the ORIGINAL optimizer batch:
+    Canonical paper objectives (``policy_loss.policy_aggregation``)
+    ---------------------------------------------------------------
+    Both use the PRE-FILTER denominators of the LOGICAL optimizer batch the
+    rows were reserved into (stamped by the trainer, passed by
+    ``dp_actor.update_policy``; zero-advantage slots count in the
+    denominator even though they carry no tensor rows):
+
+        segment_mean:  L_B = sum_{u in rows} L_u^{mean} / M_B,
+                       M_B = original_logical_segment_count
+        token_mean:    L_B = sum_{u in rows} sum_t M_ut * ell_ut / T_B,
+                       T_B = original_logical_token_count
+
+    Example: advantages [pos, neg, 0, 0] -> tensor rows [L1, L2],
+    M_B = 4, segment_mean loss = (L1 + L2) / 4.
+
+    These paths return the LOCAL numerator over the fixed logical
+    denominator; the distributed dp-size compensation for the averaging
+    reducer lives in ``dp_actor`` (``loss_scale_factor``), never here.
+
+    Tree-balanced ablation (``policy_aggregation=tree_balanced_segment_mean``)
+    --------------------------------------------------------------------------
+    The historical objective, per-row weights over the ORIGINAL optimizer
+    batch:
 
         L_B = sum_{s in retained(B)} w_s * L_s^r,
         w_s = 1 / (N_T * N_seg(T)),
@@ -375,11 +397,8 @@ def compute_policy_loss_vdra_segment_mean(
     batch (passed by ``dp_actor.update_policy`` as
     ``original_optimizer_batch_tree_count`` so microbatch splits preserve
     it) and ``N_seg(T)`` is the PRE-FILTER ``tree_total_segment_count`` of
-    the row's tree. Because ``N_seg(T)`` is the pre-filter count, removing
-    exact-zero-advantage rows leaves the loss unchanged:
-
-        advantages [pos, neg, 0, 0] -> retained [L1, L2]
-        loss = (L1 + L2 + 0 + 0) / 4 = (L1 + L2) / 4.
+    the row's tree. Measured NON-parity under multi-rank FSDP dispatch
+    (docs/h1_fsdp_parity_report.md) — labeled ablation only.
 
     ``L_s^r`` is either ``TokenMean(pg_row)`` (``r=mean``) or the raw token
     sum (``r=sum``).
@@ -427,9 +446,92 @@ def compute_policy_loss_vdra_segment_mean(
 
     row_losses = _segment_row_losses(pg_losses, action_mask, reduction=reduction)
 
+    policy_aggregation = str(
+        _resolve_policy_loss_field(
+            config, "policy_aggregation", "tree_balanced_segment_mean"
+        )
+    ).strip().lower()
+    if policy_aggregation == "global_segment_mean":
+        raise ValueError(
+            "`global_segment_mean` was renamed to `tree_balanced_segment_mean`. "
+            "Use `segment_mean` only if uniform weighting over all original "
+            "segment slots is intended (PLAN.md §1.3)."
+        )
+    if policy_aggregation not in (
+        "token_mean",
+        "segment_mean",
+        "tree_balanced_segment_mean",
+    ):
+        raise ValueError(
+            f"policy_loss.policy_aggregation={policy_aggregation!r} is invalid; "
+            "must be one of {'token_mean', 'segment_mean', "
+            "'tree_balanced_segment_mean'} (PLAN.md §1.3)."
+        )
+
     batch_slot_mean_ablation = bool(
         _resolve_policy_loss_field(config, "batch_slot_mean_ablation", False)
     )
+    if policy_aggregation in ("segment_mean", "token_mean"):
+        # Canonical paper objectives — pre-filter LOGICAL batch denominators
+        # only. No retained-row fallback, no tree-count approximation, no
+        # interplay with the legacy ablation flag (PLAN.md §1.3).
+        if batch_slot_mean_ablation:
+            raise ValueError(
+                "policy_loss.batch_slot_mean_ablation is a legacy ablation "
+                "flag and cannot be combined with the canonical "
+                f"policy_aggregation={policy_aggregation!r} (PLAN.md §1.3)."
+            )
+        if policy_aggregation == "segment_mean":
+            if original_logical_segment_count is None:
+                raise ValueError(
+                    "policy_aggregation='segment_mean' requires the "
+                    "pre-filter logical-batch slot count "
+                    "(original_logical_segment_count stamped by the trainer); "
+                    "refusing to fall back to the retained tensor-row count "
+                    "(PLAN.md §1.3)."
+                )
+            m_b = float(original_logical_segment_count)
+            if m_b <= 0:
+                raise ValueError(
+                    "original_logical_segment_count must be > 0 for "
+                    "segment_mean; got "
+                    f"{original_logical_segment_count!r}."
+                )
+            pg_loss = row_losses.sum() / m_b
+        else:  # token_mean
+            if reduction == "sum":
+                raise ValueError(
+                    "policy_aggregation='token_mean' has no within-segment "
+                    "reduction; segment_token_reduction='sum' would be "
+                    "silently ignored, which strict VDRA forbids "
+                    "(PLAN.md §1.3)."
+                )
+            if original_logical_token_count is None:
+                raise ValueError(
+                    "policy_aggregation='token_mean' requires the pre-filter "
+                    "logical-batch token count (original_logical_token_count "
+                    "stamped by the trainer); refusing to fall back to the "
+                    "retained-token count (PLAN.md §1.3)."
+                )
+            t_b = float(original_logical_token_count)
+            if t_b <= 0:
+                raise ValueError(
+                    "original_logical_token_count must be > 0 for token_mean; "
+                    f"got {original_logical_token_count!r}."
+                )
+            token_numerator = (pg_losses * action_mask).sum()
+            pg_loss = token_numerator / t_b
+
+        avg_ratio = _masked_mean(ratio, action_mask)
+        _ = avg_ratio
+        _ = ratio_threshold
+        pg_clipfrac = _masked_mean(
+            torch.gt(pg_losses2, pg_losses1).float(), action_mask
+        )
+        approx_kl = 0.5 * _masked_mean((log_prob - old_log_prob) ** 2, action_mask)
+        pg_clipfrac_lower = torch.zeros((), dtype=pg_loss.dtype, device=pg_loss.device)
+        return pg_loss, pg_clipfrac, approx_kl, pg_clipfrac_lower
+
     if batch_slot_mean_ablation:
         # Labeled legacy batch-slot ablation — NOT the canonical denominator.
         # Retained-slot counts shrink under zero-advantage filtering, so this
