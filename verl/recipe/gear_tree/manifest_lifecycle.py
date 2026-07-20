@@ -22,7 +22,6 @@ from recipe.gear_tree.run_manifest import (
 from recipe.gear_tree.tree_data import (
     compute_group_metrics,
     compute_objective_weights,
-    is_canonical_tree_instance_id,
     validate_group_integrity,
     validate_objective_weights,
     validate_replay_batch,
@@ -189,15 +188,18 @@ def update_manifest_from_generated_edges(
             )
             continue
         # PLAN.md M3: an all-zero tree never passes strict edge normalization,
-        # so its canonical structure is validated here instead.
-        if strict and not is_canonical_tree_instance_id(
-            tid, snapshot_id=tid.split("|", 1)[0]
-        ):
-            id_failures.append(
-                f"all-zero tree summary tree_id {tid!r} is not a canonical "
-                "tree identity"
+        # so validate its summary-only identity against the rollout metadata
+        # carried by the construction summary. Do NOT derive the expected
+        # snapshot from ``tid`` itself: that would let a self-consistent but
+        # wrong tree_id pass the manifest gate.
+        if strict:
+            summary_record = {"tree_id": tid, "tree_summary": summary}
+            summary_ok, summary_id_failures = verify_tree_instance_id_uniqueness(
+                [summary_record]
             )
-            continue
+            if not summary_ok:
+                id_failures.extend(summary_id_failures)
+                continue
         if tid in edge_tree_ids or tid in summary_only_tree_ids:
             id_failures.append(
                 f"all-zero tree summary tree_id {tid!r} collides with another "

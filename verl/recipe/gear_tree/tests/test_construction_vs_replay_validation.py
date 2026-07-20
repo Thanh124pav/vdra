@@ -385,6 +385,8 @@ def _all_zero_summary(tree_id="snap0|iter:1|q:q0|t:abcd", *, k=3, tid_pg="pg0"):
     zero retained edges, but the pre-filter facts are intact."""
     return {
         "tree_id": tree_id,
+        "policy_snapshot_id": "snap0",
+        "rollout_iteration": 1,
         "question_id": "q0",
         "tree_total_segment_count": k,
         "retained_edge_count": 0,
@@ -421,6 +423,49 @@ class TestAllZeroTreeManifestIdentity:
                 [],
                 strict=True,
                 construction_summaries=[_all_zero_summary(tree_id="t0")],
+            )
+        assert manifest.unique_tree_ids_verified is False
+
+    def test_all_zero_summary_rejects_wrong_snapshot_in_manifest(self):
+        manifest = _manifest()
+        with pytest.raises(ValueError, match="snapshot"):
+            update_manifest_from_generated_edges(
+                manifest,
+                [],
+                strict=True,
+                construction_summaries=[
+                    _all_zero_summary(
+                        tree_id="wrong_snapshot|iter:1|q:q0|t:abcd"
+                    )
+                ],
+            )
+        assert manifest.unique_tree_ids_verified is False
+
+    def test_all_zero_summary_rejects_wrong_iteration_in_manifest(self):
+        manifest = _manifest()
+        with pytest.raises(ValueError, match="rollout iteration"):
+            update_manifest_from_generated_edges(
+                manifest,
+                [],
+                strict=True,
+                construction_summaries=[
+                    _all_zero_summary(tree_id="snap0|iter:999|q:q0|t:abcd")
+                ],
+            )
+        assert manifest.unique_tree_ids_verified is False
+
+    def test_all_zero_summary_rejects_wrong_question_in_manifest(self):
+        manifest = _manifest()
+        with pytest.raises(ValueError, match="question"):
+            update_manifest_from_generated_edges(
+                manifest,
+                [],
+                strict=True,
+                construction_summaries=[
+                    _all_zero_summary(
+                        tree_id="snap0|iter:1|q:wrong_question|t:abcd"
+                    )
+                ],
             )
         assert manifest.unique_tree_ids_verified is False
 
