@@ -44,6 +44,15 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+# PLAN.md §1: the probability-mask predicate is defined ONCE in a
+# dependency-light module and shared with extraction-time counting; these
+# re-exports keep the historical `policy_loss.<helper>` import paths working.
+from recipe.gear_tree.prob_mask import (  # noqa: F401
+    DEFAULT_PROBABILITY_MASK_THRESHOLD,
+    count_prob_mask_active_tokens,
+    effective_action_mask,
+    probability_mask_active,
+)
 from verl.trainer.ppo.core_algos import register_policy_loss
 
 if TYPE_CHECKING:  # ActorConfig is only used as a type hint; avoid a hard import.
@@ -100,17 +109,23 @@ def _ppo_clipped_token_surrogate(
     cliprange: float,
     use_prob_mask: bool,
     rollout_is_weights: Optional[torch.Tensor],
+    probability_mask_threshold: float = DEFAULT_PROBABILITY_MASK_THRESHOLD,
+    is_dummy: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute the per-token PPO-clip surrogate loss and diagnostics.
 
     Returns ``(pg_losses, action_mask, ratio, pg_losses1, pg_losses2)``. The
-    caller decides how to reduce ``pg_losses`` over ``action_mask``.
+    caller decides how to reduce ``pg_losses`` over ``action_mask``, which is
+    already the dummy-safe effective mask.
     """
 
-    action_mask = response_mask
-    if use_prob_mask:
-        prob_mask = torch.exp(old_log_prob) < 0.9
-        action_mask = action_mask.bool() & prob_mask
+    action_mask = effective_action_mask(
+        response_mask,
+        old_log_prob,
+        use_prob_mask=use_prob_mask,
+        probability_mask_threshold=probability_mask_threshold,
+        is_dummy=is_dummy,
+    )
     action_mask = action_mask.to(dtype=advantages.dtype)
 
     log_ratio = (log_prob - old_log_prob) * action_mask
@@ -149,6 +164,13 @@ def compute_policy_loss_treetune(
     # PLAN.md P0.F: read PolicyLossConfig fields from config.policy_loss.*.
     cliprange = float(config.clip_ratio)              # PPOHParams.cliprange = 0.2
     use_prob_mask = bool(_resolve_policy_loss_field(config, "use_prob_mask", True))
+    # PLAN.md §1: authoritative threshold from the config — never hard-coded.
+    probability_mask_threshold = float(
+        _resolve_policy_loss_field(
+            config, "probability_mask_threshold",
+            DEFAULT_PROBABILITY_MASK_THRESHOLD,
+        )
+    )
     ratio_threshold = float(
         _resolve_policy_loss_field(config, "ratio_threshold", 10.0)
     )
@@ -157,6 +179,7 @@ def compute_policy_loss_treetune(
         old_log_prob, log_prob, advantages, response_mask,
         cliprange=cliprange, use_prob_mask=use_prob_mask,
         rollout_is_weights=rollout_is_weights,
+        probability_mask_threshold=probability_mask_threshold,
     )
 
     pg_loss = _weighted_masked_mean(pg_losses, action_mask, edge_weights=edge_weights)
@@ -363,7 +386,9 @@ def compute_policy_loss_vdra_segment_mean(
     original_optimizer_batch_slot_count: int | None = None,
     original_optimizer_batch_tree_count: int | None = None,
     original_logical_segment_count: float | None = None,
-    original_logical_token_count: float | None = None,
+    original_logical_response_token_count: float | None = None,
+    original_logical_prob_mask_token_count: float | None = None,
+    is_dummy: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """VDRA main-run loss family (PLAN.md §1.3, user decision 2026-07-21).
 
@@ -374,10 +399,21 @@ def compute_policy_loss_vdra_segment_mean(
     ``dp_actor.update_policy``; zero-advantage slots count in the
     denominator even though they carry no tensor rows):
 
-        segment_mean:  L_B = sum_{u in rows} L_u^{mean} / M_B,
+        segment_mean:  L_B = sum_{u in rows} L_u / M_B,
+                       L_u = sum_t A_ut * ell_ut / sum_t A_ut
+                       (A = the dummy-safe EFFECTIVE action mask; an empty
+                        A_u yields a differentiable zero segment loss while
+                        the slot still counts in M_B),
                        M_B = original_logical_segment_count
-        token_mean:    L_B = sum_{u in rows} sum_t M_ut * ell_ut / T_B,
-                       T_B = original_logical_token_count
+
+        token_mean:    L_B = sum_{u,t} A_ut * ell_ut / T_B, where the
+                       denominator MATCHES the numerator's mask:
+                       use_prob_mask=false -> T_B =
+                           original_logical_response_token_count
+                       use_prob_mask=true  -> T_B =
+                           original_logical_prob_mask_token_count
+                       A probability-masked numerator is NEVER divided by
+                       the unmasked response-token count (PLAN.md §5).
 
     Example: advantages [pos, neg, 0, 0] -> tensor rows [L1, L2],
     M_B = 4, segment_mean loss = (L1 + L2) / 4.
@@ -430,6 +466,13 @@ def compute_policy_loss_vdra_segment_mean(
     cliprange = float(config.clip_ratio)
     # PLAN.md P0.F: PolicyLossConfig fields read from config.policy_loss.*.
     use_prob_mask = bool(_resolve_policy_loss_field(config, "use_prob_mask", True))
+    # PLAN.md §1: authoritative threshold from the config — never hard-coded.
+    probability_mask_threshold = float(
+        _resolve_policy_loss_field(
+            config, "probability_mask_threshold",
+            DEFAULT_PROBABILITY_MASK_THRESHOLD,
+        )
+    )
     # PLAN.md P0.4: report the ratio as a metric; do NOT skip microbatches on
     # the canonical VDRA path.
     ratio_threshold = float(
@@ -440,6 +483,10 @@ def compute_policy_loss_vdra_segment_mean(
         old_log_prob, log_prob, advantages, response_mask,
         cliprange=cliprange, use_prob_mask=use_prob_mask,
         rollout_is_weights=rollout_is_weights,
+        probability_mask_threshold=probability_mask_threshold,
+        # PLAN.md §9: dummy rows are masked EXPLICITLY, never left to the
+        # probability mask to remove by accident.
+        is_dummy=is_dummy,
     )
 
     row_losses = _segment_row_losses(pg_losses, action_mask, reduction=reduction)
@@ -448,10 +495,14 @@ def compute_policy_loss_vdra_segment_mean(
         _resolve_policy_loss_field(config, "policy_aggregation", "segment_mean")
     ).strip().lower()
     if policy_aggregation == "global_segment_mean":
-        raise ValueError(
-            "`global_segment_mean` was renamed to `tree_balanced_segment_mean`. "
-            "Use `segment_mean` only if uniform weighting over all original "
-            "segment slots is intended (PLAN.md §1.3)."
+        # PLAN.md §11: cross-level validation canonicalizes this legacy token
+        # BEFORE runtime. Seeing it here means validation was bypassed.
+        raise RuntimeError(
+            "internal configuration error: policy_aggregation="
+            "'global_segment_mean' reached the actor loss. Cross-level "
+            "validation must canonicalize it to 'tree_balanced_segment_mean' "
+            "(non-strict) or reject it (strict); it must NEVER mean "
+            "'segment_mean' (PLAN.md §1.3/§11)."
         )
     if policy_aggregation not in (
         "token_mean",
@@ -502,18 +553,32 @@ def compute_policy_loss_vdra_segment_mean(
                     "silently ignored, which strict VDRA forbids "
                     "(PLAN.md §1.3)."
                 )
-            if original_logical_token_count is None:
-                raise ValueError(
-                    "policy_aggregation='token_mean' requires the pre-filter "
-                    "logical-batch token count (original_logical_token_count "
-                    "stamped by the trainer); refusing to fall back to the "
-                    "retained-token count (PLAN.md §1.3)."
+            # PLAN.md §5: the denominator MUST match the numerator's mask.
+            if use_prob_mask:
+                raw_t_b = original_logical_prob_mask_token_count
+                field = "original_logical_prob_mask_token_count"
+                why = (
+                    "use_prob_mask=true masks the numerator, so it must be "
+                    "normalized by the pre-filter PROBABILITY-MASK-ACTIVE "
+                    "token count — never by the unmasked response-token count"
                 )
-            t_b = float(original_logical_token_count)
+            else:
+                raw_t_b = original_logical_response_token_count
+                field = "original_logical_response_token_count"
+                why = (
+                    "use_prob_mask=false keeps every valid response token, so "
+                    "the pre-filter RESPONSE-token count is the denominator"
+                )
+            if raw_t_b is None:
+                raise ValueError(
+                    f"policy_aggregation='token_mean' requires {field} "
+                    "stamped by the trainer; refusing to fall back to the "
+                    f"retained-token count (PLAN.md §5). {why}."
+                )
+            t_b = float(raw_t_b)
             if t_b <= 0:
                 raise ValueError(
-                    "original_logical_token_count must be > 0 for token_mean; "
-                    f"got {original_logical_token_count!r}."
+                    f"{field} must be > 0 for token_mean; got {raw_t_b!r}."
                 )
             token_numerator = (pg_losses * action_mask).sum()
             pg_loss = token_numerator / t_b
@@ -668,6 +733,13 @@ def compute_policy_loss_vdra_node_balanced(
     cliprange = float(config.clip_ratio)
     # PLAN.md P0.F: PolicyLossConfig fields read from config.policy_loss.*.
     use_prob_mask = bool(_resolve_policy_loss_field(config, "use_prob_mask", True))
+    # PLAN.md §1: authoritative threshold from the config — never hard-coded.
+    probability_mask_threshold = float(
+        _resolve_policy_loss_field(
+            config, "probability_mask_threshold",
+            DEFAULT_PROBABILITY_MASK_THRESHOLD,
+        )
+    )
     # PLAN.md P0.4: do NOT apply ratio_threshold as a per-microbatch skip on
     # the canonical VDRA path; only report the diagnostic. Legacy skip lives
     # in treetune_ppo.
@@ -679,6 +751,7 @@ def compute_policy_loss_vdra_node_balanced(
         old_log_prob, log_prob, advantages, response_mask,
         cliprange=cliprange, use_prob_mask=use_prob_mask,
         rollout_is_weights=rollout_is_weights,
+        probability_mask_threshold=probability_mask_threshold,
     )
 
     # Stage 1: token mean per child segment (one row per child).

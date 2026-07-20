@@ -14,6 +14,11 @@ from typing import Any, Iterable
 import torch
 
 from recipe.gear_tree.gear_core.tree_update_modes import compute_tree_update_values
+# PLAN.md §1/§3: extraction-time active-token counting shares the actor's
+# probability-mask predicate so the two can never drift apart. The helper
+# lives in its own dependency-light module so extraction does not pull in the
+# actor/loss registration import chain.
+from recipe.gear_tree.prob_mask import count_prob_mask_active_tokens
 
 
 def _bok(value: float, bok: int = 4) -> float:
@@ -49,7 +54,11 @@ _LOGICAL_SLOT_FIELDS = (
     "reward",
     "leaf",
     "pruned",
+    # PLAN.md §3: denominator bookkeeping computed BEFORE the payload is
+    # stripped — a zero slot's active-token count can never be recomputed.
     "response_token_count",
+    "prob_mask_token_count",
+    "probability_mask_threshold",
     "advantage_is_zero",
 )
 
@@ -71,6 +80,7 @@ def extract_edges_from_tree(
     treerl_gamma: float = 0.9,
     emit_pruned_edges: bool = False,
     emit_zero_slots: bool = False,
+    probability_mask_threshold: float = 0.9,
     strict_fresh_iid: bool = False,
     collect_construction_summaries: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -85,6 +95,12 @@ def extract_edges_from_tree(
     and negative advantages are retained. Administrative ``pruned=True``
     placeholder rows must NOT enter replay; ``emit_pruned_edges`` defaults to
     ``False`` and is only for diagnostic dumps.
+
+    ``probability_mask_threshold`` (PLAN.md §1/§3) is the AUTHORITATIVE
+    threshold propagated from ``actor.policy_loss.probability_mask_threshold``.
+    Active-token counting shares
+    :func:`recipe.gear_tree.policy_loss.count_prob_mask_active_tokens` with the
+    actor mask, so the two can never use different semantics.
 
     ``emit_zero_slots`` (PLAN.md §1.2 sparse-execution contract, 2026-07-21):
     when true together with ``only_adv_greater_than_zero``, an exact-zero
@@ -324,11 +340,33 @@ def extract_edges_from_tree(
                 # legacy fixture is used; prefer the max we saw.
                 if int(allocated_k) > slot["allocated_k"]:
                     slot["allocated_k"] = int(allocated_k)
-            # PLAN.md §1.2: denominator bookkeeping fields stamped on every
-            # emitted record so M_B/T_B never need re-derivation downstream.
-            edge["response_token_count"] = int(
-                len(edge.get("response_token_ids") or [])
+            # PLAN.md §3: denominator bookkeeping stamped on EVERY emitted
+            # record (trainable rows AND metadata-only zero slots) while the
+            # old log-probs are still available, so M_B / T_B_response /
+            # T_B_prob_mask never need re-derivation downstream.
+            _resp_ids = edge.get("response_token_ids") or []
+            _old_lps = edge.get("actor_shifted_log_probs")
+            if not is_pruned:
+                if _old_lps is None:
+                    raise ValueError(
+                        "cannot stamp logical-slot active-token counts: edge "
+                        f"{child_segment_id!r} has no actor_shifted_log_probs "
+                        "(PLAN.md §3)."
+                    )
+                if len(_old_lps) != len(_resp_ids):
+                    raise ValueError(
+                        "cannot stamp logical-slot active-token counts: edge "
+                        f"{child_segment_id!r} has {len(_old_lps)} old "
+                        f"log-probs for {len(_resp_ids)} response tokens "
+                        "(PLAN.md §3)."
+                    )
+            edge["response_token_count"] = int(len(_resp_ids))
+            edge["prob_mask_token_count"] = (
+                count_prob_mask_active_tokens(_old_lps, probability_mask_threshold)
+                if _old_lps is not None
+                else 0
             )
+            edge["probability_mask_threshold"] = float(probability_mask_threshold)
             edge["advantage_is_zero"] = bool(advantage == 0)
             # Stage 1: the zero filter uses the EXACT scalar that
             # token_fields_for_edges broadcasts into the policy `advantages`

@@ -48,6 +48,14 @@ class PolicyLossConfig(BaseConfig):
             supported first-class ablation. Any other value fails at startup.
         use_prob_mask (bool): Apply the treetune-style probability mask on top of
             the response mask before the PPO surrogate reduction (VDRA path).
+            BOTH values are first-class supported; strict mode never forces
+            one (PLAN.md §1.3).
+        probability_mask_threshold (float): Authoritative threshold for the
+            probability mask. A response token is active iff
+            ``exp(old_log_prob) < probability_mask_threshold`` (STRICT ``<``).
+            Must satisfy ``0 < t <= 1``; the historical default is ``0.9``.
+            Extraction-time active-token counting and the actor-side mask read
+            this same field — the threshold is never hard-coded.
         ratio_threshold (float): Diagnostic ratio threshold for VDRA losses.
             ``float('inf')`` disables the report (the canonical VDRA main path
             never uses this to drop microbatches — see PLAN.md P0.4).
@@ -73,21 +81,29 @@ class PolicyLossConfig(BaseConfig):
     ppo_kl_coef: float = 0.1
     segment_token_reduction: str = "mean"
     use_prob_mask: bool = True
+    probability_mask_threshold: float = 0.9
     ratio_threshold: float = float("inf")
     # PLAN.md §1.3 (2026-07-21): the canonical default is the paper's
     # uniform segment mean over the pre-filter logical-batch slot count.
     policy_aggregation: str = "segment_mean"
 
     _VALID_POLICY_AGGREGATIONS = ("token_mean", "segment_mean", "tree_balanced_segment_mean")
+    # PLAN.md §1.3: the retired name is accepted by TYPED PARSING only so the
+    # strictness-aware cross-level validator can decide its fate (strict:
+    # fail fast with the rename message; non-strict: canonicalize to
+    # tree_balanced_segment_mean with a DeprecationWarning). It must never
+    # reach runtime production code.
+    LEGACY_POLICY_AGGREGATION = "global_segment_mean"
 
     def __post_init__(self):
         """PLAN.md P0.1/§1.3: fail loudly on invalid VDRA loss knobs.
 
         Only ``mean`` and ``sum`` are accepted for
         ``segment_token_reduction`` (see PLAN.md §1.2 and P0.1), and only the
-        three explicit aggregation names for ``policy_aggregation``. We
-        normalise to lowercase so YAML overrides like ``Mean`` do not silently
-        fall back to the default.
+        three explicit aggregation names for ``policy_aggregation`` (plus the
+        legacy ``global_segment_mean`` token, which survives parsing and is
+        resolved by cross-level validation). We normalise to lowercase so
+        YAML overrides like ``Mean`` do not silently fall back to the default.
         """
         raw = self.segment_token_reduction
         if raw is None:
@@ -104,16 +120,12 @@ class PolicyLossConfig(BaseConfig):
 
         raw_agg = self.policy_aggregation
         if raw_agg is None:
-            raw_agg = "tree_balanced_segment_mean"
+            # PLAN.md §12: ONE canonical default everywhere.
+            raw_agg = "segment_mean"
         agg = str(raw_agg).strip().lower()
-        if agg == "global_segment_mean":
-            raise ValueError(
-                "`global_segment_mean` was renamed to "
-                "`tree_balanced_segment_mean`. Use `segment_mean` only if "
-                "uniform weighting over all original segment slots is "
-                "intended (PLAN.md §1.3)."
-            )
-        if agg not in self._VALID_POLICY_AGGREGATIONS:
+        if agg not in self._VALID_POLICY_AGGREGATIONS + (
+            self.LEGACY_POLICY_AGGREGATION,
+        ):
             raise ValueError(
                 f"policy_aggregation={raw_agg!r} is invalid; must be exactly "
                 f"one of {self._VALID_POLICY_AGGREGATIONS} (PLAN.md §1.3)."
@@ -126,6 +138,24 @@ class PolicyLossConfig(BaseConfig):
                 "segment_token_reduction='mean'."
             )
         object.__setattr__(self, "policy_aggregation", agg)
+
+        # PLAN.md §1: authoritative probability-mask threshold.
+        raw_thr = self.probability_mask_threshold
+        if raw_thr is None:
+            raw_thr = 0.9
+        try:
+            threshold = float(raw_thr)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"probability_mask_threshold={raw_thr!r} is not a number "
+                "(PLAN.md §1)."
+            ) from None
+        if not (0.0 < threshold <= 1.0):
+            raise ValueError(
+                f"probability_mask_threshold={raw_thr!r} is invalid; must "
+                "satisfy 0 < threshold <= 1 (PLAN.md §1)."
+            )
+        object.__setattr__(self, "probability_mask_threshold", threshold)
 
 
 @dataclass

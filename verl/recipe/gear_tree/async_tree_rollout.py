@@ -572,6 +572,21 @@ try:  # keep CPU-importable when agent_loop isn't installed
                     "before generate_sequences (see PLAN.md P0.1)."
                 )
             snapshot_id = str(snapshot_id)
+            # PLAN.md §2: the objective-mask configuration is propagated
+            # PER REQUEST from actor.policy_loss (the single source of truth).
+            # Never read a stale constructor-time copy — after resume or
+            # config composition it can disagree with the actor.
+            if "policy_probability_mask_threshold" not in kwargs:
+                raise RuntimeError(
+                    "TreeAgentLoop.run received no "
+                    "policy_probability_mask_threshold via non_tensor_batch "
+                    "kwargs; the trainer must propagate the resolved "
+                    "actor.policy_loss mask configuration to every rollout "
+                    "request (PLAN.md §2)."
+                )
+            probability_mask_threshold = float(
+                kwargs["policy_probability_mask_threshold"]
+            )
             # PLAN.md P0.2: pass rollout_iteration + a per-row uuid so the
             # tree builder mints a globally-unique tree_instance_id. The
             # (snapshot, question, iteration) tuple alone would still let two
@@ -645,6 +660,7 @@ try:  # keep CPU-importable when agent_loop isn't installed
                 treerl_gamma=self._gt.get("treerl_gamma", 0.9),
                 only_adv_greater_than_zero=_sparse_zero_execution,
                 emit_zero_slots=_sparse_zero_execution,
+                probability_mask_threshold=probability_mask_threshold,
                 vineppo_K=self._gt.get("vineppo_K", 0),
                 gear_node_expander=self._node_expander,
                 policy_snapshot_id=snapshot_id,

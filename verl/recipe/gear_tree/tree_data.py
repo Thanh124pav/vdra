@@ -1289,10 +1289,12 @@ def edges_to_dataproto(
         batch[key] = value
 
     # PLAN.md P0.C: float objective-weight tensors are attached ONLY for the
-    # explicit node-balanced ablation. The canonical segment-mean loss derives
-    # 1/(N_T * N_seg(T)) from row metadata and must receive neither tensor;
-    # tree- and parent-normalized weights would silently re-couple the batch
-    # to complete-tree assumptions.
+    # explicit node-balanced ablation. The CANONICAL paper objectives
+    # (segment_mean / token_mean) weigh rows uniformly by the trainer-stamped
+    # pre-filter logical denominators M_B / T_B and must receive neither
+    # tensor; tree- and parent-normalized weights would silently re-couple the
+    # batch to complete-tree assumptions. (The 1/(N_T * N_seg(T)) formula
+    # belongs to the tree_balanced_segment_mean ABLATION only.)
     if str(loss_mode) in _LOSS_MODES_WITH_OBJECTIVE_WEIGHTS:
         obj_weights = compute_objective_weights(edges)
         validate_objective_weights(edges, obj_weights)
@@ -1340,8 +1342,10 @@ def build_logical_update_batch(
     dp_size: int,
     loss_mode: str = "vdra_segment_mean_ppo",
     include_old_log_probs: bool = True,
+    use_prob_mask: bool = False,
+    probability_mask_threshold: float = 0.9,
 ) -> Tuple[Optional[DataProto], Dict[str, float]]:
-    """PLAN.md §1.2/§1.3 (2026-07-21): tensorize a reservation of LOGICAL slots.
+    """PLAN.md §1.2/§1.3/§5/§6 (2026-07-21): tensorize a reservation of LOGICAL slots.
 
     ``slots`` is the reservation in RESERVATION ORDER: metadata-only zero
     slots (``is_ledger_slot``) and trainable rows interleaved. This function:
@@ -1349,26 +1353,36 @@ def build_logical_update_batch(
     1. partitions the slots into logical optimizer batches of
        ``ppo_mini_batch_size`` BEFORE any tensor filtering;
     2. computes the exact PRE-FILTER denominators per batch ``B``:
-       ``M_B`` = logical slot count, ``T_B`` = sum of ``response_token_count``
-       over EVERY slot in ``B`` (zero slots included) — failing fast when any
-       record lacks a positive ``response_token_count`` (no
+       ``M_B`` = logical slot count,
+       ``T_B_response`` = sum of ``response_token_count``,
+       ``T_B_prob_mask`` = sum of ``prob_mask_token_count``,
+       each over EVERY slot in ``B`` (zero slots included) — failing fast
+       when a record lacks the count the SELECTED objective needs (no
        ``tree_total_segment_count`` approximation, no retained-row fallback);
-    3. tensorizes ONLY the trainable rows, padding each batch's rows to a
-       multiple of ``dp_size`` with collective-safe dummy rows (exact-zero
-       advantage, one pad token, counted in NO denominator or replay metric);
-    4. orders rows RANK-MAJOR (all of rank 0's rows for batches 0..K-1, then
+    3. classifies each logical batch (PLAN.md §6):
+       ``all_zero_advantage`` (no trainable rows),
+       ``zero_active_tokens`` (trainable rows exist but no effective active
+       token on any of them), otherwise ``trainable``;
+    4. tensorizes ONLY the trainable rows of TRAINABLE batches, padding each
+       to a multiple of ``dp_size`` with collective-safe dummy rows
+       (exact-zero advantage, one pad token, explicitly masked and counted in
+       NO denominator or replay metric);
+    5. orders rows RANK-MAJOR (all of rank 0's rows for batches 0..K-1, then
        rank 1's, ...) so verl's contiguous ``DataProto.chunk`` hands every
        rank the same number of rows for every logical batch — no FSDP rank
        can skip a collective another rank enters;
-    5. stamps ``logical_batch_index``/``is_dummy`` row tensors and the
+    6. stamps ``logical_batch_index``/``is_dummy`` row tensors and the
        per-batch ``original_logical_segment_count`` /
-       ``original_logical_token_count`` lists (one value per logical batch,
-       never one per call) plus ``logical_dp_size`` into ``meta_info``.
+       ``original_logical_response_token_count`` /
+       ``original_logical_prob_mask_token_count`` /
+       ``logical_batch_status`` lists (one value per logical batch, never one
+       per call) plus ``logical_dp_size`` into ``meta_info``.
 
-    Returns ``(None, stats)`` when EVERY logical batch is all-zero — the
+    Returns ``(None, stats)`` when EVERY logical batch is skipped — the
     trainer records an explicit skipped update (no update_actor RPC, no
-    global_step, no scheduler.step; PLAN.md §1.3).
+    global_step, no scheduler.step; PLAN.md §1.3/§7).
     """
+    from recipe.gear_tree.prob_mask import count_prob_mask_active_tokens
     from recipe.gear_tree.replay_buffer import is_ledger_slot
 
     n = len(slots)
@@ -1388,40 +1402,109 @@ def build_logical_update_batch(
             "must gate the update BEFORE tensorization (PLAN.md P0.D/§1.2)."
         )
 
+    def _slot_counts(slot: Dict[str, Any]) -> Tuple[int, int]:
+        """(response_token_count, prob_mask_token_count) — stamped, never
+        recomputed for a zero slot whose log-prob payload was removed."""
+        raw_resp = slot.get("response_token_count")
+        if raw_resp is None:
+            raw_resp = len(slot.get("response_token_ids") or []) or None
+        if raw_resp is None or int(raw_resp) <= 0:
+            raise ValueError(
+                "logical slot/edge is missing a positive "
+                "response_token_count; the exact pre-filter denominator "
+                "cannot be reconstructed (PLAN.md §1.2 — never approximate "
+                "with tree_total_segment_count). Offending record edge_id="
+                f"{slot.get('edge_id')!r}."
+            )
+        resp = int(raw_resp)
+        raw_mask = slot.get("prob_mask_token_count")
+        if raw_mask is None and not is_ledger_slot(slot):
+            # A trainable row still carries its log-probs, so the count is
+            # derivable with the SHARED predicate (identical semantics).
+            log_probs = slot.get("actor_shifted_log_probs")
+            if log_probs is not None:
+                raw_mask = count_prob_mask_active_tokens(
+                    log_probs, probability_mask_threshold
+                )
+        if use_prob_mask and raw_mask is None:
+            raise ValueError(
+                "policy_aggregation='token_mean' with use_prob_mask=true "
+                "requires a stamped prob_mask_token_count on every logical "
+                "record; a zero slot's active count can NEVER be recomputed "
+                "because its old-log-prob payload was removed (PLAN.md §4). "
+                f"Offending record edge_id={slot.get('edge_id')!r}."
+            )
+        mask_count = 0 if raw_mask is None else int(raw_mask)
+        if not (0 <= mask_count <= resp):
+            raise ValueError(
+                "prob_mask_token_count must satisfy 0 <= count <= "
+                f"response_token_count; got {mask_count} > {resp} for "
+                f"edge_id={slot.get('edge_id')!r} (PLAN.md §4)."
+            )
+        return resp, mask_count
+
+    STATUS_TRAINABLE = "trainable"
+    STATUS_ALL_ZERO = "all_zero_advantage"
+    STATUS_ZERO_ACTIVE = "zero_active_tokens"
+
     n_batches = n // mini
     segment_counts: List[float] = []
-    token_counts: List[float] = []
+    response_token_counts: List[float] = []
+    prob_mask_token_counts: List[float] = []
+    statuses: List[str] = []
+    trainable_active_tokens: List[float] = []
     per_batch_rows: List[List[Dict[str, Any]]] = []
     all_zero_batches = 0
+    zero_active_batches = 0
     for k in range(n_batches):
         batch_slots = slots[k * mini : (k + 1) * mini]
-        t_b = 0
+        t_resp = 0
+        t_mask = 0
         for slot in batch_slots:
-            count = slot.get("response_token_count")
-            if count is None:
-                count = len(slot.get("response_token_ids") or []) or None
-            if count is None or int(count) <= 0:
-                raise ValueError(
-                    "logical slot/edge is missing a positive "
-                    "response_token_count; the exact pre-filter T_B cannot be "
-                    "reconstructed (PLAN.md §1.2 — never approximate with "
-                    f"tree_total_segment_count). Offending record edge_id="
-                    f"{slot.get('edge_id')!r}."
-                )
-            t_b += int(count)
+            resp, mask_count = _slot_counts(slot)
+            t_resp += resp
+            t_mask += mask_count
         rows = [s for s in batch_slots if not is_ledger_slot(s)]
+        # PLAN.md §6: executable signal counts EFFECTIVE active tokens on the
+        # nonzero-advantage trainable rows only.
+        active = 0
+        for row in rows:
+            resp, mask_count = _slot_counts(row)
+            active += mask_count if use_prob_mask else resp
         if not rows:
+            status = STATUS_ALL_ZERO
             all_zero_batches += 1
+            rows = []
+        elif active <= 0:
+            status = STATUS_ZERO_ACTIVE
+            zero_active_batches += 1
+            rows = []  # nothing executable: no tensor rows for this batch
+        else:
+            status = STATUS_TRAINABLE
         segment_counts.append(float(mini))
-        token_counts.append(float(t_b))
+        response_token_counts.append(float(t_resp))
+        prob_mask_token_counts.append(float(t_mask))
+        statuses.append(status)
+        trainable_active_tokens.append(float(active))
         per_batch_rows.append(rows)
 
     total_rows = sum(len(rows) for rows in per_batch_rows)
+    total_response_tokens = sum(response_token_counts)
+    total_mask_tokens = sum(prob_mask_token_counts)
     stats: Dict[str, float] = {
         "vdra/logical_slots": float(n),
         "vdra/logical_batches": float(n_batches),
-        "vdra/all_zero_logical_batches": float(all_zero_batches),
+        "vdra/all_zero_advantage_logical_batches": float(all_zero_batches),
+        "vdra/zero_active_token_logical_batches": float(zero_active_batches),
+        "vdra/trainable_logical_batches": float(
+            n_batches - all_zero_batches - zero_active_batches
+        ),
         "vdra/tensor_rows": float(total_rows),
+        "vdra/prob_mask_active_token_fraction": (
+            float(total_mask_tokens / total_response_tokens)
+            if total_response_tokens > 0
+            else 0.0
+        ),
     }
     if total_rows == 0:
         stats["vdra/skipped_zero_gradient_updates"] = 1.0
@@ -1460,8 +1543,9 @@ def build_logical_update_batch(
     per_rank_batch_idx: List[List[int]] = [[] for _ in range(dp)]
     for k, rows in enumerate(per_batch_rows):
         if not rows:
-            # All-zero logical batch: zero rows on EVERY rank, so all ranks
-            # skip optimizer step k consistently (PLAN.md §1.3).
+            # Skipped logical batch (all_zero_advantage or zero_active_tokens):
+            # zero rows on EVERY rank, so all ranks skip optimizer step k
+            # consistently (PLAN.md §1.3/§7).
             continue
         padded = list(rows)
         while len(padded) % dp != 0:
@@ -1499,9 +1583,20 @@ def build_logical_update_batch(
         [1 if row.get("is_dummy") else 0 for row in ordered_rows],
         dtype=torch.int64,
     )
+    # PLAN.md §5/§6: aligned per-logical-batch lists (one value per batch,
+    # never one for the whole update_actor call).
     batch.meta_info["original_logical_segment_count"] = segment_counts
-    batch.meta_info["original_logical_token_count"] = token_counts
+    batch.meta_info["original_logical_response_token_count"] = response_token_counts
+    batch.meta_info["original_logical_prob_mask_token_count"] = prob_mask_token_counts
+    batch.meta_info["logical_batch_status"] = statuses
+    batch.meta_info["logical_batch_trainable_active_tokens"] = trainable_active_tokens
     batch.meta_info["logical_batch_count"] = int(n_batches)
     batch.meta_info["logical_dp_size"] = int(dp)
+    # The objective-mask identity the denominators were computed under, so the
+    # actor can assert it matches its own configuration.
+    batch.meta_info["logical_use_prob_mask"] = bool(use_prob_mask)
+    batch.meta_info["logical_probability_mask_threshold"] = float(
+        probability_mask_threshold
+    )
     stats["vdra/dummy_rows"] = float(n_dummy)
     return batch, stats

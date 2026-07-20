@@ -189,17 +189,31 @@ actor_rollout_ref:
   actor:
     ppo_mini_batch_size: 128            # logical slots per optimizer batch
     ppo_epochs: 1
+    # Strict canonical sparse mode requires these to be off (PLAN.md §1.3
+    # auxiliary-objective rule): sparse omission preserves the POLICY-GRADIENT
+    # term exactly, but not a dense entropy/KL objective.
+    entropy_coeff: 0.0
+    use_kl_loss: false
+    kl_loss_coef: 0.0
     policy_loss:
       loss_mode: vdra_segment_mean_ppo
       policy_aggregation: segment_mean
       segment_token_reduction: mean
+      # Both values are first-class; the threshold is authoritative here and
+      # is propagated to extraction-time active-token counting.
+      use_prob_mask: true
+      probability_mask_threshold: 0.9
 
 tree_policy:
   policy_aggregation: segment_mean
   segment_token_reduction: mean
+
+gear_tree:
   only_adv_greater_than_zero: true      # sparse TENSOR EXECUTION only —
                                         # never removes slots from the
-                                        # objective denominator
+                                        # objective denominator.
+                                        # NOTE: this field lives under
+                                        # `gear_tree`, NOT `tree_policy`.
 ```
 
 Zero-advantage sparsity is an EXECUTION policy, not an objective change:

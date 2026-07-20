@@ -32,10 +32,17 @@ _REQUIRED_EDGE_FIELDS = (
     "reward",
 )
 
+# PLAN.md §13: logical-slot schema version. Bumped to 2 when zero slots
+# gained the probability-mask metadata (prob_mask_token_count +
+# probability_mask_threshold) required by masked token_mean; a version-1
+# replay cannot serve a masked run because its zero slots' log-prob payload
+# was intentionally discarded and the count cannot be recomputed.
+LOGICAL_SLOT_SCHEMA_VERSION = 2
+
 # PLAN.md §1.2 (2026-07-21): a metadata-only logical slot for an exact-zero
 # advantage segment. It has no trainable payload but MUST carry enough
 # bookkeeping for reservation, per-question caps, divisibility and the
-# pre-filter M_B / T_B denominators.
+# pre-filter M_B / T_B_response / T_B_prob_mask denominators.
 _REQUIRED_SLOT_FIELDS = (
     "edge_id",
     "question_id",
@@ -43,6 +50,8 @@ _REQUIRED_SLOT_FIELDS = (
     "parent_group_id",
     "advantage",
     "response_token_count",
+    "prob_mask_token_count",
+    "probability_mask_threshold",
 )
 
 _SLOT_FORBIDDEN_PAYLOAD_FIELDS = (
@@ -899,11 +908,34 @@ class GearTreeReplayBuffer:
                     "Replay logical slot must stamp advantage_is_zero=True "
                     "(PLAN.md §1.2)."
                 )
-            if int(edge.get("response_token_count", 0) or 0) <= 0:
+            if edge.get("trainable_edge_id", "missing") is not None:
+                raise ValueError(
+                    "Replay logical slot must set trainable_edge_id=None "
+                    "(PLAN.md §4)."
+                )
+            resp = int(edge.get("response_token_count", 0) or 0)
+            if resp <= 0:
                 raise ValueError(
                     "Replay logical slot must record its positive pre-filter "
-                    "response_token_count — T_B cannot be reconstructed "
-                    "otherwise (PLAN.md §1.2)."
+                    "response_token_count — T_B_response cannot be "
+                    "reconstructed otherwise (PLAN.md §1.2/§4)."
+                )
+            # PLAN.md §4: the masked denominator can never be recomputed for a
+            # zero slot (its old-log-prob payload is gone), so the count must
+            # be stamped and consistent.
+            mask_count = int(edge.get("prob_mask_token_count", -1))
+            if not (0 <= mask_count <= resp):
+                raise ValueError(
+                    "Replay logical slot requires 0 <= prob_mask_token_count "
+                    f"<= response_token_count; got {mask_count} vs {resp} "
+                    "(PLAN.md §4)."
+                )
+            thr = edge.get("probability_mask_threshold")
+            if thr is None or not (0.0 < float(thr) <= 1.0):
+                raise ValueError(
+                    "Replay logical slot must stamp the "
+                    "probability_mask_threshold its prob_mask_token_count was "
+                    f"computed under (0 < t <= 1); got {thr!r} (PLAN.md §4)."
                 )
             payload = [
                 f for f in _SLOT_FORBIDDEN_PAYLOAD_FIELDS if edge.get(f)
@@ -925,6 +957,23 @@ class GearTreeReplayBuffer:
             raise ValueError(
                 "Replay edge actor_shifted_log_probs must align one-to-one with response_token_ids"
             )
+        # PLAN.md §4: when the record carries the logical-slot counts, they
+        # must be internally consistent (trainable rows keep their payload, so
+        # the mask count stays derivable — but a stamped value must be sane).
+        if "response_token_count" in edge:
+            resp = int(edge.get("response_token_count") or 0)
+            if resp <= 0:
+                raise ValueError(
+                    "Replay edge response_token_count must be > 0 (PLAN.md §4)."
+                )
+            if "prob_mask_token_count" in edge:
+                mask_count = int(edge.get("prob_mask_token_count") or 0)
+                if not (0 <= mask_count <= resp):
+                    raise ValueError(
+                        "Replay edge requires 0 <= prob_mask_token_count <= "
+                        f"response_token_count; got {mask_count} vs {resp} "
+                        "(PLAN.md §4)."
+                    )
 
 
 def _assert_complete_parent_groups(edges: Iterable[Mapping[str, Any]]) -> None:

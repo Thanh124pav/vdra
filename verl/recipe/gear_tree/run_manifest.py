@@ -60,6 +60,15 @@ class RunManifest:
     advantage_mode: str = ADVANTAGE_MODE_ABLATION
     segment_definition: str = SEGMENT_DEFINITION_FIXED
 
+    # PLAN.md §14: objective-mask snapshot + the OBSERVED logical denominator
+    # mode, so a run cannot claim one objective while normalizing by another.
+    use_prob_mask: bool = True
+    probability_mask_threshold: float = 0.9
+    logical_slot_schema_version: int = 0
+    # "" (not a canonical sparse run) | "segment_slots" |
+    # "response_tokens" | "prob_mask_tokens"
+    observed_logical_denominator: str = ""
+
     # PLAN.md P0.7 replay-cadence snapshot (declared config → observed cap).
     replay_sampling_unit: str = "edge"
     target_edges_per_iteration: int = 0
@@ -72,6 +81,8 @@ class RunManifest:
     rollout_iteration: int = 0
     global_step: int = 0
     optimizer_steps_last_iteration: int = 0
+    # PLAN.md §8: expectation counts TRAINABLE logical batches only.
+    expected_optimizer_steps_last_iteration: int = 0
     num_optimizer_steps_total: int = 0
 
     # Operational invariants (updated by the trainer at runtime — never
@@ -206,6 +217,24 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
             f"({POLICY_AGGREGATION_SEGMENT_MEAN!r}, "
             f"{POLICY_AGGREGATION_TOKEN_MEAN!r})"
         )
+    # PLAN.md §14: the OBSERVED logical denominator must match the selected
+    # objective — a masked numerator normalized by the unmasked token count
+    # (or vice versa) silently changes the objective.
+    expected_denominator = {
+        POLICY_AGGREGATION_SEGMENT_MEAN: "segment_slots",
+        POLICY_AGGREGATION_TOKEN_MEAN: (
+            "prob_mask_tokens" if manifest.use_prob_mask else "response_tokens"
+        ),
+    }.get(manifest.policy_aggregation)
+    if expected_denominator is not None:
+        if manifest.observed_logical_denominator != expected_denominator:
+            failures.append(
+                "observed_logical_denominator="
+                f"{manifest.observed_logical_denominator!r} != "
+                f"{expected_denominator!r} for policy_aggregation="
+                f"{manifest.policy_aggregation!r} with use_prob_mask="
+                f"{manifest.use_prob_mask}"
+            )
     # PLAN.md P0.J: canonical replay is edge-level; a complete_tree run is a
     # labeled ablation, never a valid main run.
     if manifest.replay_sampling_unit != "edge":

@@ -12,6 +12,24 @@ import warnings
 from typing import Any, Mapping, Optional
 
 
+def _assign(container: Any, key: str, value: Any) -> None:
+    """Write a canonicalized value back into a config container.
+
+    Works for OmegaConf DictConfig, plain dicts, and typed dataclasses whose
+    mutability guards require ``object.__setattr__`` (PLAN.md §11).
+    """
+    try:
+        container[key] = value
+        return
+    except Exception:
+        pass
+    try:
+        setattr(container, key, value)
+        return
+    except Exception:
+        object.__setattr__(container, key, value)
+
+
 def _to_plain_gear_tree_cfg(config: Any) -> Mapping[str, Any]:
     """Mirror ``RayGearTreeTrainer._gear_tree_config``: the ``gear_tree``
     block as a plain dict (resolved when it is an OmegaConf node)."""
@@ -54,7 +72,12 @@ def validate_policy_loss_consistency(
     # loading maps it with a deprecation warning. It NEVER maps to the new
     # uniform `segment_mean` — that would silently change the objective of
     # existing configs and checkpoints.
-    if policy_agg == "global_segment_mean":
+    # PLAN.md §11: canonicalize the retired name HERE (the single
+    # strictness-aware stage) and write the result back to BOTH duplicated
+    # fields, so runtime production code only ever sees a canonical value.
+    actor_pl = config.actor_rollout_ref.actor.policy_loss
+    actor_agg_raw = str(actor_pl.get("policy_aggregation", "segment_mean")).strip().lower()
+    if policy_agg == "global_segment_mean" or actor_agg_raw == "global_segment_mean":
         if strict:
             raise ValueError(
                 "`global_segment_mean` was renamed to "
@@ -63,13 +86,18 @@ def validate_policy_loss_consistency(
                 "intended (PLAN.md §1.3)."
             )
         warnings.warn(
-            "tree_policy.policy_aggregation='global_segment_mean' is "
-            "deprecated; mapping to the tree_balanced_segment_mean ablation "
-            "(PLAN.md §1.3). Update the config to the new name.",
+            "policy_aggregation='global_segment_mean' is deprecated; mapping "
+            "to the tree_balanced_segment_mean ablation (PLAN.md §1.3). "
+            "Update the config to the new name.",
             DeprecationWarning,
             stacklevel=2,
         )
-        policy_agg = "tree_balanced_segment_mean"
+        if policy_agg == "global_segment_mean":
+            policy_agg = "tree_balanced_segment_mean"
+            _assign(tree_policy, "policy_aggregation", policy_agg)
+        if actor_agg_raw == "global_segment_mean":
+            actor_agg_raw = "tree_balanced_segment_mean"
+            _assign(actor_pl, "policy_aggregation", actor_agg_raw)
     _VALID_POLICY_AGGS = (
         "token_mean",
         "segment_mean",
@@ -151,23 +179,22 @@ def validate_policy_loss_consistency(
     # loss silently optimizes a different objective than the manifest/logs
     # advertise. The retired name is rejected at the actor level too.
     if actor_loss_mode == "vdra_segment_mean_ppo":
-        actor_agg = str(
-            config.actor_rollout_ref.actor.policy_loss.get(
-                "policy_aggregation", "segment_mean"
-            )
-        ).strip().lower()
-        if actor_agg == "global_segment_mean":
-            raise ValueError(
-                "`global_segment_mean` was renamed to "
-                "`tree_balanced_segment_mean`. Use `segment_mean` only if "
-                "uniform weighting over all original segment slots is "
-                "intended (PLAN.md §1.3). (actor.policy_loss.policy_aggregation)"
-            )
+        # Already canonicalized above; the legacy token can no longer appear.
+        actor_agg = actor_agg_raw
         if policy_agg in _SEGMENT_LOSS_AGGS and actor_agg != policy_agg:
             raise ValueError(
                 f"tree_policy.policy_aggregation ({policy_agg!r}) must equal "
                 "actor_rollout_ref.actor.policy_loss.policy_aggregation "
                 f"({actor_agg!r}) (PLAN.md §1.3)."
+            )
+        # PLAN.md §1: the probability-mask threshold is authoritative and must
+        # be usable; both use_prob_mask values are first-class.
+        _thr = float(actor_pl.get("probability_mask_threshold", 0.9))
+        if not (0.0 < _thr <= 1.0):
+            raise ValueError(
+                "actor_rollout_ref.actor.policy_loss."
+                f"probability_mask_threshold={_thr!r} is invalid; must "
+                "satisfy 0 < threshold <= 1 (PLAN.md §1)."
             )
 
     if strict:
@@ -206,4 +233,26 @@ def validate_policy_loss_consistency(
                 "tensor-execution policy over the logical-slot ledger "
                 "(corrected meaning, PLAN.md §1.2). Dense execution of zero "
                 "rows is not the canonical strict path."
+            )
+        # PLAN.md §10: omitting exact-zero rows is mathematically equivalent
+        # to dense execution for the POLICY-GRADIENT term only. Entropy and
+        # KL are per-token auxiliary objectives that a zero-advantage row
+        # WOULD contribute to densely, and no zero-slot auxiliary contract
+        # exists yet — so strict sparse canonical mode must refuse them
+        # rather than silently claim sparse/dense parity.
+        actor_cfg = config.actor_rollout_ref.actor
+        _entropy = float(actor_cfg.get("entropy_coeff", 0.0) or 0.0)
+        _use_kl = bool(actor_cfg.get("use_kl_loss", False))
+        _kl_coef = float(actor_cfg.get("kl_loss_coef", 0.0) or 0.0)
+        if _entropy != 0.0 or _use_kl or _kl_coef != 0.0:
+            raise ValueError(
+                "strict canonical sparse VDRA requires entropy_coeff == 0, "
+                "use_kl_loss == false and kl_loss_coef == 0 (PLAN.md §10); "
+                f"got entropy_coeff={_entropy}, use_kl_loss={_use_kl}, "
+                f"kl_loss_coef={_kl_coef}. Sparse zero-slot execution omits "
+                "exact-zero rows from the tensor batch, which preserves the "
+                "policy-gradient objective exactly but NOT a dense "
+                "entropy/KL objective those rows would also contribute to. "
+                "Set strict_vdra=false to run this as an explicitly "
+                "objective-changing ablation, or disable entropy/KL."
             )

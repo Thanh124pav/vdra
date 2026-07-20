@@ -147,7 +147,7 @@ class TestNormalizeLedger:
             normalize_generated_edges(records, snapshot_id="snap")
 
 
-def _slot(edge_id, question_id="q", token_count=3, step=0):
+def _slot(edge_id, question_id="q", token_count=3, step=0, active=None, threshold=0.9):
     return {
         "edge_id": str(edge_id),
         "question_id": str(question_id),
@@ -159,6 +159,12 @@ def _slot(edge_id, question_id="q", token_count=3, step=0):
         "advantage_is_zero": True,
         "trainable_edge_id": None,
         "response_token_count": int(token_count),
+        # PLAN.md §3/§4: a zero slot's active-token count is stamped at
+        # extraction and can never be recomputed later.
+        "prob_mask_token_count": int(
+            token_count if active is None else active
+        ),
+        "probability_mask_threshold": float(threshold),
         "sample_multiplicity": 1,
     }
 

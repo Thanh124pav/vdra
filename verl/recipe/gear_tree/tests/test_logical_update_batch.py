@@ -61,7 +61,9 @@ def _edge(i: int, adv: float, n_tokens: int = 2, tree: str = "t0") -> dict:
     }
 
 
-def _slot(i: int, n_tokens: int = 3, tree: str = "t0") -> dict:
+def _slot(
+    i: int, n_tokens: int = 3, tree: str = "t0", active: int | None = None
+) -> dict:
     return {
         "edge_id": f"{tree}/z{i}",
         "tree_id": tree,
@@ -74,6 +76,9 @@ def _slot(i: int, n_tokens: int = 3, tree: str = "t0") -> dict:
         "advantage_is_zero": True,
         "trainable_edge_id": None,
         "response_token_count": int(n_tokens),
+        # PLAN.md §3/§4: stamped at extraction, never recomputed later.
+        "prob_mask_token_count": int(n_tokens if active is None else active),
+        "probability_mask_threshold": 0.9,
     }
 
 
@@ -106,7 +111,7 @@ class TestBuilder:
         batch, stats = _build(slots)
         assert batch is not None
         assert batch.meta_info["original_logical_segment_count"] == [4.0, 4.0]
-        assert batch.meta_info["original_logical_token_count"] == [
+        assert batch.meta_info["original_logical_response_token_count"] == [
             2 + 2 + 3 + 3,
             4.0,
         ]
@@ -116,7 +121,7 @@ class TestBuilder:
         assert batch.batch["logical_batch_index"].tolist() == [0, 0, 1, 1, 1, 1]
         assert batch.batch["is_dummy"].sum().item() == 0
         assert stats["vdra/tensor_rows"] == 6.0
-        assert stats["vdra/all_zero_logical_batches"] == 0.0
+        assert stats["vdra/all_zero_advantage_logical_batches"] == 0.0
 
     def test_all_zero_batch_has_no_rows_and_is_counted(self):
         slots = [
@@ -131,12 +136,12 @@ class TestBuilder:
         ]
         batch, stats = _build(slots)
         assert batch is not None
-        assert stats["vdra/all_zero_logical_batches"] == 1.0
+        assert stats["vdra/all_zero_advantage_logical_batches"] == 1.0
         # Batch 1 contributes NO tensor rows (skipped consistently later).
         assert batch.batch["logical_batch_index"].tolist() == [0, 0]
         # Its denominators are still stamped (position 1 in the lists).
         assert batch.meta_info["original_logical_segment_count"] == [4.0, 4.0]
-        assert batch.meta_info["original_logical_token_count"][1] == pytest.approx(
+        assert batch.meta_info["original_logical_response_token_count"][1] == pytest.approx(
             3 * 4
         )
 
@@ -145,7 +150,7 @@ class TestBuilder:
         batch, stats = _build([_slot(i) for i in range(8)])
         assert batch is None
         assert stats["vdra/skipped_zero_gradient_updates"] == 1.0
-        assert stats["vdra/all_zero_logical_batches"] == 2.0
+        assert stats["vdra/all_zero_advantage_logical_batches"] == 2.0
 
     def test_dummy_padding_gives_equal_rank_shares(self):
         # Batch 0 has 3 trainable rows; dp=2 pads to 4 with one dummy row.
@@ -218,7 +223,7 @@ class TestActorLogicalExecution:
         ]
         metrics, _ = self._run(slots, "segment_mean")
         assert metrics["actor/num_optimizer_steps"] == [2]
-        assert metrics["actor/all_zero_logical_batches"] == [0]
+        assert metrics["actor/all_zero_advantage_logical_batches"] == [0]
         assert metrics["actor/used_stored_old_log_probs"] == [1.0]
 
     def test_all_zero_logical_batch_skips_its_optimizer_step(self):
@@ -233,8 +238,8 @@ class TestActorLogicalExecution:
         ]
         metrics, stats = self._run(slots, "segment_mean")
         assert metrics["actor/num_optimizer_steps"] == [1]
-        assert metrics["actor/all_zero_logical_batches"] == [1]
-        assert stats["vdra/all_zero_logical_batches"] == 1.0
+        assert metrics["actor/all_zero_advantage_logical_batches"] == [1]
+        assert stats["vdra/all_zero_advantage_logical_batches"] == 1.0
 
     def test_token_mean_runs_with_stamped_denominators(self):
         slots = [

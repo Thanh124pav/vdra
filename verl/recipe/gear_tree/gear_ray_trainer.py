@@ -412,6 +412,19 @@ class RayGearTreeTrainer(RayPPOTrainer):
         gen_batch.non_tensor_batch["tree_instance_uuid"] = np.array(
             [_uuid.uuid4().hex for _ in range(row_count)], dtype=object
         )
+        # PLAN.md §2: the objective-mask configuration lives ONLY under
+        # actor.policy_loss. Propagate the RESOLVED values per request so the
+        # rollout worker never relies on a stale constructor-time copy after
+        # resume or config composition, and so extraction-time active-token
+        # counting uses exactly the threshold the actor loss will use.
+        _pl = self.config.actor_rollout_ref.actor.policy_loss
+        gen_batch.non_tensor_batch["policy_use_prob_mask"] = np.array(
+            [bool(_pl.get("use_prob_mask", True))] * row_count, dtype=object
+        )
+        gen_batch.non_tensor_batch["policy_probability_mask_threshold"] = np.array(
+            [float(_pl.get("probability_mask_threshold", 0.9))] * row_count,
+            dtype=object,
+        )
         backend = gt.get("rollout_backend", "async")
         if backend != "async":
             raise NotImplementedError(
@@ -505,6 +518,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 * int(self.config.trainer.n_gpus_per_node),
                 1,
             )
+            # PLAN.md §5: the denominators must be computed under the SAME
+            # mask identity the actor loss will use.
+            policy_loss_cfg = self.config.actor_rollout_ref.actor.policy_loss
             edge_batch, logical_stats = build_logical_update_batch(
                 sampled_edges,
                 self.tokenizer,
@@ -516,7 +532,25 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 dp_size=dp_size,
                 loss_mode=loss_mode,
                 include_old_log_probs=True,
+                use_prob_mask=bool(policy_loss_cfg.get("use_prob_mask", True)),
+                probability_mask_threshold=float(
+                    policy_loss_cfg.get("probability_mask_threshold", 0.9)
+                ),
             )
+            # PLAN.md §8: expected optimizer steps count only TRAINABLE
+            # logical batches — a skipped batch must not mark the accounting
+            # invalid.
+            self._expected_optimizer_steps = int(
+                logical_stats.get("vdra/trainable_logical_batches", 0)
+            ) * int(self.config.actor_rollout_ref.actor.get("ppo_epochs", 1))
+            # PLAN.md §14: record which denominator the run actually used.
+            if aggregation == "segment_mean":
+                observed_denominator = "segment_slots"
+            elif bool(policy_loss_cfg.get("use_prob_mask", True)):
+                observed_denominator = "prob_mask_tokens"
+            else:
+                observed_denominator = "response_tokens"
+            self.run_manifest.observed_logical_denominator = observed_denominator
             metrics.update(logical_stats)
             if edge_batch is None:
                 return None
@@ -600,6 +634,13 @@ class RayGearTreeTrainer(RayPPOTrainer):
         manifest.ppo_epochs = int(
             self.config.actor_rollout_ref.actor.get("ppo_epochs", 1)
         )
+        # PLAN.md §14: objective-mask snapshot + logical-slot schema version.
+        _pl = self.config.actor_rollout_ref.actor.policy_loss
+        manifest.use_prob_mask = bool(_pl.get("use_prob_mask", True))
+        manifest.probability_mask_threshold = float(
+            _pl.get("probability_mask_threshold", 0.9)
+        )
+        manifest.logical_slot_schema_version = LOGICAL_SLOT_SCHEMA_VERSION
         # The resolved auto cap is populated once the replay buffer is built.
         if hasattr(self, "replay_buffer") and self.replay_buffer is not None:
             manifest.resolved_max_edges_per_question_per_iteration = int(
@@ -648,15 +689,22 @@ class RayGearTreeTrainer(RayPPOTrainer):
             m.resolved_max_edges_per_question_per_iteration = int(
                 self.replay_buffer.resolved_max_edges_per_question_per_iteration
             )
-        # PLAN.md P0.7: `optimizer_step_accounting_valid` iff the observed
-        # step count equals the expected count for this iteration.
+        # PLAN.md P0.7 / §8: `optimizer_step_accounting_valid` iff the observed
+        # step count equals the expected count for this iteration. On the
+        # canonical sparse path the expectation counts only TRAINABLE logical
+        # batches — a batch skipped for all_zero_advantage or zero_active_tokens
+        # must NOT mark a valid mixed update as accounting-invalid.
         ppo_mini = int(
             self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size", 1)
         )
         ppo_epochs = int(
             self.config.actor_rollout_ref.actor.get("ppo_epochs", 1)
         )
-        expected = (int(selected_edges) // max(ppo_mini, 1)) * max(ppo_epochs, 1)
+        expected = getattr(self, "_expected_optimizer_steps", None)
+        if expected is None:
+            expected = (int(selected_edges) // max(ppo_mini, 1)) * max(ppo_epochs, 1)
+        expected = int(expected)
+        m.expected_optimizer_steps_last_iteration = expected
         m.optimizer_step_accounting_valid = int(actual_optimizer_steps) == expected
 
     def _manifest_path(self) -> str:

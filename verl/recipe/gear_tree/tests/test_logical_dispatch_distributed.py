@@ -82,6 +82,9 @@ def _slot(i: int, n_tokens: int = 2, tree: str = "t0") -> dict:
         "advantage_is_zero": True,
         "trainable_edge_id": None,
         "response_token_count": int(n_tokens),
+        # PLAN.md §3/§4: stamped at extraction, never recomputed later.
+        "prob_mask_token_count": int(n_tokens),
+        "probability_mask_threshold": 0.9,
     }
 
 
@@ -159,7 +162,8 @@ def _worker(rank: int, world: int, rdv: str, out_dir: str):
                 {
                     "stats": stats,
                     "num_steps": metrics["actor/num_optimizer_steps"],
-                    "all_zero": metrics["actor/all_zero_logical_batches"],
+                    "all_zero": metrics["actor/all_zero_advantage_logical_batches"],
+                    "zero_active": metrics["actor/zero_active_token_logical_batches"],
                     "p0": p0,
                     "p1": p1,
                 },
@@ -235,4 +239,4 @@ def test_all_zero_logical_batch_is_skipped_with_no_drift(measured):
     dist_data, _ = measured
     assert dist_data["all_zero"] == [1]
     assert dist_data["num_steps"] == [1]
-    assert dist_data["stats"]["vdra/all_zero_logical_batches"] == 1.0
+    assert dist_data["stats"]["vdra/all_zero_advantage_logical_batches"] == 1.0

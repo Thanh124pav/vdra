@@ -320,6 +320,15 @@ actor_rollout_ref:
       # though they carry no tensor rows — sparse execution, PLAN.md §1.2).
       policy_aggregation: segment_mean
 
+      # PLAN.md §1: treetune-style probability mask. BOTH values are
+      # first-class (strict mode never forces one). A response token is
+      # active iff exp(old_log_prob) < probability_mask_threshold (STRICT
+      # `<`). This is the AUTHORITATIVE threshold: the trainer propagates it
+      # to rollout extraction so the stamped active-token counts and the
+      # actor-side mask can never use different semantics.
+      use_prob_mask: true
+      probability_mask_threshold: 0.9
+
     # No KL-in-loss by default (matches tree-family configs). KL coef = 0.
     use_kl_loss: false
 

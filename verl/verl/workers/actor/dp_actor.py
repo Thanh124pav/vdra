@@ -414,11 +414,16 @@ class DataParallelPPOActor(BasePPOActor):
         # optimizer batch, whose pre-filter denominators M_B / T_B were fixed
         # at reservation time. Every other mode keeps verl's fixed-size split.
         _split_loss_mode = str(self.config.policy_loss.get("loss_mode", "vanilla"))
+        # PLAN.md §12: ONE canonical default in every layer.
         _aggregation = str(
-            self.config.policy_loss.get(
-                "policy_aggregation", "tree_balanced_segment_mean"
-            )
+            self.config.policy_loss.get("policy_aggregation", "segment_mean")
         ).strip().lower()
+        if _aggregation == "global_segment_mean":
+            raise RuntimeError(
+                "internal configuration error: policy_aggregation="
+                "'global_segment_mean' reached the actor. Cross-level "
+                "validation must canonicalize it before runtime (PLAN.md §11)."
+            )
         vdra_canonical_aggregation = (
             _split_loss_mode == "vdra_segment_mean_ppo"
             and _aggregation in ("segment_mean", "token_mean")
@@ -426,6 +431,8 @@ class DataParallelPPOActor(BasePPOActor):
         logical_denominators = None
         vdra_dp_size = 1
         n_all_zero_logical_batches = 0
+        n_zero_active_token_batches = 0
+        _use_prob_mask = bool(self.config.policy_loss.get("use_prob_mask", True))
         if vdra_canonical_aggregation:
             if "logical_batch_index" not in data.batch.keys():
                 raise ValueError(
@@ -436,14 +443,50 @@ class DataParallelPPOActor(BasePPOActor):
                     "retained-row split (PLAN.md §1.2/§1.3)."
                 )
             seg_counts = data.meta_info.get("original_logical_segment_count")
-            tok_counts = data.meta_info.get("original_logical_token_count")
-            if not seg_counts or not tok_counts or len(seg_counts) != len(tok_counts):
+            resp_counts = data.meta_info.get("original_logical_response_token_count")
+            mask_counts = data.meta_info.get("original_logical_prob_mask_token_count")
+            statuses = data.meta_info.get("logical_batch_status")
+            if (
+                not seg_counts
+                or not resp_counts
+                or mask_counts is None
+                or statuses is None
+                or not (len(seg_counts) == len(resp_counts) == len(mask_counts) == len(statuses))
+            ):
                 raise ValueError(
-                    "canonical VDRA aggregation requires per-logical-batch "
-                    "original_logical_segment_count / "
-                    "original_logical_token_count lists in meta_info "
-                    "(PLAN.md §1.3); got "
-                    f"{seg_counts!r} / {tok_counts!r}."
+                    "canonical VDRA aggregation requires aligned "
+                    "per-logical-batch original_logical_segment_count / "
+                    "original_logical_response_token_count / "
+                    "original_logical_prob_mask_token_count / "
+                    "logical_batch_status lists in meta_info (PLAN.md §5/§6); "
+                    f"got {seg_counts!r} / {resp_counts!r} / {mask_counts!r} / "
+                    f"{statuses!r}."
+                )
+            # PLAN.md §5: the denominators were computed under a specific mask
+            # identity; a mismatch would silently normalize a masked numerator
+            # by an unmasked count.
+            _stamped_mask = data.meta_info.get("logical_use_prob_mask")
+            if _stamped_mask is not None and bool(_stamped_mask) != _use_prob_mask:
+                raise ValueError(
+                    "logical denominators were computed with use_prob_mask="
+                    f"{bool(_stamped_mask)} but the actor is configured with "
+                    f"use_prob_mask={_use_prob_mask}; the numerator and "
+                    "denominator masks must match (PLAN.md §5)."
+                )
+            _stamped_thr = data.meta_info.get("logical_probability_mask_threshold")
+            _actor_thr = float(
+                self.config.policy_loss.get("probability_mask_threshold", 0.9)
+            )
+            if (
+                _use_prob_mask
+                and _stamped_thr is not None
+                and float(_stamped_thr) != _actor_thr
+            ):
+                raise ValueError(
+                    "logical denominators were computed with "
+                    f"probability_mask_threshold={float(_stamped_thr)} but the "
+                    f"actor is configured with {_actor_thr}; active-token "
+                    "counts would disagree (PLAN.md §1/§5)."
                 )
             if self.ulysses_sequence_parallel_size > 1:
                 raise NotImplementedError(
@@ -470,17 +513,26 @@ class DataParallelPPOActor(BasePPOActor):
             mini_batches = []
             logical_denominators = []
             for _k in range(len(seg_counts)):
+                _status = str(statuses[_k])
                 _sel = torch.nonzero(_idx == _k, as_tuple=False).squeeze(-1)
-                if _sel.numel() == 0:
-                    # All-zero logical batch: no rows on ANY rank by
-                    # construction, so every rank skips this optimizer step
-                    # consistently (PLAN.md §1.3 approved skip).
-                    n_all_zero_logical_batches += 1
+                if _status != "trainable" or _sel.numel() == 0:
+                    # PLAN.md §6/§7: a skipped logical batch carries no rows on
+                    # ANY rank by construction, so every rank skips this
+                    # optimizer step consistently — no forward, no backward, no
+                    # optimizer.step, no num_optimizer_steps contribution. The
+                    # two skip reasons are counted SEPARATELY.
+                    if _status == "zero_active_tokens":
+                        n_zero_active_token_batches += 1
+                    else:
+                        n_all_zero_logical_batches += 1
                     continue
                 mini_batches.append(data[_sel])
-                logical_denominators.append(
-                    (float(seg_counts[_k]), float(tok_counts[_k]))
+                # PLAN.md §5: the token denominator must match the numerator's
+                # mask; the actor selects it from its own use_prob_mask.
+                _t_b = (
+                    float(mask_counts[_k]) if _use_prob_mask else float(resp_counts[_k])
                 )
+                logical_denominators.append((float(seg_counts[_k]), _t_b))
         else:
             # Split to make minibatch iterator for updating the actor
             # See PPO paper for details. https://arxiv.org/abs/1707.06347
@@ -655,8 +707,9 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_kwargs["original_optimizer_batch_tree_count"] = (
                             original_optimizer_batch_tree_count
                         )
-                    # PLAN.md §1.3: canonical paper aggregations receive the
-                    # trainer-stamped pre-filter logical denominators.
+                    # PLAN.md §5/§9: canonical paper aggregations receive the
+                    # trainer-stamped pre-filter logical denominators plus the
+                    # dummy-row indicator so padding rows are masked EXPLICITLY.
                     if (
                         logical_denominators is not None
                         and "original_logical_segment_count"
@@ -665,9 +718,16 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_kwargs["original_logical_segment_count"] = (
                             logical_segment_count
                         )
-                        loss_kwargs["original_logical_token_count"] = (
-                            logical_token_count
-                        )
+                        # dp_actor already selected the mask-matching count.
+                        if _use_prob_mask:
+                            loss_kwargs["original_logical_prob_mask_token_count"] = (
+                                logical_token_count
+                            )
+                        else:
+                            loss_kwargs["original_logical_response_token_count"] = (
+                                logical_token_count
+                            )
+                        loss_kwargs["is_dummy"] = model_inputs.get("is_dummy", None)
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(**loss_kwargs)
 
                     if entropy_coeff != 0:
@@ -722,10 +782,14 @@ class DataParallelPPOActor(BasePPOActor):
         # `metrics` key so it is emitted through `reduce_metrics` unchanged.
         metrics.setdefault("actor/num_optimizer_steps", []).append(int(num_optimizer_steps))
         if vdra_canonical_aggregation:
-            # PLAN.md §1.3: all-zero logical batches are skipped consistently
-            # on every rank (no forward/backward/optimizer.step) and reported.
-            metrics.setdefault("actor/all_zero_logical_batches", []).append(
+            # PLAN.md §6/§7: skipped logical batches are skipped consistently on
+            # every rank (no forward/backward/optimizer.step) and the two skip
+            # reasons are reported SEPARATELY — never conflated.
+            metrics.setdefault("actor/all_zero_advantage_logical_batches", []).append(
                 int(n_all_zero_logical_batches)
+            )
+            metrics.setdefault("actor/zero_active_token_logical_batches", []).append(
+                int(n_zero_active_token_batches)
             )
         # PLAN.md P0.J: OBSERVED fact for the manifest — 1.0 only when the
         # stored generation-time old_log_probs were actually kept as the PPO

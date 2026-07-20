@@ -142,7 +142,7 @@ class TestTokenMean:
         loss = _loss(
             _config(aggregation="token_mean"),
             rows,
-            original_logical_token_count=t_b,
+            original_logical_response_token_count=t_b,
         )
         expected = -(0.7 * 3 + (-0.3) * 2) / t_b
         assert torch.allclose(loss, torch.tensor(expected), atol=1e-7)
@@ -151,13 +151,13 @@ class TestTokenMean:
         rows_short_first = _rows([0.7, -0.3], lengths=[1, 4])
         rows_long_first = _rows([0.7, -0.3], lengths=[4, 1])
         cfg = _config(aggregation="token_mean")
-        l1 = _loss(rows=rows_short_first, config=cfg, original_logical_token_count=10)
-        l2 = _loss(rows=rows_long_first, config=cfg, original_logical_token_count=10)
+        l1 = _loss(rows=rows_short_first, config=cfg, original_logical_response_token_count=10)
+        l2 = _loss(rows=rows_long_first, config=cfg, original_logical_response_token_count=10)
         assert not torch.allclose(l1, l2)
 
     def test_missing_stamp_fails_fast(self):
         rows = _rows([0.7], lengths=[2])
-        with pytest.raises(ValueError, match="original_logical_token_count"):
+        with pytest.raises(ValueError, match="original_logical_response_token_count"):
             _loss(_config(aggregation="token_mean"), rows)
 
     def test_sum_reduction_rejected(self):
@@ -183,7 +183,7 @@ class TestMicroSplitInvariance:
         cfg = _config(aggregation=aggregation)
         stamps = {
             "original_logical_segment_count": 8,
-            "original_logical_token_count": 25,
+            "original_logical_response_token_count": 25,
         }
         full = _loss(cfg, rows, **stamps)
         split_sum = torch.tensor(0.0)
@@ -209,7 +209,7 @@ class TestAggregationModesDiffer:
         tok = _loss(
             _config(aggregation="token_mean"),
             rows,
-            original_logical_token_count=10,
+            original_logical_response_token_count=10,
         )
         tree = _loss(
             _config(aggregation="tree_balanced_segment_mean"),
@@ -228,11 +228,14 @@ class TestSchemaGuards:
 
         assert PolicyLossConfig().policy_aggregation == "segment_mean"
 
-    def test_retired_global_segment_mean_rejected_with_rename_message(self):
+    def test_legacy_global_segment_mean_survives_typed_parsing(self):
+        """PLAN.md §11: typed parsing keeps the legacy token so the
+        strictness-aware cross-level validator can decide its fate; it is
+        NEVER silently mapped to segment_mean here."""
         from verl.workers.config.actor import PolicyLossConfig
 
-        with pytest.raises(ValueError, match="tree_balanced_segment_mean"):
-            PolicyLossConfig(policy_aggregation="global_segment_mean")
+        cfg = PolicyLossConfig(policy_aggregation="global_segment_mean")
+        assert cfg.policy_aggregation == "global_segment_mean"
 
     def test_unknown_aggregation_rejected(self):
         from verl.workers.config.actor import PolicyLossConfig
@@ -240,10 +243,12 @@ class TestSchemaGuards:
         with pytest.raises(ValueError, match="policy_aggregation"):
             PolicyLossConfig(policy_aggregation="segment_average")
 
-    def test_loss_level_rejects_retired_name(self):
+    def test_loss_level_raises_internal_error_on_uncanonicalized_legacy_name(self):
+        """PLAN.md §11: if the legacy token ever reaches the actor loss,
+        cross-level canonicalization was bypassed — that is an INTERNAL
+        configuration error, never a silent mapping to segment_mean."""
         rows = _rows([0.7], lengths=[2])
         cfg = _config()
-        # Simulate a dict-shaped config that bypassed dataclass validation.
         object.__setattr__(cfg.policy_loss, "policy_aggregation", "global_segment_mean")
-        with pytest.raises(ValueError, match="renamed"):
-            _loss(cfg, rows)
+        with pytest.raises(RuntimeError, match="internal configuration error"):
+            _loss(cfg, rows, original_logical_segment_count=4)
