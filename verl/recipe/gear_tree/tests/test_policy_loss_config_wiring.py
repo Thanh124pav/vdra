@@ -19,7 +19,10 @@ import torch  # noqa: E402  after importorskip
 
 from omegaconf import OmegaConf  # noqa: E402
 from verl.workers.config.actor import ActorConfig, PolicyLossConfig  # noqa: E402
-from recipe.gear_tree.policy_loss import _resolve_segment_token_reduction  # noqa: E402
+from recipe.gear_tree.policy_loss import (  # noqa: E402
+    _resolve_policy_loss_field,
+    _resolve_segment_token_reduction,
+)
 
 
 def _make_policy_loss_cfg(reduction: str = "mean") -> PolicyLossConfig:
@@ -202,6 +205,165 @@ class TestHydraComposition:
         )
         assert pl.segment_token_reduction == "sum"
 
+    @staticmethod
+    def _compose_real(overrides=None):
+        # PLAN.md M5: REAL hydra.compose of the shipped main config,
+        # including the pkg://verl.trainer.config searchpath.
+        pytest.importorskip("hydra")
+        from pathlib import Path
+
+        from hydra import compose, initialize_config_dir
+
+        config_dir = Path(__file__).resolve().parents[1] / "config"
+        with initialize_config_dir(
+            config_dir=str(config_dir), version_base=None
+        ):
+            return compose(
+                config_name="gear_tree_trainer", overrides=overrides or []
+            )
+
+    def test_real_compose_canonical_mean(self):
+        cfg = self._compose_real()
+        actor = cfg.actor_rollout_ref.actor
+        assert actor.policy_loss.loss_mode == "vdra_segment_mean_ppo"
+        assert actor.policy_loss.segment_token_reduction == "mean"
+        assert cfg.tree_policy.segment_token_reduction == "mean"
+        assert cfg.tree_policy.policy_aggregation == "global_segment_mean"
+
+    def test_real_compose_sum_override_reaches_actor_policy_loss(self):
+        cfg = self._compose_real(
+            overrides=[
+                "tree_policy.segment_token_reduction=sum",
+                "actor_rollout_ref.actor.policy_loss.segment_token_reduction=sum",
+            ]
+        )
+        assert (
+            cfg.actor_rollout_ref.actor.policy_loss.segment_token_reduction
+            == "sum"
+        )
+        assert cfg.tree_policy.segment_token_reduction == "sum"
+
+    def test_real_compose_passes_extracted_trainer_validation(self):
+        from recipe.gear_tree.config_validation import (
+            validate_policy_loss_consistency,
+        )
+
+        assert validate_policy_loss_consistency(self._compose_real()) is None
+
+    def test_real_compose_round_trips_typed_policy_loss(self):
+        cfg = self._compose_real()
+        from omegaconf import OmegaConf
+
+        from verl.utils.config import omega_conf_to_dataclass
+
+        pl_node = OmegaConf.create(
+            OmegaConf.to_container(
+                cfg.actor_rollout_ref.actor.policy_loss, resolve=True
+            )
+        )
+        pl = omega_conf_to_dataclass(pl_node, dataclass_type=PolicyLossConfig)
+        assert pl.loss_mode == "vdra_segment_mean_ppo"
+        assert pl.segment_token_reduction == "mean"
+
+
+class TestPolicyLossFieldReads:
+    """PLAN.md P0.F: ``use_prob_mask`` / ``ratio_threshold`` are declared on
+    ``PolicyLossConfig`` and must be read from ``config.policy_loss.*``, not
+    from the ActorConfig top level."""
+
+    def test_actor_config_policy_loss_level_is_read(self):
+        cfg = ActorConfig(
+            strategy="fsdp",
+            rollout_n=1,
+            ppo_micro_batch_size_per_gpu=32,
+            policy_loss=PolicyLossConfig(
+                loss_mode="vdra_segment_mean_ppo",
+                use_prob_mask=False,
+                ratio_threshold=5.0,
+            ),
+        )
+        assert _resolve_policy_loss_field(cfg, "use_prob_mask", True) is False
+        assert _resolve_policy_loss_field(cfg, "ratio_threshold", 10.0) == 5.0
+
+    def test_wrong_level_duplicate_is_ignored(self):
+        cfg = OmegaConf.create(
+            {
+                "use_prob_mask": True,  # wrong level — must never be read
+                "ratio_threshold": 99.0,  # wrong level — must never be read
+                "policy_loss": {
+                    "use_prob_mask": False,
+                    "ratio_threshold": 5.0,
+                },
+            }
+        )
+        assert _resolve_policy_loss_field(cfg, "use_prob_mask", True) is False
+        assert _resolve_policy_loss_field(cfg, "ratio_threshold", 10.0) == 5.0
+
+    def test_bare_policy_loss_config_direct(self):
+        pl = PolicyLossConfig(
+            loss_mode="vdra_segment_mean_ppo",
+            use_prob_mask=False,
+            ratio_threshold=7.5,
+        )
+        assert _resolve_policy_loss_field(pl, "use_prob_mask", True) is False
+        assert _resolve_policy_loss_field(pl, "ratio_threshold", 10.0) == 7.5
+
+    def test_missing_everywhere_falls_back_to_default(self):
+        cfg = OmegaConf.create({})
+        assert _resolve_policy_loss_field(cfg, "use_prob_mask", True) is True
+        assert (
+            _resolve_policy_loss_field(cfg, "ratio_threshold", 10.0) == 10.0
+        )
+
+    def test_use_prob_mask_override_changes_production_loss(self):
+        """An override under actor.policy_loss must change actual loss
+        output: with the prob mask on, tokens whose old probability is
+        >= 0.9 are excluded from the surrogate."""
+        from recipe.gear_tree.policy_loss import (
+            compute_policy_loss_vdra_segment_mean,
+        )
+
+        n, t = 2, 4
+        # High-probability old tokens (exp(-0.01) ~ 0.99): masked out when
+        # use_prob_mask=True, included when False.
+        old_log_prob = torch.full((n, t), -0.01)
+        log_prob = torch.full((n, t), -0.5)
+        advantages = torch.full((n, t), 1.0)
+        response_mask = torch.ones((n, t))
+
+        def _cfg(use_prob_mask: bool) -> ActorConfig:
+            return ActorConfig(
+                strategy="fsdp",
+                rollout_n=1,
+                ppo_micro_batch_size_per_gpu=32,
+                policy_loss=PolicyLossConfig(
+                    loss_mode="vdra_segment_mean_ppo",
+                    use_prob_mask=use_prob_mask,
+                ),
+            )
+
+        seg_counts = torch.full((n,), float(t))
+        loss_masked, *_ = compute_policy_loss_vdra_segment_mean(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            config=_cfg(True),
+            tree_total_segment_count=seg_counts,
+            original_optimizer_batch_tree_count=1,
+        )
+        loss_unmasked, *_ = compute_policy_loss_vdra_segment_mean(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            config=_cfg(False),
+            tree_total_segment_count=seg_counts,
+            original_optimizer_batch_tree_count=1,
+        )
+        assert torch.isclose(loss_masked, torch.tensor(0.0))
+        assert not torch.isclose(loss_unmasked, loss_masked)
+
 
 class TestStartupConsistencyCheck:
     """PLAN.md P0.1: the trainer must refuse a config where
@@ -236,28 +398,202 @@ class TestStartupConsistencyCheck:
         )
 
     def test_matching_values_pass(self):
-        # Direct assertion of the invariant — the trainer function needs a
-        # full Ray/verl bootstrap to instantiate, so we mirror its check here
-        # to keep the test surface small and dependency-light.
-        cfg = self._minimal_config("mean", "mean")
-        tree_r = str(
-            cfg["tree_policy"]["segment_token_reduction"]
-        ).strip().lower()
-        actor_r = str(
-            cfg["actor_rollout_ref"]["actor"]["policy_loss"][
-                "segment_token_reduction"
-            ]
-        ).strip().lower()
-        assert tree_r == actor_r == "mean"
+        # PLAN.md M5: run the REAL extracted trainer validation, not a
+        # mirrored re-implementation.
+        from recipe.gear_tree.config_validation import (
+            validate_policy_loss_consistency,
+        )
 
-    def test_mismatched_values_would_be_rejected(self):
-        cfg = self._minimal_config("mean", "sum")
-        tree_r = str(
-            cfg["tree_policy"]["segment_token_reduction"]
-        ).strip().lower()
-        actor_r = str(
-            cfg["actor_rollout_ref"]["actor"]["policy_loss"][
-                "segment_token_reduction"
-            ]
-        ).strip().lower()
-        assert tree_r != actor_r
+        assert (
+            validate_policy_loss_consistency(
+                self._minimal_config("mean", "mean")
+            )
+            is None
+        )
+        assert (
+            validate_policy_loss_consistency(
+                self._minimal_config("sum", "sum")
+            )
+            is None
+        )
+
+    def test_mismatched_values_are_rejected(self):
+        from recipe.gear_tree.config_validation import (
+            validate_policy_loss_consistency,
+        )
+
+        with pytest.raises(ValueError, match="P0.1"):
+            validate_policy_loss_consistency(
+                self._minimal_config("mean", "sum")
+            )
+
+    def test_invalid_reduction_is_rejected(self):
+        from recipe.gear_tree.config_validation import (
+            validate_policy_loss_consistency,
+        )
+
+        with pytest.raises(ValueError, match="exactly 'mean' or"):
+            validate_policy_loss_consistency(
+                self._minimal_config("median", "median")
+            )
+
+    def test_wrong_loss_mode_for_canonical_aggregation_is_rejected(self):
+        from recipe.gear_tree.config_validation import (
+            validate_policy_loss_consistency,
+        )
+
+        cfg = self._minimal_config("mean", "mean")
+        cfg.actor_rollout_ref.actor.policy_loss.loss_mode = (
+            "vdra_node_balanced_ppo"
+        )
+        with pytest.raises(ValueError, match="vdra_segment_mean_ppo"):
+            validate_policy_loss_consistency(cfg)
+
+    def test_trainer_startup_routes_through_extracted_validator(self):
+        # Source guard: the trainer must call the extracted function so the
+        # gate and the trainer can never diverge.
+        import inspect
+
+        from recipe.gear_tree import gear_ray_trainer
+
+        source = inspect.getsource(
+            gear_ray_trainer.RayGearTreeTrainer._validate_replay_startup
+        )
+        assert "validate_policy_loss_consistency(" in source
+
+
+class TestM5StrictCanonicalTriple:
+    """PLAN.md M5: strict_vdra=true requires the exact canonical triple
+    tree_update_mode=spo / policy_aggregation=global_segment_mean /
+    loss_mode=vdra_segment_mean_ppo, and the node-balanced aggregation/loss
+    mapping is enforced in both directions regardless of strict mode."""
+
+    def _config(
+        self,
+        *,
+        strict=True,
+        tree_update_mode="spo",
+        policy_aggregation="global_segment_mean",
+        loss_mode="vdra_segment_mean_ppo",
+        reduction="mean",
+    ):
+        return OmegaConf.create(
+            {
+                "gear_tree": {
+                    "tree_shape": [6, 6, 6],
+                    "segment_length": 100,
+                    "tree_update_mode": tree_update_mode,
+                    "gear": {"strict_vdra": strict},
+                    "replay_buffer": {},
+                },
+                "tree_policy": {
+                    "policy_aggregation": policy_aggregation,
+                    "segment_token_reduction": reduction,
+                },
+                "actor_rollout_ref": {
+                    "actor": {
+                        "policy_loss": {
+                            "loss_mode": loss_mode,
+                            "segment_token_reduction": reduction,
+                        }
+                    }
+                },
+            }
+        )
+
+    def _validate(self, cfg):
+        from recipe.gear_tree.config_validation import (
+            validate_policy_loss_consistency,
+        )
+
+        return validate_policy_loss_consistency(cfg)
+
+    def test_canonical_triple_passes(self):
+        assert self._validate(self._config()) is None
+
+    def test_strict_rejects_treepo_style_ablation(self):
+        with pytest.raises(ValueError, match="tree_update_mode"):
+            self._validate(self._config(tree_update_mode="treepo_style_ablation"))
+
+    def test_strict_rejects_treerl_style_ablation(self):
+        with pytest.raises(ValueError, match="tree_update_mode"):
+            self._validate(self._config(tree_update_mode="treerl_style_ablation"))
+
+    def test_strict_rejects_original_aliases(self):
+        with pytest.raises(ValueError, match="tree_update_mode"):
+            self._validate(self._config(tree_update_mode="treepo_original"))
+        with pytest.raises(ValueError, match="tree_update_mode"):
+            self._validate(self._config(tree_update_mode="treerl_original"))
+
+    def test_strict_rejects_non_spo_tree_update_mode(self):
+        with pytest.raises(ValueError, match="tree_update_mode"):
+            self._validate(self._config(tree_update_mode="something_else"))
+
+    def test_strict_rejects_legacy_token_mean_aggregation(self):
+        # legacy_token_mean uses treetune_ppo; strict must reject the whole
+        # non-canonical config (reported via the aggregation requirement).
+        with pytest.raises(ValueError, match="global_segment_mean"):
+            self._validate(
+                self._config(
+                    policy_aggregation="legacy_token_mean",
+                    loss_mode="treetune_ppo",
+                )
+            )
+
+    def test_strict_rejects_node_balanced_aggregation(self):
+        with pytest.raises(ValueError, match="global_segment_mean"):
+            self._validate(
+                self._config(
+                    policy_aggregation="vdra_node_balanced",
+                    loss_mode="vdra_node_balanced_ppo",
+                )
+            )
+
+    def test_node_balanced_requires_node_balanced_loss(self):
+        # Reverse mapping, non-strict ablation: vdra_node_balanced aggregation
+        # with the wrong loss is rejected even when strict_vdra=false.
+        with pytest.raises(ValueError, match="vdra_node_balanced_ppo"):
+            self._validate(
+                self._config(
+                    strict=False,
+                    tree_update_mode="spo",
+                    policy_aggregation="vdra_node_balanced",
+                    loss_mode="vdra_segment_mean_ppo",
+                )
+            )
+
+    def test_node_balanced_loss_requires_node_balanced_aggregation(self):
+        with pytest.raises(ValueError, match="vdra_node_balanced"):
+            self._validate(
+                self._config(
+                    strict=False,
+                    policy_aggregation="legacy_token_mean",
+                    loss_mode="vdra_node_balanced_ppo",
+                )
+            )
+
+    def test_node_balanced_ablation_passes_non_strict(self):
+        # smoke_c cell: strict_vdra=false + matched node-balanced pair.
+        assert (
+            self._validate(
+                self._config(
+                    strict=False,
+                    policy_aggregation="vdra_node_balanced",
+                    loss_mode="vdra_node_balanced_ppo",
+                )
+            )
+            is None
+        )
+
+    def test_legacy_loss_ablation_passes_non_strict(self):
+        # smoke_b cell: strict_vdra=false + legacy_token_mean + treetune_ppo.
+        assert (
+            self._validate(
+                self._config(
+                    strict=False,
+                    policy_aggregation="legacy_token_mean",
+                    loss_mode="treetune_ppo",
+                )
+            )
+            is None
+        )

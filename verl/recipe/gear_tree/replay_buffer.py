@@ -1,11 +1,12 @@
 """Trainer-owned replay buffer for tree-family VERL edge updates.
 
-PLAN.md P0.N6: the buffer indexes edges both by ``edge_id`` (backwards-
-compatible flat view) and by ``tree_id`` (canonical VDRA view). Reservations
-made via :meth:`reserve_complete_trees_for_update` return one or more
-COMPLETE trees — every edge that shares a ``tree_id`` with a returned edge
-is included, and reserved rows never straddle a parent group. Legacy
-``reserve_for_update`` remains available for the SPO baseline path.
+PLAN.md P0.A: canonical VDRA replay is EDGE-level — the trainer reserves
+individual edges via :meth:`reserve_for_update` (per-question cap, hard
+target cap, transactional commit/rollback). Complete-tree replay via
+:meth:`reserve_complete_trees_for_update` is retained only as the explicit
+``replay_sampling_unit: complete_tree`` ablation; it is never selected by
+``strict_group_integrity``. Use :func:`reserve_replay_edges` to dispatch on
+the configured sampling unit.
 """
 
 from __future__ import annotations
@@ -81,6 +82,114 @@ class ReplayReservation:
     stats: Dict[str, Any]
 
 
+VALID_REPLAY_SAMPLING_UNITS = ("edge", "complete_tree")
+
+VALID_UNDERFILLED_UPDATE_POLICIES = ("postpone_until_divisible", "use_available")
+
+
+def should_postpone_sampled_update(
+    *,
+    selected_count: int,
+    target_edges_per_iteration: int,
+    ppo_mini_batch_size: int,
+    underfilled_update_policy: str = "postpone_until_divisible",
+) -> bool:
+    """PLAN.md P0.D: exact optimizer-batch cardinality for one iteration.
+
+    * ``selected_count > target`` is a sampler bug and raises
+      ``AssertionError`` — both reservation paths cap at the target, so an
+      oversized batch must never reach the actor.
+    * Canonical ``postpone_until_divisible``: postpone whenever the count is
+      not divisible by ``ppo_mini_batch_size`` (under- OR over-filled), so no
+      tail optimizer batch can form.
+    * ``use_available``: ablation-only; runs whatever was sampled.
+    """
+    n = int(selected_count)
+    target = int(target_edges_per_iteration)
+    if n > target:
+        raise AssertionError(
+            f"replay sampler returned {n} edges, exceeding "
+            f"target_edges_per_iteration={target} (PLAN.md P0.D). This is a "
+            "sampler bug; the reservation path must cap at the target."
+        )
+    policy = str(underfilled_update_policy)
+    if policy == "use_available":
+        return False
+    if policy != "postpone_until_divisible":
+        raise ValueError(f"Unknown underfilled_update_policy: {policy!r}")
+    if n == 0:
+        return False
+    return n % int(ppo_mini_batch_size) != 0
+
+
+def batch_has_zero_learning_signal(edges: Sequence[Mapping[str, Any]]) -> bool:
+    """Diagnostic predicate for experiments; canonical trainer does not skip.
+
+    Uses the exact ``advantage`` scalar tensorization broadcasts into the
+    policy ``advantages`` tensor. Missing advantages are invalid replay rows
+    and must fail instead of being interpreted as zero.
+    """
+    edge_list = list(edges)
+    if not edge_list:
+        return False
+    for edge in edge_list:
+        if "advantage" not in edge or edge["advantage"] is None:
+            raise ValueError("sampled edge is missing training advantage")
+    return all(float(edge["advantage"]) == 0.0 for edge in edge_list)
+
+
+def expected_optimizer_steps(
+    *,
+    selected_count: int,
+    ppo_mini_batch_size: int,
+    ppo_epochs: int = 1,
+) -> int:
+    """PLAN.md P0.D: N_steps = N_selected / ppo_mini_batch_size * ppo_epochs.
+
+    Valid ONLY after divisibility has been enforced; raises otherwise so the
+    floor formula can never silently hide a tail batch.
+    """
+    n = int(selected_count)
+    mini = int(ppo_mini_batch_size)
+    if mini <= 0:
+        raise ValueError("ppo_mini_batch_size must be > 0")
+    if n % mini != 0:
+        raise ValueError(
+            f"expected_optimizer_steps requires selected_count divisible by "
+            f"ppo_mini_batch_size; got {n} % {mini} != 0 (PLAN.md P0.D)."
+        )
+    return n // mini * max(int(ppo_epochs), 1)
+
+
+def reserve_replay_edges(
+    replay_buffer: "GearTreeReplayBuffer",
+    *,
+    replay_sampling_unit: str,
+    current_rollout_iteration: int,
+) -> ReplayReservation:
+    """PLAN.md P0.A: production reservation dispatch.
+
+    The sampling unit comes from config only. ``edge`` is canonical;
+    ``complete_tree`` is an explicit non-canonical ablation. Strictness
+    (``tree_policy.strict_group_integrity``) controls validation and must
+    never select the reservation path.
+    """
+
+    unit = str(replay_sampling_unit)
+    if unit == "edge":
+        return replay_buffer.reserve_for_update(
+            current_rollout_iteration=current_rollout_iteration
+        )
+    if unit == "complete_tree":
+        return replay_buffer.reserve_complete_trees_for_update(
+            current_rollout_iteration=current_rollout_iteration
+        )
+    raise ValueError(
+        f"Unknown replay_sampling_unit={unit!r}; expected one of "
+        f"{VALID_REPLAY_SAMPLING_UNITS} (PLAN.md P0.A)."
+    )
+
+
 class GearTreeReplayBuffer:
     """CPU-native edge replay buffer shared by SPO/VDRA tree methods."""
 
@@ -130,10 +239,11 @@ class GearTreeReplayBuffer:
         self.target_edges_per_iteration = max(int(resolved_target), 1)
         self.max_edge_age_iterations = max(int(resolved_age), 1)
         self.replay_sampling_unit = str(replay_sampling_unit)
-        if self.replay_sampling_unit != "edge":
+        if self.replay_sampling_unit not in VALID_REPLAY_SAMPLING_UNITS:
             raise ValueError(
-                "Only replay_sampling_unit='edge' is supported on the canonical "
-                "main path (PLAN.md P0.2)."
+                "replay_sampling_unit must be 'edge' (canonical) or "
+                "'complete_tree' (explicit ablation), got "
+                f"{self.replay_sampling_unit!r} (PLAN.md P0.A)."
             )
         self.tree_shape: Tuple[int, ...] = tuple(int(b) for b in (tree_shape or ()))
         self.trees_per_question = max(int(trees_per_question), 1)
@@ -473,10 +583,12 @@ class GearTreeReplayBuffer:
         current_rollout_iteration: Optional[int] = None,
         current_step: Optional[int] = None,  # deprecated alias
     ) -> ReplayReservation:
-        """PLAN.md P0.N6: reserve one or more COMPLETE trees.
+        """Non-canonical ``replay_sampling_unit=complete_tree`` ablation.
 
-        Trees are added whole (all edges sharing a ``tree_id``) until the
-        cumulative edge count meets or exceeds ``target_edges_per_iteration``.
+        Trees are added whole (all edges sharing a ``tree_id``) while the
+        cumulative edge count stays within ``target_edges_per_iteration`` —
+        the reservation NEVER exceeds the target (PLAN.md P0.A/P0.D); a tree
+        that does not fit is skipped, so the reservation may be underfilled.
         ``max_edges_per_question_per_iteration`` is applied per question by
         picking a subset of that question's trees, never by dropping an
         individual edge from one of its trees. A tree is never split across
@@ -544,13 +656,19 @@ class GearTreeReplayBuffer:
             picked_trees.extend(selected)
             edges_per_question.append(cumulative)
 
-        # Shuffle whole trees, then pack until the target edge count is met.
+        # Shuffle whole trees, then pack whole trees WITHOUT ever exceeding
+        # the per-iteration target (PLAN.md P0.A/P0.D: never return more than
+        # target_edges_per_iteration). A tree that does not fit is skipped so
+        # a smaller tree later in the shuffle may still fill the remainder;
+        # trees are never split.
         rng.shuffle(picked_trees)
         packed_trees: List[List[Dict[str, Any]]] = []
+        skipped_oversized_trees = 0
         cumulative = 0
         for tree_edges in picked_trees:
-            if cumulative >= self.target_edges_per_iteration and packed_trees:
-                break
+            if cumulative + len(tree_edges) > self.target_edges_per_iteration:
+                skipped_oversized_trees += 1
+                continue
             packed_trees.append(tree_edges)
             cumulative += len(tree_edges)
 
@@ -582,6 +700,7 @@ class GearTreeReplayBuffer:
             "buffer/expired_edges": len(expired_ids),
             "buffer/candidate_trees": len(picked_trees),
             "buffer/packed_trees": len(packed_trees),
+            "buffer/skipped_oversized_trees": skipped_oversized_trees,
             "buffer/sampled_edges": len(sampled),
             "buffer/size_after": len(self._edges),
             "buffer/reserved_edges": len(self._reserved),

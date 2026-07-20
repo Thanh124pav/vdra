@@ -38,17 +38,26 @@ def extract_edges_from_tree(
     treerl_gamma: float = 0.9,
     emit_pruned_edges: bool = False,
     strict_fresh_iid: bool = False,
+    collect_construction_summaries: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Extract treetune-compatible training edges from a generated tree.
 
     This ports ``TreeEpisodeUtils.extract_edges_from_tree`` while reading both
     ``reward`` and legacy ``score`` fields.
 
-    PLAN.md P0.1: main VDRA runs must keep every realized child (including
-    zero-advantage ones) so the parent denominator ``|children_of_p|`` matches
-    ``allocated_k``. Administrative ``pruned=True`` placeholder rows must NOT
-    enter training nor the parent denominator; ``emit_pruned_edges`` defaults
-    to ``False``. Set to ``True`` only for diagnostic dumps.
+    Stage 1 zero-filter contract: advantages are computed for every realized
+    child before filtering. When ``only_adv_greater_than_zero`` is true, the
+    legacy name means "drop exact-zero advantages to save compute"; positive
+    and negative advantages are retained. Administrative ``pruned=True``
+    placeholder rows must NOT enter replay; ``emit_pruned_edges`` defaults to
+    ``False`` and is only for diagnostic dumps.
+
+    ``collect_construction_summaries``: when a list is passed, the per-tree
+    construction summary (pre-filter counts and per-parent
+    ``realized``/``allocated_k``/``retained`` facts) is appended to it even
+    when every edge of the tree is zero-filtered away. This is the only
+    channel that preserves construction facts for a parent/tree whose every
+    child has exactly zero advantage — such rows never enter replay.
 
     ``strict_fresh_iid`` enforces the fresh_iid invariants right at edge
     extraction:
@@ -77,29 +86,46 @@ def extract_edges_from_tree(
         or data_instance.get("policy_snapshot_id")
         or data_instance.get("current_rollout_snapshot_id")
     )
-    # PLAN.md P0.2: every stochastic tree has one globally-unique
-    # tree_instance_id stamped by the tree builder. Prefer it; fall back to
-    # legacy tree_id fields only to keep old fixtures working. The
+    # PLAN.md P0.2/P0.H: every stochastic tree has one globally-unique
+    # tree_instance_id stamped by the tree builder (make_tree_instance_id:
+    # snapshot + rollout iteration + question + per-tree uuid/counter).
+    # Prefer it; legacy tree_id fields keep old fixtures working. The
     # (snapshot, question) tuple must NEVER be used as a tree id in main runs
     # — two rollouts for the same prompt in the same iteration would collide.
-    tree_id = (
+    tree_instance_id = (
         tree_copy.get("tree_instance_id")
-        or tree_copy.get("tree_id")
         or data_instance.get("tree_instance_id")
-        or data_instance.get("tree_id")
-        or f"{policy_snapshot_id}:{question_id}"
     )
+    if strict_fresh_iid and not tree_instance_id:
+        # PLAN.md P0.H / M3: strict main generation requires the explicit
+        # tree_instance_id stamped by the tree builder (make_tree_instance_id:
+        # snapshot + rollout iteration + question + per-tree uuid/counter).
+        # A legacy tree_id alone is NOT a valid strict identity, and the
+        # (snapshot, question) tuple must never be used as a tree id.
+        raise ValueError(
+            "Strict VDRA requires a unique tree_instance_id stamped by "
+            "the tree builder (make_tree_instance_id); a legacy tree_id "
+            "alone or the ambiguous snapshot:question fallback is not a "
+            "valid strict identity (PLAN.md P0.H)."
+        )
+    tree_id = (
+        tree_instance_id
+        or tree_copy.get("tree_id")
+        or data_instance.get("tree_id")
+    )
+    if tree_id is None:
+        # Non-strict compatibility path only — strict already raised above.
+        tree_id = f"{policy_snapshot_id}:{question_id}"
 
     # PLAN.md P0.N1: aggregate tree-level counts as we walk the tree so the
     # trainer can assert group integrity without a second pass.
     expanded_parent_group_ids: set[str] = set()
     trainable_child_count = 0
     queue_to_parent_group_counts: dict[Any, set[str]] = {}
-    # PLAN.md P0.2: pre-filter segment counts. Every realized (non-pruned)
+    # Stage 1: pre-filter segment counts. Every realized non-pruned
     # segment increments ``tree_total_segment_count`` even if its advantage
-    # ends up zero and it gets dropped from ``edges`` — the segment denominator
-    # ``N_seg(T)`` must not shift under advantage sparsity. Queue counts obey
-    # the same rule so the identity ``sum_q n_q == N_seg(T)`` holds.
+    # is exactly zero and the row is dropped from replay to save compute.
+    # Queue counts preserve the same pre-filter construction snapshot.
     tree_total_segment_count = 0
     queue_released_segment_count: dict[Any, int] = {}
     # PLAN.md P0.2: per-parent realized-vs-allocated snapshot. Fresh_iid
@@ -203,6 +229,8 @@ def extract_edges_from_tree(
                 "pruned": is_pruned,
                 # PLAN.md P0.N1/N2: canonical grouping metadata. These must
                 # survive tree -> edge -> replay -> DataProto -> actor.
+                # tree_id is kept for backward compat; on the strict path it
+                # always equals tree_instance_id (stamped below, PLAN.md M3).
                 "tree_id": str(tree_id),
                 "parent_group_id": str(parent_group_id),
                 "parent_segment_id": str(parent_segment_id),
@@ -223,11 +251,16 @@ def extract_edges_from_tree(
                 "vdra_original_pilot_indices": node.get("vdra_original_pilot_indices"),
                 **update_values,
             }
+            if tree_instance_id:
+                # PLAN.md M3: the explicit instance identity survives the
+                # tree -> edge boundary. Absent only on the legacy
+                # non-strict path, which never had one to begin with.
+                edge["tree_instance_id"] = str(tree_instance_id)
             edge["advantage"] = advantage
-            # PLAN.md P0.2: count every realized segment BEFORE zero-advantage
-            # filtering so the segment denominator stays stable even when
-            # ``only_adv_greater_than_zero`` drops rows. Pruned placeholders
-            # remain excluded from both counts.
+            # Stage 1: count every realized non-pruned segment BEFORE
+            # zero-advantage filtering. ``tree_total_segment_count`` preserves
+            # the construction count even when exact-zero rows are dropped
+            # from replay to save compute. Pruned placeholders remain excluded.
             if not is_pruned:
                 tree_total_segment_count += 1
                 queue_released_segment_count[queue_flush_id] = (
@@ -246,8 +279,13 @@ def extract_edges_from_tree(
                 # legacy fixture is used; prefer the max we saw.
                 if int(allocated_k) > slot["allocated_k"]:
                     slot["allocated_k"] = int(allocated_k)
+            # Stage 1: the zero filter uses the EXACT scalar that
+            # token_fields_for_edges broadcasts into the policy `advantages`
+            # tensor (edge["advantage"]), never diagnostic pav_advantage.
+            # Despite the legacy flag name, true keeps positive and negative
+            # advantages and removes only exact-zero rows.
             if (not is_pruned or emit_pruned_edges) and (
-                not only_adv_greater_than_zero or pav_advantage != 0
+                not only_adv_greater_than_zero or advantage != 0
             ):
                 edges.append(edge)
                 if not is_pruned:
@@ -262,23 +300,46 @@ def extract_edges_from_tree(
         node.pop("children", None)
 
     visit(tree_copy)
-    # PLAN.md P0.N1 + P0.2: tree-level counts. Stamp them on every edge so
-    # replay / tensorization / actor can index by tree without another tree
-    # walk. ``tree_total_segment_count`` is the canonical N_seg(T) used as the
-    # segment denominator; queue_released_segment_count[q] is the pre-filter
-    # ``n_q`` used only for logging / theoretical validation.
+    # PLAN.md P0.N1 + Stage 1: tree-level construction counts. Stamp them on
+    # every retained edge so replay / tensorization / actor can index by tree
+    # without another tree walk. ``tree_total_segment_count`` is the pre-filter
+    # realized non-pruned segment count; queue_released_segment_count[q] is the
+    # matching pre-filter queue count for logging / theoretical validation.
+    retained_by_parent: dict[str, int] = {}
+    for edge in edges:
+        pgid = str(edge.get("parent_group_id", ""))
+        retained_by_parent[pgid] = retained_by_parent.get(pgid, 0) + 1
     tree_summary = {
         "tree_id": str(tree_id),
+        "policy_snapshot_id": policy_snapshot_id,
+        "rollout_iteration": data_instance.get("rollout_iteration"),
+        "question_id": str(question_id),
         "expanded_parent_group_count": len(expanded_parent_group_ids),
         "trainable_child_count": int(trainable_child_count),
         "tree_total_segment_count": int(tree_total_segment_count),
+        "retained_edge_count": len(edges),
         "queue_to_parent_group_counts": {
             str(k): len(v) for k, v in queue_to_parent_group_counts.items()
         },
         "queue_released_segment_count": {
             str(k): int(v) for k, v in queue_released_segment_count.items()
         },
+        # Per-parent PRE-FILTER construction facts. This is the only record
+        # that survives for a parent whose every child was zero-filtered
+        # (retained == 0): such parents have no rows in ``edges`` at all.
+        "parent_construction": {
+            pgid: {
+                "realized": int(slot["realized"]),
+                "allocated_k": int(slot["allocated_k"]),
+                "retained": int(retained_by_parent.get(pgid, 0)),
+            }
+            for pgid, slot in realized_by_parent.items()
+        },
     }
+    if collect_construction_summaries is not None:
+        collect_construction_summaries.append(
+            json.loads(json.dumps(tree_summary))
+        )
     for edge in edges:
         edge.setdefault("tree_summary", tree_summary)
         # Preserve on every row so downstream splits do not lose it.

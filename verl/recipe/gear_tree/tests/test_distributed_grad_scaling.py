@@ -1,4 +1,8 @@
-"""PLAN.md P0.6 — distributed gradient-scaling parity for the batch-slot mean.
+"""Distributed gradient-scaling parity for the batch-slot mean (ablation).
+
+This algebra check covers the labeled ``batch_slot_mean_ablation`` loss whose
+distributed scaling is a preserved contract; canonical tree-segment-mean
+distributed parity is a Hard-stage (H1) verification item.
 
 ``ppo_mini_batch_size=128`` is the GLOBAL optimizer batch size. Multi-rank
 sharding must reproduce the single-rank 128-row reference gradient after the
@@ -48,6 +52,7 @@ def _actor_cfg(reduction: str = "mean") -> ActorConfig:
         policy_loss=PolicyLossConfig(
             loss_mode="vdra_segment_mean_ppo",
             segment_token_reduction=reduction,
+            batch_slot_mean_ablation=True,
         ),
     )
 

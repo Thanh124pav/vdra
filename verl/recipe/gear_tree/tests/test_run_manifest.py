@@ -31,8 +31,14 @@ def _valid_main_manifest(*, reduction: str = SEGMENT_TOKEN_REDUCTION_MEAN) -> Ru
         fresh_iid_row_count_matches_allocated_k=True,
         # PLAN.md P0.7 canonical bits — always required on a valid main run.
         replay_age_uses_rollout_iteration=True,
-        optimizer_step_accounting_valid=True,
         unique_tree_ids_verified=True,
+        replay_sampling_unit="edge",
+        # PLAN.md M4: canonical validity requires >= 1 successful OUTER actor
+        # update (global_step). num_optimizer_steps_total and
+        # optimizer_step_accounting_valid are diagnostics only.
+        global_step=1,
+        num_optimizer_steps_total=4,
+        optimizer_step_accounting_valid=True,
     )
     return m
 
@@ -98,6 +104,26 @@ def test_scorer_weight_mismatch_invalidates_run():
     m = _valid_main_manifest()
     m.rollout_scorer_weights_verified = False
     assert not is_valid_main_run(m)
+
+
+def test_no_outer_update_invalidates_run():
+    # PLAN.md M4: without a successful outer actor update (global_step < 1)
+    # the run is invalid, and the reason names global_step.
+    m = _valid_main_manifest()
+    m.global_step = 0
+    reason = validate_main_run(m)
+    assert reason is not None
+    assert "global_step" in reason
+
+
+def test_optimizer_step_diagnostics_do_not_gate_validity():
+    # PLAN.md M4: num_optimizer_steps_total and optimizer_step_accounting_valid
+    # are diagnostics — they must NOT invalidate a run that has a successful
+    # outer update.
+    m = _valid_main_manifest()
+    m.optimizer_step_accounting_valid = False
+    m.num_optimizer_steps_total = 0
+    assert is_valid_main_run(m)
 
 
 def test_manifest_round_trips_through_json(tmp_path):

@@ -120,7 +120,9 @@ class GearTreeActorRolloutWorker(ActorRolloutRefWorker):  # pragma: no cover - G
             adv_method=gt.get("adv_method", "rloo"),
             treepo_global_weight=gt.get("treepo_global_weight", 0.5),
             treerl_gamma=gt.get("treerl_gamma", 0.9),
-            only_adv_greater_than_zero=gt.get("only_adv_greater_than_zero", True),
+            # PLAN.md P0.G: canonical default is DENSE (keep zero-advantage
+            # rows) — must match the main config and every other call site.
+            only_adv_greater_than_zero=gt.get("only_adv_greater_than_zero", False),
             vineppo_K=gt.get("vineppo_K", 0),
             unfinished_penalty=gt.get("unfinished_penalty", 0.0),
             demo_logger=demo_logger,

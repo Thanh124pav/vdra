@@ -29,14 +29,23 @@ def _trainer(balance_batch=False, target_edges=512, mini_batch=128, default_loca
     obj.config = _Cfg(
         data=_Cfg(max_prompt_length=4, max_response_length=3),
         trainer=_Cfg(balance_batch=balance_batch, default_local_dir=default_local_dir),
-        actor_rollout_ref=_Cfg(actor=_Cfg(ppo_mini_batch_size=mini_batch)),
+        actor_rollout_ref=_Cfg(
+            actor=_Cfg(
+                ppo_mini_batch_size=mini_batch,
+                # PLAN.md P0.C: tensorization reads the configured loss mode.
+                policy_loss={"loss_mode": "vdra_segment_mean_ppo"},
+            )
+        ),
         gear_tree={
             "replay_buffer": {
                 "target_edges_per_update": target_edges,
                 "max_edges_per_question": 32,
                 "max_edge_age": 8,
                 "sampling_seed": 0,
-            }
+            },
+            # Non-strict so the CPU stub does not need a live scorer server
+            # for the P0.5 weight-version probe.
+            "gear": {"strict_vdra": False},
         },
     )
     obj.balance_calls = 0
@@ -269,7 +278,7 @@ def test_dp_actor_source_honors_force_stored_old_log_probs():
 
 def test_replay_startup_validates_mini_batch_divisibility():
     trainer = _trainer(target_edges=510, mini_batch=128)
-    with pytest.raises(ValueError, match="target_edges_per_update"):
+    with pytest.raises(ValueError, match="target_edges_per_iteration"):
         trainer._validate_replay_startup()
 
 
@@ -328,6 +337,7 @@ class _FakeGenBatch:
 def test_generate_tree_edges_injects_policy_snapshot_into_config():
     trainer = _trainer()
     trainer.global_steps = 7
+    trainer.rollout_iteration = 1
     seen = {}
     seen_rows = {}
 
@@ -381,6 +391,9 @@ def test_scorer_cache_reuses_client_across_calls(monkeypatch):
         VLLMLogprobClient=_FakeClient,
         make_lp_scorer=_fake_make_lp_scorer,
         resolve_vllm_model_id=_fake_resolve,
+        # Return None so the scorer falls back to the client snapshot label,
+        # matching the pre-P0.5 contract this test asserts.
+        fetch_server_weight_version=lambda *_, **__: None,
     )
     import sys
 

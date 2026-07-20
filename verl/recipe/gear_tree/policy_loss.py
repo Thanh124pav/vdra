@@ -5,18 +5,16 @@ Three losses are registered here:
 * ``treetune_ppo`` — the byte-faithful port of treetune's
   ``PPOTrainer._compute_actor_loss`` used by SPO/TreeRL/TreePO/GEAR-*. Kept as
   the SPO baseline and legacy aggregation; see the module docstring below.
-* ``vdra_segment_mean_ppo`` — PLAN.md P0.1 / P0.4 canonical main-run loss.
-  Global segment-average with configurable within-segment token reduction:
-
-      token -> segment (``segment_token_reduction=mean|sum``)
-      segment -> tree (divide by pre-filter ``tree_total_segment_count``)
-      tree -> update (average over trees)
-
-  Neither reduction couples to parent branch factor: the loss depends only on
-  ``tree_id`` and ``tree_total_segment_count``, not on ``parent_group_id``,
-  ``allocated_k``, or ``queue_flush_id``. The precomputed row weights come
-  from ``tree_data.compute_segment_objective_weights`` and are attached to
-  the DataProto as ``segment_objective_weights``.
+* ``vdra_segment_mean_ppo`` — canonical main-run loss. It applies configurable
+  within-segment token reduction and normalizes each retained row by the tree
+  segment mean ``w_s = 1 / (N_T * N_seg(T))``, where ``N_T`` is the unique-tree
+  count of the ORIGINAL optimizer batch and ``N_seg(T)`` is the PRE-FILTER
+  ``tree_total_segment_count`` — so removing exact-zero-advantage rows leaves
+  the loss unchanged. The historical batch-slot mean over retained replay
+  slots survives only behind the labeled ``batch_slot_mean_ablation`` flag.
+  No float ``segment_objective_weights`` tensor is needed on the canonical
+  path (it is derived from the integer counts); that tensor belongs only to
+  the explicit node-balanced ablation.
 * ``vdra_node_balanced_ppo`` — legacy parent-balanced ablation. NOT the main
   VDRA path (PLAN.md P0.1). Kept for controlled comparison runs; it must not
   be selected by the main config.
@@ -147,9 +145,12 @@ def compute_policy_loss_treetune(
     assert config is not None
 
     # treetune hyper-params (defaults match PPOHParams in ppo_trainer.py).
+    # PLAN.md P0.F: read PolicyLossConfig fields from config.policy_loss.*.
     cliprange = float(config.clip_ratio)              # PPOHParams.cliprange = 0.2
-    use_prob_mask = bool(config.get("use_prob_mask", True))
-    ratio_threshold = float(config.get("ratio_threshold", 10.0))
+    use_prob_mask = bool(_resolve_policy_loss_field(config, "use_prob_mask", True))
+    ratio_threshold = float(
+        _resolve_policy_loss_field(config, "ratio_threshold", 10.0)
+    )
 
     pg_losses, action_mask, ratio, pg_losses1, pg_losses2 = _ppo_clipped_token_surrogate(
         old_log_prob, log_prob, advantages, response_mask,
@@ -249,6 +250,41 @@ def hierarchical_reference_reduction(
 _VALID_SEGMENT_TOKEN_REDUCTIONS = ("mean", "sum")
 
 
+def _resolve_policy_loss_field(config, name: str, default):
+    """PLAN.md P0.F: canonical read for fields declared on ``PolicyLossConfig``.
+
+    Prefer ``config.policy_loss.<name>`` (the typed ActorConfig level). Fall
+    back to a top-level lookup ONLY when the caller passed the policy-loss
+    subconfig (or a bare dict) directly — a duplicate left at the ActorConfig
+    top level is never read once ``policy_loss`` carries the field, which
+    effectively removes wrong-level overrides.
+    """
+
+    if config is None:
+        return default
+    policy_loss_cfg = None
+    try:
+        policy_loss_cfg = getattr(config, "policy_loss", None)
+    except Exception:  # pragma: no cover — omegaconf edge cases
+        policy_loss_cfg = None
+    if policy_loss_cfg is None and hasattr(config, "get"):
+        policy_loss_cfg = config.get("policy_loss", None)
+    if policy_loss_cfg is not None:
+        if hasattr(policy_loss_cfg, "get"):
+            value = policy_loss_cfg.get(name, None)
+        else:
+            value = getattr(policy_loss_cfg, name, None)
+        if value is not None:
+            return value
+    # The caller passed the policy-loss subconfig directly (bare
+    # PolicyLossConfig / dict), or a legacy pre-migration config.
+    if hasattr(config, "get"):
+        value = config.get(name, None)
+    else:
+        value = getattr(config, name, None)
+    return default if value is None else value
+
+
 def _resolve_segment_token_reduction(config) -> str:
     """PLAN.md P0.1: `segment_token_reduction` must be exactly ``mean`` or
     ``sum``. Read from the authoritative source
@@ -324,33 +360,46 @@ def compute_policy_loss_vdra_segment_mean(
     tree_group_ids: torch.Tensor | None = None,
     tree_total_segment_count: torch.Tensor | None = None,
     original_optimizer_batch_slot_count: int | None = None,
+    original_optimizer_batch_tree_count: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """PLAN.md P0.1 / P0.4 canonical VDRA main-run loss (batch-slot mean).
+    """Canonical VDRA main-run loss (tree segment mean).
 
     Canonical semantics (main path)
     ------------------------------
-    For one optimizer batch of ``N_B`` selected segment slots the loss is
+    Per-row weights are computed over the ORIGINAL optimizer batch:
 
-        L_B = (1/N_B) * sum_{s in retained(B)} L_s^r,
+        L_B = sum_{s in retained(B)} w_s * L_s^r,
+        w_s = 1 / (N_T * N_seg(T)),
 
-    where ``L_s^r`` is either ``TokenMean(pg_row)`` (``r=mean``) or the raw
-    token sum (``r=sum``). ``N_B`` is the ORIGINAL selected-slot count for
-    this optimizer batch (128 in the canonical main config). It is passed by
-    ``dp_actor.update_policy`` via ``original_optimizer_batch_slot_count``
-    so that microbatch splits do not shrink the denominator.
+    where ``N_T`` is the number of unique trees in the original optimizer
+    batch (passed by ``dp_actor.update_policy`` as
+    ``original_optimizer_batch_tree_count`` so microbatch splits preserve
+    it) and ``N_seg(T)`` is the PRE-FILTER ``tree_total_segment_count`` of
+    the row's tree. Because ``N_seg(T)`` is the pre-filter count, removing
+    exact-zero-advantage rows leaves the loss unchanged:
 
-    Legacy tree-average fallback
-    ---------------------------
-    When ``original_optimizer_batch_slot_count`` is not passed and either
-    ``segment_objective_weights`` or ``(tree_group_ids,
-    tree_total_segment_count)`` is available, the function falls back to the
-    pre-PLAN.md-P0.4 tree-average
+        advantages [pos, neg, 0, 0] -> retained [L1, L2]
+        loss = (L1 + L2 + 0 + 0) / 4 = (L1 + L2) / 4.
 
-        L = sum_row w_row * L_row^r,   w_row = 1 / (N_T * N_seg(T)).
+    ``L_s^r`` is either ``TokenMean(pg_row)`` (``r=mean``) or the raw token
+    sum (``r=sum``).
 
-    This preserves the ablation-only ``vdra_node_balanced_ppo`` path and
-    unit-test surface without silently mixing the two conventions.
-    ``edge_weights`` is a hard error in both paths.
+    Labeled legacy batch-slot ablation
+    ---------------------------------
+    ``policy_loss.batch_slot_mean_ablation=true`` selects the pre-zero-filter
+    batch-slot mean ``L_B = (1/N_B) * sum_s L_s^r`` with
+    ``N_B = original_optimizer_batch_slot_count`` (the retained replay-slot
+    count). It is NOT the canonical denominator — retained-slot counts shrink
+    under zero filtering — and exists only as an explicitly labeled ablation.
+
+    Legacy tree-average fallbacks
+    -----------------------------
+    When neither the canonical inputs nor the ablation flag are present,
+    ``segment_objective_weights`` (precomputed ``w_s``) or
+    ``(tree_group_ids, tree_total_segment_count)`` reproduce the same
+    tree-average identity for unit tests; the derived fallback computes
+    ``N_T`` locally and is therefore not microbatch-split invariant.
+    ``edge_weights`` is a hard error in every path.
     """
 
     assert config is not None
@@ -362,10 +411,13 @@ def compute_policy_loss_vdra_segment_mean(
 
     reduction = _resolve_segment_token_reduction(config)
     cliprange = float(config.clip_ratio)
-    use_prob_mask = bool(config.get("use_prob_mask", True))
+    # PLAN.md P0.F: PolicyLossConfig fields read from config.policy_loss.*.
+    use_prob_mask = bool(_resolve_policy_loss_field(config, "use_prob_mask", True))
     # PLAN.md P0.4: report the ratio as a metric; do NOT skip microbatches on
     # the canonical VDRA path.
-    ratio_threshold = float(config.get("ratio_threshold", float("inf")))
+    ratio_threshold = float(
+        _resolve_policy_loss_field(config, "ratio_threshold", float("inf"))
+    )
 
     pg_losses, action_mask, ratio, pg_losses1, pg_losses2 = _ppo_clipped_token_surrogate(
         old_log_prob, log_prob, advantages, response_mask,
@@ -375,15 +427,44 @@ def compute_policy_loss_vdra_segment_mean(
 
     row_losses = _segment_row_losses(pg_losses, action_mask, reduction=reduction)
 
-    if original_optimizer_batch_slot_count is not None:
-        # PLAN.md P0.4 canonical main path.
+    batch_slot_mean_ablation = bool(
+        _resolve_policy_loss_field(config, "batch_slot_mean_ablation", False)
+    )
+    if batch_slot_mean_ablation:
+        # Labeled legacy batch-slot ablation — NOT the canonical denominator.
+        # Retained-slot counts shrink under zero-advantage filtering, so this
+        # path is reachable only via the explicit config flag.
+        if original_optimizer_batch_slot_count is None:
+            raise ValueError(
+                "policy_loss.batch_slot_mean_ablation=true requires "
+                "original_optimizer_batch_slot_count from the actor."
+            )
         n_b = int(original_optimizer_batch_slot_count)
         if n_b <= 0:
             raise ValueError(
                 "original_optimizer_batch_slot_count must be > 0 for the "
-                "batch-slot VDRA main loss (PLAN.md P0.4)."
+                "batch-slot ablation loss."
             )
         pg_loss = row_losses.sum() / float(n_b)
+    elif (
+        original_optimizer_batch_tree_count is not None
+        and tree_total_segment_count is not None
+    ):
+        # Canonical main path: w_s = 1 / (N_T * N_seg(T)) with N_T fixed from
+        # the ORIGINAL optimizer batch (microbatch-split invariant) and
+        # N_seg(T) the pre-filter tree_total_segment_count per row.
+        n_tree = int(original_optimizer_batch_tree_count)
+        if n_tree <= 0:
+            raise ValueError(
+                "original_optimizer_batch_tree_count must be > 0 for the "
+                "canonical VDRA tree-segment-mean loss."
+            )
+        counts = tree_total_segment_count.to(
+            dtype=row_losses.dtype, device=row_losses.device
+        )
+        safe_counts = torch.where(counts > 0, counts, torch.ones_like(counts))
+        w = 1.0 / (float(n_tree) * safe_counts)
+        pg_loss = (w * row_losses).sum()
     elif segment_objective_weights is not None:
         # Legacy tree-average path. Retained for unit tests and the
         # vdra_node_balanced_ppo ablation; NOT the main path.
@@ -398,7 +479,8 @@ def compute_policy_loss_vdra_segment_mean(
         pg_loss = (w * row_losses).sum()
     elif tree_group_ids is not None and tree_total_segment_count is not None:
         # Legacy tree-average derived path — kept so pre-P0.4 tests without
-        # precomputed weights still exercise the analytic identity.
+        # precomputed weights still exercise the analytic identity. N_T is
+        # computed on the local rows, so this is NOT split invariant.
         tids = tree_group_ids.to(dtype=torch.long, device=row_losses.device)
         unique_trees = torch.unique(tids)
         n_tree = float(unique_trees.numel())
@@ -411,9 +493,12 @@ def compute_policy_loss_vdra_segment_mean(
     else:
         raise ValueError(
             "vdra_segment_mean_ppo requires either "
-            "original_optimizer_batch_slot_count (PLAN.md P0.4 main path) or "
-            "segment_objective_weights / (tree_group_ids, "
-            "tree_total_segment_count) for the legacy tree-average path."
+            "(original_optimizer_batch_tree_count, tree_total_segment_count) "
+            "for the canonical tree-segment-mean path, "
+            "policy_loss.batch_slot_mean_ablation=true with "
+            "original_optimizer_batch_slot_count for the labeled legacy "
+            "ablation, or segment_objective_weights / (tree_group_ids, "
+            "tree_total_segment_count) for the legacy tree-average fallback."
         )
 
     # Report ratio as a metric.
@@ -495,11 +580,14 @@ def compute_policy_loss_vdra_node_balanced(
         )
 
     cliprange = float(config.clip_ratio)
-    use_prob_mask = bool(config.get("use_prob_mask", True))
+    # PLAN.md P0.F: PolicyLossConfig fields read from config.policy_loss.*.
+    use_prob_mask = bool(_resolve_policy_loss_field(config, "use_prob_mask", True))
     # PLAN.md P0.4: do NOT apply ratio_threshold as a per-microbatch skip on
     # the canonical VDRA path; only report the diagnostic. Legacy skip lives
     # in treetune_ppo.
-    ratio_threshold = float(config.get("ratio_threshold", float("inf")))
+    ratio_threshold = float(
+        _resolve_policy_loss_field(config, "ratio_threshold", float("inf"))
+    )
 
     pg_losses, action_mask, ratio, pg_losses1, pg_losses2 = _ppo_clipped_token_surrogate(
         old_log_prob, log_prob, advantages, response_mask,

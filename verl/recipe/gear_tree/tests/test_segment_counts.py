@@ -51,6 +51,9 @@ def test_tree_total_segment_count_matches_realized_children_no_filter():
     assert len(edges) == 4
     assert all(e["tree_total_segment_count"] == 4 for e in edges)
     summary = edges[0]["tree_summary"]
+    assert summary["policy_snapshot_id"] == "snap"
+    assert summary["rollout_iteration"] == 3
+    assert summary["question_id"] == "q1"
     assert summary["tree_total_segment_count"] == 4
 
 

@@ -92,6 +92,10 @@ class RunManifest:
     tree_split_count: int = 0
     group_integrity_failures: int = 0
     segment_count_failures: int = 0
+    # PLAN.md P0.B: row-local failures observed on sampled replay batches
+    # (missing metadata, duplicate edge ids, cap/target violations, bad
+    # ages). Partial trees/parent groups are NOT failures at this stage.
+    replay_batch_failures: int = 0
 
     # PLAN.md P0.7 replay diagnostics from the most recent iteration.
     selected_edges_last_iteration: int = 0
@@ -105,10 +109,18 @@ class RunManifest:
     # Free-form extra provenance (e.g., dataset hash, GPU count).
     extras: Dict[str, Any] = field(default_factory=dict)
 
+    def record_segment_invariant_pass(self) -> None:
+        """PLAN.md P0.J: the canonical segment-mean invariant claim."""
+        self.segment_count_invariants_passed = True
+
+    def record_node_balanced_invariant_pass(self) -> None:
+        """PLAN.md P0.J: the node-balanced ABLATION invariant claim."""
+        self.node_balanced_invariants_passed = True
+
     def record_invariant_pass(self) -> None:
-        # Legacy alias — flips the segment-count bit on for the segment-mean
-        # main path AND keeps the node-balanced bit compatible for ablation
-        # manifests.
+        # Deprecated legacy alias — the two bits are DIFFERENT claims
+        # (PLAN.md P0.J); production code calls the specific recorder for
+        # its configured loss mode. Kept only for pre-split callers.
         self.node_balanced_invariants_passed = True
         self.segment_count_invariants_passed = True
 
@@ -123,6 +135,9 @@ class RunManifest:
 
     def record_segment_count_failure(self, count: int = 1) -> None:
         self.segment_count_failures += int(count)
+
+    def record_replay_batch_failure(self, count: int = 1) -> None:
+        self.replay_batch_failures += int(count)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -154,6 +169,8 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
 
     A main run is invalid when:
       * policy_aggregation != global_segment_mean;
+      * no successful outer actor update was observed
+        (``global_step < 1``);
       * segment_token_reduction is not exactly ``mean`` or ``sum``;
       * complete-tree replay was ever violated;
       * segment-count invariants failed
@@ -163,6 +180,11 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
         (``stored_old_log_probs_used=False``);
       * rollout/scorer weight versions were not independently verified;
       * silent truncation was observed (``no_truncation=False``).
+
+    Canonical validity hinges on ``global_step`` — the host VERL outer-update
+    unit. The internal PPO ``num_optimizer_steps_total`` and the derived
+    ``optimizer_step_accounting_valid`` are DIAGNOSTICS only and never gate
+    the main run (PLAN.md M1/M4).
 
     The legacy ``vdra_node_balanced`` aggregation remains a supported
     ablation configuration but never validates as a canonical main run —
@@ -174,6 +196,18 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
         failures.append(
             f"policy_aggregation={manifest.policy_aggregation!r} != {POLICY_AGGREGATION_SEGMENT_MEAN!r}"
         )
+    # PLAN.md P0.J: canonical replay is edge-level; a complete_tree run is a
+    # labeled ablation, never a valid main run.
+    if manifest.replay_sampling_unit != "edge":
+        failures.append(
+            f"replay_sampling_unit={manifest.replay_sampling_unit!r} != 'edge'"
+        )
+    # PLAN.md M4: canonical validity requires at least one successful OUTER
+    # actor update (global_step >= 1) — the host-framework training unit.
+    # num_optimizer_steps_total and optimizer_step_accounting_valid are
+    # diagnostics and must NOT gate the main run.
+    if manifest.global_step < 1:
+        failures.append(f"global_step={manifest.global_step} < 1")
     if manifest.segment_token_reduction not in _VALID_SEGMENT_TOKEN_REDUCTIONS:
         failures.append(
             f"segment_token_reduction={manifest.segment_token_reduction!r} not in {_VALID_SEGMENT_TOKEN_REDUCTIONS}"
@@ -189,6 +223,13 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
         failures.append(
             f"group_integrity_failures={manifest.group_integrity_failures} > 0"
         )
+    # PLAN.md P0.B: row-local replay-batch failures (duplicate ids, missing
+    # metadata, cap/target/age violations) also invalidate the run. Partial
+    # trees or parent groups in a sampled batch are NOT counted here.
+    if manifest.replay_batch_failures > 0:
+        failures.append(
+            f"replay_batch_failures={manifest.replay_batch_failures} > 0"
+        )
     if not manifest.segment_count_invariants_passed:
         failures.append("segment_count_invariants_passed=False")
     # PLAN.md P0.7: complete-tree replay is NOT canonical anymore; edge-level
@@ -203,8 +244,8 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
     # PLAN.md P0.7 canonical bits.
     if not manifest.replay_age_uses_rollout_iteration:
         failures.append("replay_age_uses_rollout_iteration=False")
-    if not manifest.optimizer_step_accounting_valid:
-        failures.append("optimizer_step_accounting_valid=False")
+    # PLAN.md M4: optimizer_step_accounting_valid is a DIAGNOSTIC, not a
+    # validity requirement — intentionally NOT checked here.
     if not manifest.unique_tree_ids_verified:
         failures.append("unique_tree_ids_verified=False")
     if failures:

@@ -61,6 +61,7 @@ def build_edge_batch(
     unfinished_penalty: float = 0.0,
     demo_logger: Any = None,
     strict_fresh_iid: bool = False,
+    loss_mode: str = "vdra_segment_mean_ppo",
 ):
     """Build the flat edge-batch ``DataProto`` for a batch of prompts.
 
@@ -139,8 +140,9 @@ def build_edge_batch(
             except Exception:
                 pass
 
-        # PLAN.md P0.1: exclude pruned placeholders; keep zero-advantage
-        # realized children so the parent denominator matches allocated_k.
+        # Stage 1: extract after computing advantages for realized children.
+        # The legacy flag removes only exact-zero advantages; positive and
+        # negative advantages remain trainable. Pruned placeholders stay out.
         edges = extract_edges_from_tree(
             tree,
             adv_method=adv_method,
@@ -156,11 +158,14 @@ def build_edge_batch(
     if not all_edges:
         raise RuntimeError("tree rollout produced no training edges for this batch")
 
+    # PLAN.md P0.C: the configured loss mode decides whether float objective
+    # weights are attached (node-balanced ablation only).
     return edges_to_dataproto(
         all_edges,
         tokenizer,
         max_prompt_length=max_prompt_length,
         max_response_length=max_response_length,
+        loss_mode=loss_mode,
     )
 
 

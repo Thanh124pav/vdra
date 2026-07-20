@@ -171,6 +171,8 @@ def test_update_manifest_from_edges_reports_no_failure_for_valid_group():
     # helper flips ``replay_age_uses_rollout_iteration`` /
     # ``unique_tree_ids_verified`` from the observed edges.
     manifest.optimizer_step_accounting_valid = True
+    manifest.num_optimizer_steps_total = 4  # diagnostic only
+    manifest.global_step = 1  # PLAN.md M4: >=1 successful outer update
     assert manifest.replay_age_uses_rollout_iteration is True
     assert manifest.unique_tree_ids_verified is True
     assert is_valid_main_run(manifest)
@@ -198,7 +200,10 @@ def test_update_manifest_from_edges_raises_on_partial_group_strict():
         actor_loss_mode=cfg["actor_loss_mode"],
     )
     partial = _fresh_iid_group()[:1]
-    with pytest.raises(ValueError, match="Group-integrity"):
+    # PLAN.md P0.B: the deprecated alias treats its input as a COMPLETE
+    # generated batch, so a partial parent group fails construction
+    # validation.
+    with pytest.raises(ValueError, match="Tree-construction"):
         update_manifest_from_edges(manifest, partial, strict=True)
     # Failure is recorded even when we raise, so a killed strict run leaves
     # evidence on disk.
@@ -217,6 +222,8 @@ def test_manifest_persists_across_json_round_trip(tmp_path):
     manifest.record_invariant_pass()
     manifest.rollout_scorer_weights_verified = True
     manifest.optimizer_step_accounting_valid = True
+    manifest.num_optimizer_steps_total = 4  # diagnostic only
+    manifest.global_step = 1  # PLAN.md M4: >=1 successful outer update
     path = tmp_path / "vdra_run_manifest.json"
     manifest.save(path)
     from recipe.gear_tree.run_manifest import RunManifest

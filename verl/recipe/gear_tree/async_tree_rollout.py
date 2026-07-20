@@ -226,6 +226,7 @@ async def build_tree_edges_async(
     gear_node_expander: Any = None,
     policy_snapshot_id: Optional[str] = None,
     strict_fresh_iid: bool = False,
+    collect_construction_summaries: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Build one tree via the async server and return its SPO/GEAR edges."""
 
@@ -260,16 +261,17 @@ async def build_tree_edges_async(
         except Exception:
             pass
 
-    # PLAN.md P0.1: administrative pruned=True rows must never enter DataProto
-    # (emit_pruned_edges=False), and every realized (non-pruned) child must
-    # remain — including zero-advantage ones — so the parent denominator
-    # equals allocated_k.
+    # Stage 1: administrative pruned=True rows must never enter DataProto
+    # (emit_pruned_edges=False). Advantages are computed for every realized
+    # non-pruned child before optional exact-zero filtering; positive and
+    # negative advantages are retained.
     edges = extract_edges_from_tree(
         tree, adv_method=adv_method, only_adv_greater_than_zero=only_adv_greater_than_zero,
         tree_update_mode=tree_update_mode, treepo_global_weight=treepo_global_weight,
         treerl_gamma=treerl_gamma,
         emit_pruned_edges=False,
         strict_fresh_iid=strict_fresh_iid,
+        collect_construction_summaries=collect_construction_summaries,
     )
     if policy_snapshot_id is not None:
         for edge in edges:
@@ -619,9 +621,11 @@ try:  # keep CPU-importable when agent_loop isn't installed
 
                 self._gate.set_terminal_reward_fn(_terminal_grader)
 
-            # PLAN.md P0.1: default only_adv_greater_than_zero to False so the
-            # parent denominator matches the realized child count. Callers who
-            # need the legacy SPO baseline can still override to True.
+            # Stage 1: the shipped main config sets only_adv_greater_than_zero
+            # to true, which removes exact-zero advantages after construction
+            # counts are stamped. The runtime fallback stays false only for
+            # legacy configs that omit the field.
+            construction_summaries: List[Dict[str, Any]] = []
             edges = await build_tree_edges_async(
                 prompt_text, prompt_ids, data_instance,
                 segment_generator=per_call_gen, reward_fn=self._reward_fn,
@@ -644,6 +648,7 @@ try:  # keep CPU-importable when agent_loop isn't installed
                         (self._gt.get("gear") or {}).get("strict_vdra", True)
                     )
                 ),
+                collect_construction_summaries=construction_summaries,
             )
 
             # Placeholder response (first edge) keeps the AgentLoopOutput schema
@@ -665,6 +670,12 @@ try:  # keep CPU-importable when agent_loop isn't installed
                 metrics=AgentLoopMetrics(),
                 extra_fields={
                     "gear_tree_edges": edges,
+                    # Zero-filter contract: per-tree construction summaries
+                    # preserve realized/allocated facts even when a parent —
+                    # or the entire tree — retained no edges because every
+                    # child had exactly zero advantage. Zero rows themselves
+                    # never travel to replay.
+                    "gear_tree_construction_summaries": construction_summaries,
                     # PLAN.md P1.R4: emit the resolved sampling params so
                     # downstream logging can prove which distribution the
                     # rollout actually used.
@@ -843,3 +854,20 @@ def collect_tree_edges(dataproto) -> List[Dict[str, Any]]:
         if item:
             edges.extend(item)
     return edges
+
+
+def collect_tree_construction_summaries(dataproto) -> List[Dict[str, Any]]:
+    """Flatten per-prompt ``gear_tree_construction_summaries`` into one list.
+
+    Tolerates rollout outputs that predate the summary channel (returns an
+    empty list) so legacy fixtures keep working; the construction validator
+    then simply has no all-zero-tree facts to check.
+    """
+    summaries: List[Dict[str, Any]] = []
+    per_prompt = dataproto.non_tensor_batch.get("gear_tree_construction_summaries")
+    if per_prompt is None:
+        return summaries
+    for item in per_prompt:
+        if item:
+            summaries.extend(item)
+    return summaries

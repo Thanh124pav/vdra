@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -431,8 +431,17 @@ def validate_group_integrity(
       * every row sharing a ``parent_group_id`` shares one ``tree_group_id``;
       * every row sharing a ``parent_group_id`` shares one ``allocated_k``;
       * fresh_iid groups (sample_multiplicity == 1 across every row of the
-        group) have row_count == allocated_k;
-      * no parent group is silently split or partially dropped.
+        group) satisfy the PRE-FILTER construction contract
+        ``realized_child_count == allocated_k`` and the retained-row bound
+        ``row_count <= allocated_k``.
+
+    The retained row count is deliberately NOT required to equal
+    ``allocated_k``: exact-zero-advantage edges are intentionally removed by
+    the Stage 1 zero filter, so a fresh_iid group may legitimately retain a
+    strict subset of its realized children. Rows stamped with
+    ``realized_child_count`` at extraction time carry the pre-filter fact;
+    legacy rows without the stamp fall back to the retained row count
+    (retained == realized by construction for pre-zero-filter fixtures).
 
     Returns a small diagnostics dict for logging.
     """
@@ -458,13 +467,31 @@ def validate_group_integrity(
         mults = [int(e.get("sample_multiplicity", 1) or 1) for e in group]
         if all(m == 1 for m in mults):
             fresh_iid_group_count += 1
-            # PLAN.md P0.N4: always detect a partial fresh_iid parent group;
-            # ``strict_fresh_iid`` only decides whether to raise.
             expected = next(iter(allocated_values), 0)
-            if expected and len(group) != expected:
+            # Zero-filter contract: validate the PRE-FILTER realized count
+            # against the allocation and bound the retained rows by it —
+            # never require retained == allocated_k, because exact-zero
+            # advantage edges are intentionally removed.
+            realized_values = {
+                int(e["realized_child_count"])
+                for e in group
+                if e.get("realized_child_count") is not None
+            }
+            if len(realized_values) > 1:
                 failures.append(
-                    f"fresh_iid parent_group_id={pgid!r} has {len(group)} rows "
-                    f"but allocated_k={expected}"
+                    f"fresh_iid parent_group_id={pgid!r} has inconsistent "
+                    f"realized_child_count={sorted(realized_values)}"
+                )
+            realized = next(iter(realized_values), len(group))
+            if expected and realized != expected:
+                failures.append(
+                    f"fresh_iid parent_group_id={pgid!r} realized {realized} "
+                    f"children but allocated_k={expected}"
+                )
+            if expected and len(group) > expected:
+                failures.append(
+                    f"fresh_iid parent_group_id={pgid!r} retained {len(group)} "
+                    f"rows which exceeds allocated_k={expected}"
                 )
         else:
             weighted_group_count += 1
@@ -480,6 +507,624 @@ def validate_group_integrity(
     }
 
 
+def derive_edge_id(
+    *,
+    snapshot_id: str,
+    tree_instance_id: str,
+    parent_group_id: str,
+    child_segment_id: str,
+) -> str:
+    """PLAN.md M3: deterministic canonical edge identity.
+
+    Derived from exactly (tree_instance_id | parent_group_id |
+    child_segment_id), digest-prefixed by the policy snapshot. The digest
+    formula is byte-identical to the historical strict-path derivation, so
+    well-formed edge IDs do not change value.
+    """
+    key = f"{tree_instance_id}|{parent_group_id}|{child_segment_id}"
+    digest = hashlib.blake2b(key.encode("utf-8"), digest_size=16).hexdigest()
+    return f"{snapshot_id}:{digest}"
+
+
+def is_canonical_tree_instance_id(
+    tree_instance_id: Any, *, snapshot_id: Any
+) -> bool:
+    """PLAN.md M3: True iff ``tree_instance_id`` has the exact structure the
+    canonical builder (:func:`tree_rollout.make_tree_instance_id`) produces:
+
+        "{policy_snapshot}|iter:{rollout_iteration}|q:{question}|{tiebreaker}"
+
+    A generic value such as ``"t0"`` — truthy but structureless — is NOT a
+    canonical identity. The policy-snapshot component must match the rollout
+    snapshot, the rollout-iteration and question markers must be present, and
+    the per-tree tiebreaker must be non-empty. This validates structure only;
+    it does not change the ``derive_edge_id`` digest for well-formed ids.
+    """
+    if not tree_instance_id:
+        return False
+    parts = str(tree_instance_id).split("|")
+    if len(parts) < 4:
+        return False
+    if parts[0] != str(snapshot_id):
+        return False
+    if not parts[1].startswith("iter:") or parts[1] == "iter:":
+        return False
+    if not parts[2].startswith("q:") or parts[2] == "q:":
+        return False
+    tiebreaker = "|".join(parts[3:])
+    return bool(tiebreaker)
+
+
+def normalize_generated_edges(
+    edges: Sequence[Dict[str, Any]],
+    *,
+    snapshot_id: str,
+    strict: bool = False,
+) -> List[Dict[str, Any]]:
+    """PLAN.md P0.H: normalize freshly generated edges and assign edge IDs.
+
+    Strict mode requires the unique tree identity stamped by
+    ``make_tree_instance_id`` (snapshot + rollout iteration + question +
+    per-tree uuid/counter) plus explicit parent/child identities, and
+    derives ``edge_id`` from exactly (tree identity | parent group | child
+    segment). Legacy fallback chains (generic ``gear_segment_id`` /
+    ``child_index``) survive only in non-strict mode for old fixtures.
+    """
+    normalized: List[Dict[str, Any]] = []
+    for idx, edge in enumerate(edges):
+        record = dict(edge)
+        parent_group = record.get("parent_group_id")
+        child_seg = record.get("child_segment_id")
+        if strict:
+            # PLAN.md M3: strict identity requires tree_instance_id
+            # specifically — a legacy tree_id alone is not sufficient.
+            tree_instance_id = record.get("tree_instance_id")
+            missing = [
+                name
+                for name, value in (
+                    ("tree_instance_id", tree_instance_id),
+                    ("parent_group_id", parent_group),
+                    ("child_segment_id", child_seg),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    "Strict VDRA edge identity is incomplete; missing "
+                    f"{missing} on generated edge {idx} (PLAN.md P0.H). "
+                    "Generation must stamp make_tree_instance_id-derived "
+                    "tree identities and explicit parent/child segment ids."
+                )
+            # PLAN.md M3: reject a generic tree_instance_id (e.g. "t0"). Strict
+            # mode requires the canonical builder structure — policy snapshot +
+            # rollout iteration + stable question + unique tiebreaker.
+            if not is_canonical_tree_instance_id(
+                tree_instance_id, snapshot_id=snapshot_id
+            ):
+                raise ValueError(
+                    f"Strict VDRA requires a canonical tree_instance_id on "
+                    f"generated edge {idx}; got {tree_instance_id!r} (PLAN.md "
+                    "M3). It must be produced by make_tree_instance_id: "
+                    "'{snapshot}|iter:{n}|q:{qid}|{tiebreaker}' with the "
+                    "policy snapshot matching the rollout snapshot."
+                )
+            derived = derive_edge_id(
+                snapshot_id=snapshot_id,
+                tree_instance_id=str(tree_instance_id),
+                parent_group_id=str(parent_group),
+                child_segment_id=str(child_seg),
+            )
+            supplied = record.get("edge_id")
+            if supplied is not None and str(supplied) != derived:
+                raise ValueError(
+                    f"Supplied edge_id {supplied!r} does not match the "
+                    f"identity-derived id {derived!r} for generated edge "
+                    f"{idx} (PLAN.md P0.H/M3)."
+                )
+            record["edge_id"] = derived
+        else:
+            # Legacy non-strict compatibility path: fallback chains and a
+            # caller-supplied edge_id are honored as-is.
+            tree_id = (
+                record.get("tree_instance_id")
+                or record.get("tree_id")
+                or record.get("gear_segment_id", "")
+            )
+            parent_group = (
+                parent_group
+                or record.get("parent_path")
+                or record.get("gear_parent_segment_id", "")
+            )
+            child_seg = (
+                child_seg
+                or record.get("gear_segment_id")
+                or str(record.get("child_index", idx))
+            )
+            qid = record.get("question_id", "")
+            key = f"{snapshot_id}|{qid}|{tree_id}|{parent_group}|{child_seg}"
+            digest = hashlib.blake2b(
+                key.encode("utf-8"), digest_size=16
+            ).hexdigest()
+            record.setdefault("edge_id", f"{snapshot_id}:{digest}")
+        record.setdefault("policy_snapshot_id", snapshot_id)
+        if record["policy_snapshot_id"] != snapshot_id:
+            raise ValueError(
+                "Generated edge policy_snapshot_id mismatches rollout snapshot"
+            )
+        response = list(record.get("response_token_ids") or [])
+        log_probs = record.get("actor_shifted_log_probs")
+        if log_probs is None:
+            raise ValueError(
+                "Generated edge is missing generation-time actor_shifted_log_probs"
+            )
+        if len(log_probs) != len(response):
+            raise ValueError(
+                "Generated edge log-probs do not align with response tokens"
+            )
+        record.setdefault("depth", int(record.get("depth", 0) or 0))
+        record.setdefault("leaf", bool(record.get("leaf", False)))
+        record.setdefault("pruned", bool(record.get("pruned", False)))
+        record.setdefault("tree_update_mode", record.get("tree_update_mode", "spo"))
+        normalized.append(record)
+    return normalized
+
+
+def _parse_canonical_tree_instance_id(tree_id: str) -> Tuple[str, int, str]:
+    """Parse ``snapshot|iter:<n>|q:<question>|...`` tree identities."""
+    parts = str(tree_id).split("|")
+    if len(parts) < 4:
+        raise ValueError(
+            f"tree_id {tree_id!r} is not a canonical tree_instance_id"
+        )
+    snapshot = parts[0]
+    iteration_part = parts[1]
+    question_part = parts[2]
+    if not snapshot:
+        raise ValueError(f"tree_id {tree_id!r} has an empty snapshot")
+    if not iteration_part.startswith("iter:"):
+        raise ValueError(
+            f"tree_id {tree_id!r} is missing the iter:<n> component"
+        )
+    if not question_part.startswith("q:"):
+        raise ValueError(
+            f"tree_id {tree_id!r} is missing the q:<question> component"
+        )
+    try:
+        rollout_iteration = int(iteration_part.split(":", 1)[1])
+    except ValueError as exc:
+        raise ValueError(
+            f"tree_id {tree_id!r} has a non-integer rollout iteration"
+        ) from exc
+    return snapshot, rollout_iteration, question_part.split(":", 1)[1]
+
+
+def _summary_tree_identity_failures(record: Dict[str, Any]) -> List[str]:
+    """Validate summary-only tree identity against rollout metadata."""
+    summary = record.get("tree_summary") or {}
+    if not summary:
+        return []
+    tree_id = str(record.get("tree_id") or summary.get("tree_id") or "")
+    missing = [
+        name
+        for name in (
+            "tree_id",
+            "policy_snapshot_id",
+            "rollout_iteration",
+            "question_id",
+        )
+        if summary.get(name) is None and not (name == "tree_id" and tree_id)
+    ]
+    if missing:
+        return [
+            "tree_summary is missing canonical identity metadata "
+            f"{missing}; cannot verify summary-only tree identity"
+        ]
+    try:
+        tid_snapshot, tid_iteration, tid_question = _parse_canonical_tree_instance_id(
+            tree_id
+        )
+    except ValueError as exc:
+        return [str(exc)]
+
+    failures: List[str] = []
+    expected_snapshot = str(summary["policy_snapshot_id"])
+    if tid_snapshot != expected_snapshot:
+        failures.append(
+            f"tree_id snapshot {tid_snapshot!r} != summary.policy_snapshot_id "
+            f"{expected_snapshot!r}"
+        )
+    expected_iteration = int(summary["rollout_iteration"])
+    if tid_iteration != expected_iteration:
+        failures.append(
+            f"tree_id rollout iteration {tid_iteration!r} != "
+            f"summary.rollout_iteration {expected_iteration!r}"
+        )
+    expected_question = str(summary["question_id"])
+    if tid_question != expected_question:
+        failures.append(
+            f"tree_id question {tid_question!r} != summary.question_id "
+            f"{expected_question!r}"
+        )
+    return failures
+
+
+def verify_tree_instance_id_uniqueness(
+    edges: Sequence[Dict[str, Any]],
+) -> Tuple[bool, List[str]]:
+    """PLAN.md P0.H: real tree-identity verification for a generated batch.
+
+    Stronger than ``bool(set(tree_ids))``:
+
+    * a collision between two stochastic trees merged under one ``tree_id``
+      shows up as duplicate ``(tree_id, child_segment_id)`` pairs;
+    * summary-only tree records must have a canonical ``tree_id`` whose
+      snapshot, rollout iteration and question match ``tree_summary``;
+    * a ``tree_id`` equal to the ambiguous ``snapshot:question`` fallback of
+      its own edge is a forbidden identity in main runs.
+
+    Returns ``(ok, failure_details)``.
+    """
+    from collections import Counter
+
+    details: List[str] = []
+    pair_counts = Counter(
+        (str(e.get("tree_id", "")), str(e.get("child_segment_id", "")))
+        for e in edges
+    )
+    for (tid, child_seg), count in sorted(pair_counts.items()):
+        # Legacy fixtures without child_segment_id cannot express a
+        # collision; edge_id uniqueness (construction validation) covers
+        # duplicates for them.
+        if count > 1 and tid and child_seg:
+            details.append(
+                f"tree_id {tid!r} carries child_segment_id {child_seg!r} "
+                f"{count} times — two stochastic trees collided under one id"
+            )
+    for e in edges:
+        details.extend(_summary_tree_identity_failures(e))
+        tid = str(e.get("tree_id", ""))
+        fallback = (
+            f"{e.get('policy_snapshot_id', '')}:{e.get('question_id', '')}"
+        )
+        if tid and tid == fallback:
+            details.append(
+                f"tree_id {tid!r} equals the ambiguous snapshot:question "
+                "fallback — not a unique tree identity"
+            )
+            break
+    return (not details), details
+
+
+def _queue_segment_identity_failures(
+    edges: Sequence[Dict[str, Any]],
+) -> Tuple[int, List[str]]:
+    """PLAN.md P0.B: per-tree identity
+    ``sum_q queue_released_segment_count[q] == tree_total_segment_count``.
+
+    Only meaningful on a COMPLETE generated tree — a partial replay sample
+    is missing queues by design, so this must never run on sampled batches.
+
+    Zero-filter contract: when the tree carries its extraction-time
+    ``tree_summary`` the full PRE-FILTER queue map from that summary is used,
+    because a queue whose every edge had exactly zero advantage retains no
+    rows at all and would otherwise be miscounted as a construction failure.
+    """
+    from collections import defaultdict
+
+    tree_totals: Dict[str, int] = {}
+    queue_totals: Dict[str, int] = defaultdict(int)
+    tree_queue_seen: Dict[Tuple[str, str], bool] = {}
+    summary_trees: set = set()
+    for edge in edges:
+        tid = str(edge.get("tree_id", ""))
+        total = int(edge.get("tree_total_segment_count", 0) or 0)
+        if total > 0:
+            tree_totals[tid] = total
+        summary = edge.get("tree_summary")
+        if tid not in summary_trees and isinstance(summary, dict):
+            queue_map = summary.get("queue_released_segment_count")
+            if isinstance(queue_map, dict) and queue_map:
+                summary_trees.add(tid)
+                queue_totals[tid] = sum(int(v or 0) for v in queue_map.values())
+        if tid in summary_trees:
+            continue
+        qid = str(edge.get("queue_flush_id", "0"))
+        q_key = (tid, qid)
+        if not tree_queue_seen.get(q_key):
+            tree_queue_seen[q_key] = True
+            queue_totals[tid] += int(edge.get("queue_released_segment_count", 0) or 0)
+    details: List[str] = []
+    for tid, total in tree_totals.items():
+        got = queue_totals.get(tid, total)
+        if got != total:
+            details.append(
+                f"tree {tid!r}: sum_q queue_released_segment_count = {got} "
+                f"!= tree_total_segment_count = {total}"
+            )
+    return len(details), details
+
+
+def validate_tree_construction(
+    edges: Sequence[Dict[str, Any]],
+    *,
+    strict_fresh_iid: bool = True,
+    construction_summaries: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """PLAN.md P0.B: full generated-tree construction validation.
+
+    Runs once on the COMPLETE batch of edges extracted from freshly
+    generated trees, immediately after normalization and before the edges
+    are inserted into replay. It is the only place allowed to require
+    complete parent groups and full-tree queue identities:
+
+      * every parent group: one tree_id, one allocated_k;
+      * fresh_iid parent groups: pre-filter realized_child_count ==
+        allocated_k, retained row_count <= allocated_k, and
+        sample_multiplicity == 1 on every row (zero-filtered subsets are
+        legitimate — retained == allocated_k is NOT required);
+      * edge IDs unique within the generated batch;
+      * no pruned placeholder appears as a trainable edge;
+      * per tree: sum_q queue_released_segment_count[q] ==
+        tree_total_segment_count;
+      * stored old log-probs align with response tokens.
+
+    ``construction_summaries``: extraction-time per-tree summaries (see
+    ``extract_edges_from_tree(collect_construction_summaries=...)``). They
+    are the only record of a parent — or an entire tree — whose every child
+    had exactly zero advantage: such rows are intentionally absent from
+    ``edges`` and must never be re-inserted into replay. When provided,
+    the summaries' pre-filter ``realized == allocated_k`` facts are
+    validated even for parents with zero retained rows.
+
+    Raises ``ValueError`` on any failure when ``strict_fresh_iid``; returns
+    a diagnostics dict either way.
+    """
+    from collections import Counter
+
+    failures: List[str] = []
+
+    # Parent-group invariants (complete trees only).
+    try:
+        metrics = validate_group_integrity(edges, strict_fresh_iid=False)
+    except ValueError as exc:  # pragma: no cover - non-strict never raises
+        metrics = {"vdra/group_integrity_failures": 1}
+        failures.append(str(exc))
+    group_failures = int(metrics.get("vdra/group_integrity_failures", 0) or 0)
+    if group_failures:
+        failures.append(
+            f"{group_failures} parent-group integrity failure(s) in generated batch"
+        )
+
+    # Edge-ID uniqueness within the generated batch.
+    id_counts = Counter(str(e.get("edge_id", "")) for e in edges)
+    duplicate_ids = sorted(
+        eid for eid, count in id_counts.items() if count > 1 and eid
+    )
+    missing_ids = sum(1 for e in edges if not str(e.get("edge_id", "")))
+    if duplicate_ids:
+        failures.append(f"duplicate edge_id values: {duplicate_ids[:5]}")
+    if missing_ids:
+        failures.append(f"{missing_ids} generated edge(s) missing edge_id")
+
+    # Pruned placeholders must never be emitted as trainable edges.
+    pruned_rows = sum(1 for e in edges if bool(e.get("pruned", False)))
+    if pruned_rows:
+        failures.append(
+            f"{pruned_rows} pruned placeholder row(s) present in generated batch"
+        )
+
+    # Full-tree queue identity.
+    queue_failures, queue_details = _queue_segment_identity_failures(edges)
+    failures.extend(queue_details)
+
+    # Extraction-time construction summaries: the only construction record
+    # for parents/trees whose every child was zero-filtered away.
+    summary_failure_count = 0
+    if construction_summaries:
+        summary_details = _construction_summary_failures(construction_summaries)
+        summary_failure_count = len(summary_details)
+        failures.extend(summary_details)
+
+    # Stored old log-probs must align with response tokens row by row.
+    misaligned = 0
+    for e in edges:
+        log_probs = e.get("actor_shifted_log_probs")
+        response = e.get("response_token_ids")
+        if log_probs is not None and response is not None:
+            if len(list(log_probs)) != len(list(response)):
+                misaligned += 1
+    if misaligned:
+        failures.append(
+            f"{misaligned} generated edge(s) with old log-probs misaligned "
+            "with response tokens"
+        )
+
+    metrics.update(
+        {
+            "vdra/construction_failures": len(failures),
+            "vdra/queue_segment_identity_failures": float(queue_failures),
+            "vdra/generated_duplicate_edge_ids": float(len(duplicate_ids)),
+            "vdra/generated_pruned_rows": float(pruned_rows),
+            "vdra/construction_summary_failures": float(summary_failure_count),
+        }
+    )
+    if failures and strict_fresh_iid:
+        raise ValueError(
+            "Tree-construction validation failed (PLAN.md P0.B):\n  "
+            + "\n  ".join(failures)
+        )
+    return metrics
+
+
+def _construction_summary_failures(
+    construction_summaries: Sequence[Dict[str, Any]],
+) -> List[str]:
+    """Validate extraction-time construction summaries.
+
+    Covers the facts that retained edges cannot represent: a parent (or a
+    whole tree) whose every child had exactly zero advantage retains no rows,
+    so its pre-filter ``realized == allocated_k`` contract and its queue
+    identity can only be checked here. Zero-filtered rows themselves are
+    never re-inserted into replay.
+    """
+    details: List[str] = []
+    for summary in construction_summaries:
+        tid = str(summary.get("tree_id", ""))
+        parent_facts = summary.get("parent_construction") or {}
+        for pgid, facts in parent_facts.items():
+            realized = int(facts.get("realized", 0) or 0)
+            allocated = int(facts.get("allocated_k", 0) or 0)
+            retained = int(facts.get("retained", 0) or 0)
+            if allocated and realized != allocated:
+                details.append(
+                    f"tree {tid!r} parent_group_id={pgid!r} realized "
+                    f"{realized} children but allocated_k={allocated}"
+                )
+            if allocated and retained > allocated:
+                details.append(
+                    f"tree {tid!r} parent_group_id={pgid!r} retained "
+                    f"{retained} rows which exceeds allocated_k={allocated}"
+                )
+        total = int(summary.get("tree_total_segment_count", 0) or 0)
+        queue_map = summary.get("queue_released_segment_count") or {}
+        if total and queue_map:
+            queue_sum = sum(int(v or 0) for v in queue_map.values())
+            if queue_sum != total:
+                details.append(
+                    f"tree {tid!r}: summary sum_q queue_released_segment_count"
+                    f" = {queue_sum} != tree_total_segment_count = {total}"
+                )
+    return details
+
+
+def validate_replay_batch(
+    edges: Sequence[Dict[str, Any]],
+    *,
+    target_edges_per_iteration: Optional[int] = None,
+    max_edges_per_question_per_iteration: Optional[int] = None,
+    max_edge_age_iterations: Optional[int] = None,
+    current_rollout_iteration: Optional[int] = None,
+    strict: bool = True,
+) -> Dict[str, Any]:
+    """PLAN.md P0.B: sampled replay-batch validation (row-local only).
+
+    Edge-level replay intentionally splits trees and parent groups, so this
+    validator must NEVER require complete trees, complete parent groups,
+    ``row_count == allocated_k``, or queue totals reconstructed from the
+    partial sample. It checks only:
+
+      * required row metadata exists (edge_id, question_id,
+        generation_rollout_iteration, training advantage);
+      * edge_id values are unique in the sampled batch;
+      * stored old log-probs align with response tokens;
+      * ages are in ``[0, max_edge_age_iterations)`` (when age inputs given);
+      * per-question selected count <= resolved cap (when given);
+      * selected count <= target (when given).
+
+    Raises ``ValueError`` on failure when ``strict``; returns diagnostics.
+    """
+    from collections import Counter, defaultdict
+
+    failures: List[str] = []
+
+    missing_edge_id = 0
+    missing_question = 0
+    missing_generation_iteration = 0
+    missing_advantage = 0
+    misaligned_log_probs = 0
+    per_question: Dict[str, int] = defaultdict(int)
+    ages: List[int] = []
+    for e in edges:
+        if not str(e.get("edge_id", "")):
+            missing_edge_id += 1
+        qid = str(e.get("question_id", ""))
+        if not qid:
+            missing_question += 1
+        per_question[qid] += 1
+        if e.get("generation_rollout_iteration") is None:
+            missing_generation_iteration += 1
+        elif current_rollout_iteration is not None:
+            ages.append(
+                int(current_rollout_iteration)
+                - int(e.get("generation_rollout_iteration"))
+            )
+        if e.get("advantage") is None:
+            missing_advantage += 1
+        log_probs = e.get("actor_shifted_log_probs")
+        response = e.get("response_token_ids")
+        if log_probs is not None and response is not None:
+            if len(list(log_probs)) != len(list(response)):
+                misaligned_log_probs += 1
+
+    if missing_edge_id:
+        failures.append(f"{missing_edge_id} sampled edge(s) missing edge_id")
+    if missing_question:
+        failures.append(f"{missing_question} sampled edge(s) missing question_id")
+    if missing_generation_iteration:
+        failures.append(
+            f"{missing_generation_iteration} sampled edge(s) missing "
+            "generation_rollout_iteration"
+        )
+    if missing_advantage:
+        failures.append(
+            f"{missing_advantage} sampled edge(s) missing training advantage"
+        )
+    if misaligned_log_probs:
+        failures.append(
+            f"{misaligned_log_probs} sampled edge(s) with old log-probs "
+            "misaligned with response tokens"
+        )
+
+    id_counts = Counter(str(e.get("edge_id", "")) for e in edges)
+    duplicate_ids = sorted(
+        eid for eid, count in id_counts.items() if count > 1 and eid
+    )
+    if duplicate_ids:
+        failures.append(f"duplicate sampled edge_id values: {duplicate_ids[:5]}")
+
+    invalid_ages = 0
+    if ages and max_edge_age_iterations is not None:
+        invalid_ages = sum(
+            1 for a in ages if a < 0 or a >= int(max_edge_age_iterations)
+        )
+        if invalid_ages:
+            failures.append(
+                f"{invalid_ages} sampled edge(s) with age outside "
+                f"[0, {int(max_edge_age_iterations)})"
+            )
+
+    max_per_question = max(per_question.values()) if per_question else 0
+    if (
+        max_edges_per_question_per_iteration is not None
+        and max_per_question > int(max_edges_per_question_per_iteration)
+    ):
+        failures.append(
+            f"per-question selected count {max_per_question} exceeds resolved "
+            f"cap {int(max_edges_per_question_per_iteration)}"
+        )
+
+    if (
+        target_edges_per_iteration is not None
+        and len(edges) > int(target_edges_per_iteration)
+    ):
+        failures.append(
+            f"selected edge count {len(edges)} exceeds "
+            f"target_edges_per_iteration {int(target_edges_per_iteration)}"
+        )
+
+    metrics = {
+        "vdra/replay_batch_failures": len(failures),
+        "vdra/replay_selected_edges": float(len(edges)),
+        "vdra/replay_unique_questions": float(len(per_question)),
+        "vdra/replay_max_per_question": float(max_per_question),
+        "vdra/replay_invalid_ages": float(invalid_ages),
+    }
+    if failures and strict:
+        raise ValueError(
+            "Replay-batch validation failed (PLAN.md P0.B):\n  "
+            + "\n  ".join(failures)
+        )
+    return metrics
 
 
 def _compute_position_id_with_mask(attention_mask: torch.Tensor) -> torch.Tensor:
@@ -502,6 +1147,13 @@ def _right_pad(ids: Sequence[int], length: int, pad_id: int) -> List[int]:
     return ids + [pad_id] * (length - len(ids))
 
 
+# PLAN.md P0.C: loss modes whose actor loss consumes precomputed float
+# objective-weight tensors. The canonical ``vdra_segment_mean_ppo`` path uses
+# the segment objective 1/(N_T * N_seg(T)); node-balanced weights are only for
+# the explicit ablation below.
+_LOSS_MODES_WITH_OBJECTIVE_WEIGHTS = ("vdra_node_balanced_ppo",)
+
+
 def edges_to_dataproto(
     edges: List[Dict[str, Any]],
     tokenizer,
@@ -509,6 +1161,7 @@ def edges_to_dataproto(
     max_prompt_length: int,
     max_response_length: int,
     include_old_log_probs: bool = True,
+    loss_mode: str = "vdra_segment_mean_ppo",
 ) -> DataProto:
     """Build a DataProto whose rows are tree edges.
 
@@ -518,6 +1171,14 @@ def edges_to_dataproto(
       (optionally) ``old_log_probs``.
     Non-tensor fields: ``uid`` (per source question, for grouping/logging),
     ``question_id``, ``reward_model``, ``extra_info``.
+
+    PLAN.md P0.C: ``loss_mode`` selects which float weight tensors are
+    attached. The canonical ``vdra_segment_mean_ppo`` mode attaches NO
+    ``objective_weights`` / ``segment_objective_weights`` here: its actor
+    loss computes the segment objective 1/(N_T * N_seg(T)) directly from the
+    row metadata. Only the explicit ``vdra_node_balanced_ppo`` ablation still
+    receives its precomputed weights. Integer group/identity tensors are
+    attached unconditionally for diagnostics and validation.
     """
     if not edges:
         raise ValueError("edges_to_dataproto received an empty edge list")
@@ -605,22 +1266,21 @@ def edges_to_dataproto(
     for key, value in group_tensors_for_edges(edges).items():
         batch[key] = value
 
-    # PLAN.md P0.3 (legacy node-balanced path): precompute exact
-    # node-balanced weights and attach them as a row-level tensor. Kept for
-    # the ablation ``vdra_node_balanced_ppo`` loss. The main VDRA path uses
-    # ``segment_objective_weights`` below instead.
-    obj_weights = compute_objective_weights(edges)
-    validate_objective_weights(edges, obj_weights)
-    batch["objective_weights"] = torch.tensor(obj_weights, dtype=torch.float32)
+    # PLAN.md P0.C: float objective-weight tensors are attached ONLY for the
+    # explicit node-balanced ablation. The canonical segment-mean loss derives
+    # 1/(N_T * N_seg(T)) from row metadata and must receive neither tensor;
+    # tree- and parent-normalized weights would silently re-couple the batch
+    # to complete-tree assumptions.
+    if str(loss_mode) in _LOSS_MODES_WITH_OBJECTIVE_WEIGHTS:
+        obj_weights = compute_objective_weights(edges)
+        validate_objective_weights(edges, obj_weights)
+        batch["objective_weights"] = torch.tensor(obj_weights, dtype=torch.float32)
 
-    # PLAN.md P0.4: precompute the segment-average weights on the full batch.
-    # The main VDRA loss reduces sum(segment_objective_weights * L_row), so
-    # mini/microbatch splits give gradients exactly equal to the full-batch
-    # weighted sum. Depends only on ``tree_id`` and ``tree_total_segment_count``
-    # — not on parent groups or queue labels.
-    seg_weights = compute_segment_objective_weights(edges)
-    validate_segment_objective_weights(edges, seg_weights)
-    batch["segment_objective_weights"] = torch.tensor(seg_weights, dtype=torch.float32)
+        seg_weights = compute_segment_objective_weights(edges)
+        validate_segment_objective_weights(edges, seg_weights)
+        batch["segment_objective_weights"] = torch.tensor(
+            seg_weights, dtype=torch.float32
+        )
 
     non_tensor_batch = {
         "uid": np.array(uids, dtype=object),

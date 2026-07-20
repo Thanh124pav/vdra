@@ -25,7 +25,7 @@ gear_tree:
   tree_shape: [6, 6, 6]
 
   # Segment length M (tokens per non-terminal segment). None at the last depth.
-  segment_length: 100
+  segment_length: 600
 
   # Advantage variant. treepo_style_ablation / treerl_style_ablation are
   # scalar-objective ablations, NOT byte-faithful reproductions of the
@@ -46,22 +46,15 @@ gear_tree:
   # TreeRL-style discount (only used by treerl_style_ablation).
   treerl_gamma: 0.9
 
-  # PLAN.md P0.1: main VDRA runs keep every realized child, including
-  # zero-advantage ones, so the parent denominator (|children_of_p|) matches
-  # allocated_k. Legacy treetune default was true (drop pav_advantage == 0);
-  # keep that option for the SPO baseline only.
-  only_adv_greater_than_zero: false
+  # Stage 1 zero-filter contract: despite the legacy name, true removes
+  # only exact-zero advantages after all realized non-pruned segments have
+  # been counted; positive and negative advantages are retained.
+  only_adv_greater_than_zero: true
 
   replay_buffer:
     enabled: true
-    # PLAN.md P0.2 canonical names. The old aliases
-    # (target_edges_per_update / max_edges_per_question / max_edge_age)
-    # remain accepted for one release but must not appear in main configs.
     target_edges_per_iteration: 512
     max_edge_age_iterations: 8
-    # 'auto' resolves to ceil(R * (sum_d prod_{l<=d} b_l) / max_edge_age_iterations)
-    # from `tree_shape` and `actor_rollout_ref.rollout.n`. Numeric overrides
-    # are legal only for controlled compatibility/ablation runs.
     max_edges_per_question_per_iteration: auto
     replay_sampling_unit: edge
     underfill_policy: use_available
@@ -116,7 +109,7 @@ gear_tree:
 
 
     # k0 pilot children and r likelihood samples per child.
-    pilot_branch_factor: 8
+    pilot_branch_factor: 7
     likelihood_samples_per_distribution: 2
 
     # Current verl runtime owns one queue manager per tree; do not claim
@@ -161,7 +154,7 @@ gear_tree:
 
     # Online queues flush on capacity or timeout; final drain only at rollout end.
     queue_count: 4
-    queue_capacity: 8
+    queue_capacity: 16
 
     queue_timeout_seconds: 1.0
 
@@ -239,15 +232,9 @@ tree_policy:
   advantage_mode: spo_local
 
   # policy_aggregation selects the actor loss reduction. Main VDRA is
-  # `global_segment_mean` (PLAN.md P0.1):
-  #
-  #     L = (1/N_T) * sum_T (1/N_seg(T)) * sum_s L_s^r,
-  #
-  # where the within-segment reduction ``r`` is set by
-  # `segment_token_reduction` below. The main path REQUIRES the actor loss
-  # `vdra_segment_mean_ppo` and the row tensors produced by
-  # ``tree_data.edges_to_dataproto`` (``segment_objective_weights``,
-  # ``tree_total_segment_count``).
+  # `global_segment_mean` (PLAN.md P0.1): segment contributions use the
+  # canonical 1/(N_T * N_seg(T)) objective. Tree/queue count tensors remain
+  # diagnostics and validation inputs until the Medium manifest cleanup.
   #
   # Values:
   #   * global_segment_mean  — canonical main-run (PLAN.md P0.1).
@@ -259,13 +246,13 @@ tree_policy:
   # PLAN.md P0.1: within-segment token reduction. Must be exactly `mean` or
   # `sum`. `mean` is the canonical/default main setting; `sum` is a supported
   # first-class ablation of the score-function convention. The two modes
-  # share exactly one rollout / advantage / segment-denominator / replay /
-  # batching path — only the per-row `L_s` differs.
+  # share exactly one rollout / advantage / replay / batching path — only
+  # the per-row `L_s` differs.
   segment_token_reduction: mean
 
-  # If true (canonical), root-generated child segments participate in the
-  # tree average as segments in their own right — every realized segment is
-  # counted.
+  # If true, root-generated child segments are included in construction
+  # counts and diagnostics. Do not treat this as a Stage 1 loss-normalization
+  # change.
   include_root_parent_group: true
 
   # Strict main runs must abort on any group integrity failure.
@@ -316,6 +303,13 @@ actor_rollout_ref:
       # because the loss function reads it via `config` (ActorConfig). Keep it
       # in sync with `tree_policy.segment_token_reduction`.
       segment_token_reduction: mean
+
+      # Canonical normalization is the tree segment mean
+      # w_s = 1 / (N_T * N_seg(T)) with the PRE-FILTER
+      # tree_total_segment_count, so removing exact-zero-advantage rows
+      # leaves the loss unchanged. `true` selects the historical batch-slot
+      # mean over retained replay slots — a labeled LEGACY ablation only.
+      batch_slot_mean_ablation: false
 
     # No KL-in-loss by default (matches tree-family configs). KL coef = 0.
     use_kl_loss: false

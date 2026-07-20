@@ -22,10 +22,11 @@ from recipe.gear_tree.run_manifest import (
 from recipe.gear_tree.tree_data import (
     compute_group_metrics,
     compute_objective_weights,
-    compute_segment_objective_weights,
     validate_group_integrity,
     validate_objective_weights,
-    validate_segment_objective_weights,
+    validate_replay_batch,
+    validate_tree_construction,
+    verify_tree_instance_id_uniqueness,
 )
 
 
@@ -85,131 +86,301 @@ def build_run_manifest(
     return manifest
 
 
+def update_manifest_from_generated_edges(
+    manifest: RunManifest,
+    generated_edges: List[Dict[str, Any]],
+    *,
+    strict: bool,
+    construction_summaries: List[Dict[str, Any]] | None = None,
+) -> Dict[str, Any]:
+    """PLAN.md P0.B: CONSTRUCTION-stage manifest update.
+
+    Runs on the complete batch of edges extracted from freshly generated
+    trees, before replay insertion. This is the only stage allowed to
+    require complete parent groups and full-tree queue identities. The
+    canonical path validates observed accounting facts only; objective
+    weights are computed/validated solely for the node-balanced ablation
+    (PLAN.md M4).
+
+    ``construction_summaries`` are the extraction-time per-tree summaries.
+    They carry the construction facts of parents (or whole trees) whose
+    every child had exactly zero advantage — those rows are intentionally
+    absent from ``generated_edges`` and never re-enter replay, so the
+    summary is the only place their ``realized == allocated_k`` contract
+    can still be checked.
+    """
+    integrity_metrics: Dict[str, Any] = {}
+    raised: Exception | None = None
+    try:
+        integrity_metrics = validate_tree_construction(
+            generated_edges,
+            strict_fresh_iid=strict,
+            construction_summaries=construction_summaries,
+        )
+    except ValueError as exc:
+        raised = exc
+        integrity_metrics = {
+            "vdra/construction_failures": 1,
+            "vdra/group_integrity_failures": 1,
+            "vdra/queue_segment_identity_failures": 1.0,
+            "vdra/construction_error": str(exc),
+        }
+    group_failures = int(
+        integrity_metrics.get("vdra/group_integrity_failures", 0) or 0
+    )
+    summary_failures = int(
+        float(integrity_metrics.get("vdra/construction_summary_failures", 0) or 0)
+    )
+    if group_failures or summary_failures:
+        manifest.record_integrity_failure(group_failures + summary_failures)
+        manifest.fresh_iid_row_count_matches_allocated_k = False
+    else:
+        manifest.fresh_iid_row_count_matches_allocated_k = True
+    queue_failures = int(
+        float(integrity_metrics.get("vdra/queue_segment_identity_failures", 0) or 0)
+    )
+    if queue_failures:
+        manifest.record_segment_count_failure(queue_failures)
+    if raised is not None and strict:
+        raise raised
+    integrity_metrics.update(compute_group_metrics(generated_edges))
+
+    # PLAN.md P0.C: parent-/tree-normalized node-balanced weights are an
+    # ablation concept. Compute and validate them ONLY when the run actually
+    # trains with the node-balanced loss — the canonical segment-mean path
+    # must not validate (or depend on) these float weights at all.
+    if (
+        str(manifest.extras.get("actor_loss_mode", ""))
+        == "vdra_node_balanced_ppo"
+    ):
+        try:
+            weights = compute_objective_weights(generated_edges)
+            integrity_metrics.update(
+                validate_objective_weights(generated_edges, weights)
+            )
+            manifest.extras["objective_weight_normalization_passes"] = True
+        except ValueError as exc:
+            manifest.record_integrity_failure(1)
+            manifest.extras["objective_weight_normalization_passes"] = False
+            manifest.extras["objective_weight_normalization_error"] = str(exc)
+            integrity_metrics["vdra/objective_weight_normalization_failed"] = 1.0
+            # Non-fatal for the segment-mean main path.
+
+    # PLAN.md P0.H / M4: REAL tree-identity verification at construction time.
+    # Edge-bearing trees are checked from their edges (duplicate
+    # (tree_id, child_segment_id) pairs and the ambiguous snapshot:question
+    # fallback). A tree whose every child had zero advantage retains NO edges,
+    # so its identity is invisible to the edge-based check — verify it from
+    # its construction summary instead, otherwise a legitimate all-zero tree
+    # would falsely leave unique_tree_ids_verified=False and invalidate the
+    # run. Both sources contribute to the verified identity set.
+    edge_tree_ids = {str(e.get("tree_id", "")) for e in generated_edges}
+    ids_ok, id_failures = verify_tree_instance_id_uniqueness(generated_edges)
+    summary_only_tree_ids: set = set()
+    for summary in construction_summaries or []:
+        if int(summary.get("retained_edge_count", 0) or 0) != 0:
+            # Edge-bearing tree: its id already rides on its edges above.
+            continue
+        tid = str(summary.get("tree_id", ""))
+        if not tid:
+            id_failures.append(
+                "all-zero tree construction summary is missing a tree_id"
+            )
+            continue
+        # PLAN.md M3: an all-zero tree never passes strict edge normalization,
+        # so validate its summary-only identity against the rollout metadata
+        # carried by the construction summary. Do NOT derive the expected
+        # snapshot from ``tid`` itself: that would let a self-consistent but
+        # wrong tree_id pass the manifest gate.
+        if strict:
+            summary_record = {"tree_id": tid, "tree_summary": summary}
+            summary_ok, summary_id_failures = verify_tree_instance_id_uniqueness(
+                [summary_record]
+            )
+            if not summary_ok:
+                id_failures.extend(summary_id_failures)
+                continue
+        if tid in edge_tree_ids or tid in summary_only_tree_ids:
+            id_failures.append(
+                f"all-zero tree summary tree_id {tid!r} collides with another "
+                "tree"
+            )
+            continue
+        summary_only_tree_ids.add(tid)
+    ids_ok = not id_failures
+    all_tree_ids = edge_tree_ids | summary_only_tree_ids
+    manifest.extras["unique_tree_ids_verified"] = ids_ok and bool(all_tree_ids)
+    manifest.extras["unique_tree_ids_count"] = len(all_tree_ids)
+    manifest.unique_tree_ids_verified = ids_ok and bool(all_tree_ids)
+    integrity_metrics["vdra/unique_tree_ids"] = float(len(all_tree_ids))
+    integrity_metrics["vdra/tree_id_collisions"] = float(len(id_failures))
+    if not ids_ok:
+        manifest.extras["tree_id_collision_details"] = id_failures[:5]
+        manifest.record_integrity_failure(len(id_failures))
+        if strict:
+            raise ValueError(
+                "Tree-identity verification failed (PLAN.md P0.H):\n  "
+                + "\n  ".join(id_failures)
+            )
+
+    # PLAN.md M4: the canonical segment-count claim rides on OBSERVED
+    # construction accounting facts only — objective-weight normalization is
+    # NOT a canonical dependency:
+    #   (a) every parent realized its allocation BEFORE zero-advantage
+    #       filtering (pre-filter realized_child_count == allocated_k;
+    #       never the retained row count, which zero-filtering may shrink);
+    #   (b) full-tree queue identity: per tree, the sum of unique
+    #       queue_released_segment_count values equals
+    #       tree_total_segment_count;
+    #   (c) no missing or duplicate edge IDs in the generated batch;
+    #   (d) no pruned placeholder counted as a trainable segment.
+    duplicate_edge_ids = int(
+        float(integrity_metrics.get("vdra/generated_duplicate_edge_ids", 0) or 0)
+    )
+    missing_edge_ids = sum(
+        1 for e in generated_edges if not str(e.get("edge_id", ""))
+    )
+    pruned_rows = int(
+        float(integrity_metrics.get("vdra/generated_pruned_rows", 0) or 0)
+    )
+    allocation_failures = _pre_filter_allocation_failures(generated_edges)
+    integrity_metrics["vdra/generated_missing_edge_ids"] = float(missing_edge_ids)
+    integrity_metrics["vdra/pre_filter_allocation_failures"] = float(
+        allocation_failures
+    )
+    if (
+        queue_failures == 0
+        and allocation_failures == 0
+        and summary_failures == 0
+        and duplicate_edge_ids == 0
+        and missing_edge_ids == 0
+        and pruned_rows == 0
+    ):
+        manifest.segment_count_invariants_passed = True
+
+    return integrity_metrics
+
+
+def _pre_filter_allocation_failures(edges: List[Dict[str, Any]]) -> int:
+    """PLAN.md M4 fact (a): per parent group, the PRE-FILTER realized child
+    count must equal ``allocated_k``.
+
+    Uses the ``realized_child_count`` stamped on every edge at extraction
+    time (unaffected by zero-advantage filtering). Edges without the stamp
+    (legacy fixtures that predate zero-filtering) fall back to the retained
+    row count, where retained == realized by construction.
+    """
+    from collections import defaultdict
+
+    by_parent: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for edge in edges:
+        by_parent[str(edge.get("parent_group_id", ""))].append(edge)
+    failures = 0
+    for group in by_parent.values():
+        allocated_values = {int(e.get("allocated_k", 0) or 0) for e in group}
+        if len(allocated_values) != 1:
+            failures += 1
+            continue
+        allocated = next(iter(allocated_values))
+        if not allocated:
+            continue
+        realized_values = {
+            int(e["realized_child_count"])
+            for e in group
+            if e.get("realized_child_count") is not None
+        }
+        if len(realized_values) > 1:
+            failures += 1
+            continue
+        realized = next(iter(realized_values), len(group))
+        if realized != allocated:
+            failures += 1
+    return failures
+
+
+def update_manifest_from_replay_batch(
+    manifest: RunManifest,
+    sampled_edges: List[Dict[str, Any]],
+    *,
+    strict: bool,
+    target_edges_per_iteration: int | None = None,
+    max_edges_per_question_per_iteration: int | None = None,
+    max_edge_age_iterations: int | None = None,
+    current_rollout_iteration: int | None = None,
+) -> Dict[str, Any]:
+    """PLAN.md P0.B: REPLAY-stage manifest update (row-local checks only).
+
+    Edge-level replay legitimately samples partial trees and partial parent
+    groups, so this update never requires group completeness and never
+    increments ``group_integrity_failures`` for partial sampling.
+    """
+    replay_metrics: Dict[str, Any] = {}
+    raised: Exception | None = None
+    try:
+        replay_metrics = validate_replay_batch(
+            sampled_edges,
+            target_edges_per_iteration=target_edges_per_iteration,
+            max_edges_per_question_per_iteration=(
+                max_edges_per_question_per_iteration
+            ),
+            max_edge_age_iterations=max_edge_age_iterations,
+            current_rollout_iteration=current_rollout_iteration,
+            strict=strict,
+        )
+    except ValueError as exc:
+        raised = exc
+        replay_metrics = {
+            "vdra/replay_batch_failures": 1,
+            "vdra/replay_batch_error": str(exc),
+        }
+    failures = int(replay_metrics.get("vdra/replay_batch_failures", 0) or 0)
+    if failures:
+        manifest.record_replay_batch_failure(failures)
+    if raised is not None and strict:
+        raise raised
+
+    # PLAN.md P0.7: replay age uses rollout_iteration when at least one
+    # observed edge carries the canonical stamp.
+    if any("generation_rollout_iteration" in edge for edge in sampled_edges):
+        manifest.replay_age_uses_rollout_iteration = True
+    # PLAN.md P0.J: `stored_old_log_probs_used` and `no_truncation` are NOT
+    # set here. The trainer flips them only from actually observed runtime
+    # events: the actor's actor/used_stored_old_log_probs metric and a
+    # successful strict tensorization respectively.
+
+    return replay_metrics
+
+
 def update_manifest_from_edges(
     manifest: RunManifest,
     sampled_edges: List[Dict[str, Any]],
     *,
     strict: bool,
 ) -> Dict[str, Any]:
-    """PLAN.md P0.6/P0.N7/N8: observe group integrity, fresh_iid row counts,
-    and objective-weight normalization at runtime and record them on the
-    manifest. Config-derived values are never used to flip these bits.
+    """Deprecated P0.B alias: treats the batch as a COMPLETE generated batch.
+
+    Kept for backwards compatibility with callers written before the
+    construction/replay validator split. The production trainer calls
+    :func:`update_manifest_from_generated_edges` at generation time and
+    :func:`update_manifest_from_replay_batch` on sampled batches instead.
     """
-    integrity_metrics: Dict[str, Any] = {}
-    raised: Exception | None = None
     try:
-        integrity_metrics = validate_group_integrity(
-            sampled_edges, strict_fresh_iid=strict
+        integrity_metrics = update_manifest_from_generated_edges(
+            manifest, sampled_edges, strict=strict
         )
-    except ValueError as exc:
-        raised = exc
-        integrity_metrics = {
-            "vdra/group_integrity_failures": 1,
-            "vdra/group_integrity_error": str(exc),
-        }
-    failures = int(integrity_metrics.get("vdra/group_integrity_failures", 0) or 0)
-    if failures:
-        manifest.record_integrity_failure(failures)
-        # An integrity failure means at least one parent group is partial —
-        # complete-tree replay did NOT hold for this batch.
+    except ValueError:
         manifest.complete_tree_replay = False
         manifest.complete_parent_microbatches = False
-        manifest.fresh_iid_row_count_matches_allocated_k = False
-    else:
-        # PLAN.md P0.6: only when the observed batch passes every invariant
-        # do we flip these bits on.
-        manifest.complete_tree_replay = True
-        manifest.complete_parent_microbatches = True
-        manifest.fresh_iid_row_count_matches_allocated_k = True
-    if raised is not None and strict:
-        raise raised
-    integrity_metrics.update(compute_group_metrics(sampled_edges))
-
-    # PLAN.md P0.4 / P0.6: segment-average weight normalization is the main
-    # runtime invariant. Compute + validate the pre-filter segment weights.
-    segment_metrics: Dict[str, Any] = {}
-    try:
-        seg_weights = compute_segment_objective_weights(sampled_edges)
-        segment_metrics = validate_segment_objective_weights(
-            sampled_edges, seg_weights
-        )
-        integrity_metrics.update(segment_metrics)
-        manifest.extras["segment_weight_normalization_passes"] = True
-    except ValueError as exc:
-        manifest.record_segment_count_failure(1)
-        manifest.extras["segment_weight_normalization_passes"] = False
-        manifest.extras["segment_weight_normalization_error"] = str(exc)
-        integrity_metrics["vdra/segment_weight_normalization_failed"] = 1.0
-        if strict:
-            raise
-
-    # PLAN.md P0.2: verify sum_q queue_released_segment_count[q] ==
-    # tree_total_segment_count for every tree in this batch.
-    from collections import defaultdict as _dd
-    tree_totals: Dict[str, int] = {}
-    queue_totals: Dict[str, int] = _dd(int)
-    tree_queue_seen: Dict[tuple, bool] = {}
-    for edge in sampled_edges:
-        tid = str(edge.get("tree_id", ""))
-        total = int(edge.get("tree_total_segment_count", 0) or 0)
-        if total > 0:
-            tree_totals[tid] = total
-        qid = str(edge.get("queue_flush_id", "0"))
-        q_key = (tid, qid)
-        if not tree_queue_seen.get(q_key):
-            tree_queue_seen[q_key] = True
-            queue_totals[tid] += int(edge.get("queue_released_segment_count", 0) or 0)
-    segment_identity_failures = 0
-    for tid, total in tree_totals.items():
-        if queue_totals.get(tid, total) != total:
-            segment_identity_failures += 1
-    if segment_identity_failures:
-        manifest.record_segment_count_failure(segment_identity_failures)
-        integrity_metrics["vdra/queue_segment_identity_failures"] = float(
-            segment_identity_failures
-        )
-    else:
-        integrity_metrics["vdra/queue_segment_identity_failures"] = 0.0
-
-    # PLAN.md P0.6: legacy node-balanced weight normalization is still
-    # computed for logging but its failure only flips the ABLATION invariant
-    # bit, not the main-path segment bit.
-    try:
-        weights = compute_objective_weights(sampled_edges)
-        integrity_metrics.update(validate_objective_weights(sampled_edges, weights))
-        manifest.extras["objective_weight_normalization_passes"] = True
-    except ValueError as exc:
-        manifest.record_integrity_failure(1)
-        manifest.extras["objective_weight_normalization_passes"] = False
-        manifest.extras["objective_weight_normalization_error"] = str(exc)
-        integrity_metrics["vdra/objective_weight_normalization_failed"] = 1.0
-        # Non-fatal for the segment-mean main path.
-
-    # PLAN.md P0.6/P0.7: verify globally-unique tree ids (observed fact).
-    tree_ids = {str(e.get("tree_id", "")) for e in sampled_edges}
-    manifest.extras["unique_tree_ids_verified"] = bool(tree_ids)
-    manifest.extras["unique_tree_ids_count"] = len(tree_ids)
-    manifest.unique_tree_ids_verified = bool(tree_ids)
-    integrity_metrics["vdra/unique_tree_ids"] = float(len(tree_ids))
-    # PLAN.md P0.7: replay age uses rollout_iteration when at least one
-    # observed edge carries the canonical stamp.
-    if any(
-        "generation_rollout_iteration" in edge for edge in sampled_edges
-    ):
+        raise
+    failures = int(
+        integrity_metrics.get("vdra/construction_failures", 0) or 0
+    )
+    manifest.complete_tree_replay = failures == 0
+    manifest.complete_parent_microbatches = failures == 0
+    if any("generation_rollout_iteration" in edge for edge in sampled_edges):
         manifest.replay_age_uses_rollout_iteration = True
-    # PLAN.md P0.6: stored old log-probs are what the trainer forces via
-    # meta_info["force_stored_old_log_probs"]; record the observed presence
-    # both on the extras (legacy) and on the top-level manifest field.
     manifest.stored_old_log_probs_used = True
-    manifest.no_truncation = True  # edges_to_dataproto refuses truncation
+    manifest.no_truncation = True
     manifest.extras["stored_old_log_probs_used"] = True
     manifest.extras["no_truncation"] = True
-
-    # PLAN.md P0.6: only when the segment-count identity holds and the
-    # segment weights normalize does the segment-count invariants bit flip on.
-    if segment_identity_failures == 0 and manifest.extras.get(
-        "segment_weight_normalization_passes", False
-    ):
-        manifest.segment_count_invariants_passed = True
-
     return integrity_metrics

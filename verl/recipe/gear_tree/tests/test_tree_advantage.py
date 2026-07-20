@@ -58,8 +58,8 @@ def test_extract_edges_matches_vendor_update_modes(mode, expected_adv, expected_
 
 
 def test_pruned_edge_is_dropped_by_default():
-    # PLAN.md P0.1: administrative pruned=True placeholder rows must NOT enter
-    # DataProto or the parent denominator. Default emit_pruned_edges=False.
+    # Stage 1: administrative pruned=True placeholder rows must NOT enter
+    # replay or the realized non-pruned pre-filter count.
     tree = _tree()
     tree["children"][0]["pruned"] = True
     edges = extract_edges_from_tree(tree, only_adv_greater_than_zero=False)
@@ -111,6 +111,8 @@ def _tree_with_alloc(k: int, mark_multiplicity: int = 1):
         "reward_std": 0.25,
         "full_text": "Q",
         "_request_object": {"_treetune__idx": 42, "problem": "1+1"},
+        # PLAN.md P0.H: strict extraction requires a unique tree identity.
+        "tree_instance_id": f"snap|iter:0|q:42|t:alloc-{k}-{mark_multiplicity}",
         "vdra_allocated_k": k,
         "children": [
             {

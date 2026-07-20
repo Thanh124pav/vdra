@@ -9,6 +9,7 @@ sampled edges to the actor update.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import uuid
@@ -17,25 +18,41 @@ from typing import Any, Dict, List, Mapping
 
 import numpy as np
 
+_LOGGER = logging.getLogger(__name__)
+
 from verl import DataProto
 from verl.trainer.ppo.metric_utils import reduce_metrics
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
+from recipe.gear_tree.config_validation import validate_policy_loss_consistency
 from recipe.gear_tree.context_contract import (
     resolve_max_edge_prompt_length,
     resolve_max_original_prompt_length,
     validate_context_contract,
 )
-from recipe.gear_tree.replay_buffer import GearTreeReplayBuffer
+from recipe.gear_tree.replay_buffer import (
+    GearTreeReplayBuffer,
+    expected_optimizer_steps,
+    reserve_replay_edges,
+    should_postpone_sampled_update,
+)
 from recipe.gear_tree.manifest_lifecycle import (
     build_run_manifest,
-    update_manifest_from_edges,
+    update_manifest_from_generated_edges,
+    update_manifest_from_replay_batch,
 )
 from recipe.gear_tree.run_manifest import (
     POLICY_AGGREGATION_LEGACY,
     POLICY_AGGREGATION_VDRA,
     RunManifest,
     validate_main_run,
+)
+from recipe.gear_tree.trainer_state import (
+    GearTreeTrainerState,
+    advance_past_thresholds,
+    initial_next_threshold,
+    load_trainer_state,
+    save_trainer_state,
 )
 
 
@@ -130,14 +147,93 @@ class RayGearTreeTrainer(RayPPOTrainer):
     def _checkpoint_dir_for_step(self, step: int) -> str:
         return os.path.join(self.config.trainer.default_local_dir, f"global_step_{int(step)}")
 
+    # --- PLAN.md P0.E: counter state must survive checkpoint/resume ------- #
+
+    def _save_checkpoint(self):
+        """Base checkpoint plus the VDRA counter state file.
+
+        The base trainer restores only ``global_steps`` from the folder
+        name; ``gear_tree_trainer_state.json`` carries the remaining
+        counters (most importantly ``rollout_iteration``, which drives
+        replay ages).
+        """
+        super()._save_checkpoint()
+        save_trainer_state(
+            self._checkpoint_dir_for_step(self.global_steps),
+            GearTreeTrainerState(
+                global_step=int(self.global_steps),
+                rollout_iteration=int(getattr(self, "rollout_iteration", 0)),
+                num_optimizer_steps_total=int(
+                    getattr(self, "num_optimizer_steps_total", 0)
+                ),
+                successful_actor_updates=int(
+                    getattr(self, "successful_actor_updates", 0)
+                ),
+                postponed_updates=int(getattr(self, "postponed_updates", 0)),
+                failed_updates=int(getattr(self, "failed_updates", 0)),
+            ),
+        )
+
+    def _load_checkpoint(self):
+        """Restore ``global_steps`` (base) plus the VDRA counter state.
+
+        A checkpoint without the state file is a LEGACY checkpoint: replay
+        restore is disabled for it (PLAN.md P0.E option A) because restored
+        edges would carry generation iterations far above the reset
+        ``rollout_iteration`` and get negative, never-expiring ages.
+        """
+        ret = super()._load_checkpoint()
+        self._legacy_checkpoint_without_state = False
+        if int(getattr(self, "global_steps", 0) or 0) > 0:
+            state = load_trainer_state(
+                self._checkpoint_dir_for_step(self.global_steps)
+            )
+            if state is None:
+                self._legacy_checkpoint_without_state = True
+                print(
+                    "WARNING (PLAN.md P0.E): checkpoint "
+                    f"global_step_{self.global_steps} has no "
+                    "gear_tree_trainer_state.json (legacy checkpoint). "
+                    "The replay buffer will be RESET and rollout_iteration "
+                    "restarts at 0 so replay ages can never go negative."
+                )
+            else:
+                if int(state.global_step) != int(self.global_steps):
+                    raise ValueError(
+                        "gear_tree_trainer_state.json global_step="
+                        f"{state.global_step} does not match checkpoint "
+                        f"folder global_step_{self.global_steps}"
+                    )
+                self.rollout_iteration = int(state.rollout_iteration)
+                self.num_optimizer_steps_total = int(
+                    state.num_optimizer_steps_total
+                )
+                self.successful_actor_updates = int(
+                    state.successful_actor_updates
+                )
+                self.postponed_updates = int(state.postponed_updates)
+                self.failed_updates = int(state.failed_updates)
+        return ret
+
     def _restore_or_init_replay_buffer(self) -> Dict[str, Any]:
         replay_cfg = self._replay_config()
         metrics = {
             "buffer/checkpoint_restored": 0.0,
             "buffer/reset_on_resume": 0.0,
+            "buffer/legacy_checkpoint_reset": 0.0,
         }
         if int(getattr(self, "global_steps", 0) or 0) <= 0:
             self.replay_buffer = self._new_replay_buffer()
+            return metrics
+
+        # PLAN.md P0.E option A: a legacy checkpoint (no trainer-state file)
+        # must NOT restore replay — its edges carry generation iterations far
+        # above the reset rollout_iteration and would get negative ages.
+        if getattr(self, "_legacy_checkpoint_without_state", False):
+            self.replay_buffer = self._new_replay_buffer()
+            metrics["buffer/reset_on_resume"] = 1.0
+            metrics["buffer/legacy_checkpoint_reset"] = 1.0
+            self.replay_buffer_resume_metrics = metrics
             return metrics
 
         ckpt_dir = Path(self._checkpoint_dir_for_step(self.global_steps))
@@ -211,95 +307,35 @@ class RayGearTreeTrainer(RayPPOTrainer):
             segment_length=int(gt.get("segment_length", 0) or 0),
             model_context_length=model_context,
         )
-        # PLAN.md P1.R7: refuse the deprecated ablation `_original` names in
-        # strict main runs, and refuse to combine the *_style_ablation modes
-        # with the canonical policy aggregation (they are ablations, not
-        # main-paper losses). The gate's own strict checks cover
-        # pilot_execution_mode and allocation_runtime.
-        gear_cfg = gt.get("gear") or {}
-        strict = bool(gear_cfg.get("strict_vdra", True))
-        tree_update_mode = str(gt.get("tree_update_mode", "spo"))
-        tree_policy = self.config.get("tree_policy") or {}
-        policy_agg = str(tree_policy.get("policy_aggregation", "legacy_token_mean"))
-        actor_loss_mode = str(
-            self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        )
-        segment_reduction = str(
-            tree_policy.get("segment_token_reduction", "mean")
-        ).strip().lower()
-        # PLAN.md P0.1: segment_token_reduction must be exactly `mean` or `sum`.
-        if segment_reduction not in ("mean", "sum"):
-            raise ValueError(
-                "tree_policy.segment_token_reduction must be exactly 'mean' or "
-                f"'sum' (PLAN.md P0.1); got {segment_reduction!r}."
-            )
-        # PLAN.md P0.1: `tree_policy.segment_token_reduction` and
-        # `actor.policy_loss.segment_token_reduction` are duplicates that MUST
-        # agree, otherwise the actor loss silently reads a different reduction
-        # than the manifest/logs advertise.
-        actor_reduction = str(
-            self.config.actor_rollout_ref.actor.policy_loss.get(
-                "segment_token_reduction", "mean"
-            )
-        ).strip().lower()
-        if actor_reduction not in ("mean", "sum"):
-            raise ValueError(
-                "actor_rollout_ref.actor.policy_loss.segment_token_reduction "
-                f"must be exactly 'mean' or 'sum' (PLAN.md P0.1); got "
-                f"{actor_reduction!r}."
-            )
-        if actor_reduction != segment_reduction:
-            raise ValueError(
-                "tree_policy.segment_token_reduction "
-                f"({segment_reduction!r}) must equal "
-                "actor_rollout_ref.actor.policy_loss.segment_token_reduction "
-                f"({actor_reduction!r}) (PLAN.md P0.1)."
-            )
-        if strict:
-            if tree_update_mode in {"treepo_original", "treerl_original"}:
-                raise ValueError(
-                    "strict VDRA main runs must not use the deprecated "
-                    "tree_update_mode aliases (PLAN.md P1.R7); rename to "
-                    "'*_style_ablation' or set strict_vdra=false."
-                )
-            if (
-                policy_agg == "vdra_node_balanced"
-                and tree_update_mode
-                in {"treepo_style_ablation", "treerl_style_ablation"}
-            ):
-                raise ValueError(
-                    "The style-ablation tree_update_modes are not main-paper "
-                    "advantage estimators (PLAN.md P1.R7)."
-                )
-            # PLAN.md P0.1: the canonical main policy_aggregation is
-            # global_segment_mean, which requires vdra_segment_mean_ppo. The
-            # legacy vdra_node_balanced_ppo must not appear in the strict main
-            # config; keep it available only when strict_vdra=false (ablation).
-            if policy_agg == "global_segment_mean" and actor_loss_mode != "vdra_segment_mean_ppo":
-                raise ValueError(
-                    "tree_policy.policy_aggregation=global_segment_mean requires "
-                    "actor_rollout_ref.actor.policy_loss.loss_mode=vdra_segment_mean_ppo "
-                    f"(PLAN.md P0.1); got {actor_loss_mode!r}."
-                )
-            if actor_loss_mode == "vdra_node_balanced_ppo" and policy_agg != "vdra_node_balanced":
-                raise ValueError(
-                    "loss_mode=vdra_node_balanced_ppo is only valid when "
-                    "tree_policy.policy_aggregation=vdra_node_balanced "
-                    "(labeled ablation, PLAN.md P0.1)."
-                )
+        # PLAN.md M5: the cross-level tree_policy <-> actor.policy_loss
+        # validation lives in config_validation.validate_policy_loss_consistency
+        # so the pre-GPU Hydra gate runs the exact same code.
+        validate_policy_loss_consistency(self.config, gear_tree_cfg=gt)
 
     def _should_postpone_sampled_update(self, sampled_edges: List[Dict[str, Any]]) -> bool:
+        """PLAN.md P0.D: enforce exact optimizer-batch cardinality.
+
+        The sampler must never return more than
+        ``target_edges_per_iteration`` — exceeding it is a sampler bug and
+        raises. In canonical mode (``postpone_until_divisible``) any selected
+        count not divisible by ``ppo_mini_batch_size`` is postponed, whether
+        under- or over-filled, so no tail optimizer batch can ever form.
+        """
         replay_cfg = self._replay_config()
-        policy = replay_cfg.get("underfilled_update_policy", "postpone_until_divisible")
-        if policy == "use_available":
-            return False
-        if policy != "postpone_until_divisible":
-            raise ValueError(f"Unknown underfilled_update_policy: {policy!r}")
-        if not sampled_edges:
-            return False
-        ppo_mini = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
-        target = int(replay_cfg["target_edges_per_iteration"])
-        return len(sampled_edges) < target and len(sampled_edges) % ppo_mini != 0
+        return should_postpone_sampled_update(
+            selected_count=len(sampled_edges),
+            target_edges_per_iteration=int(
+                replay_cfg["target_edges_per_iteration"]
+            ),
+            ppo_mini_batch_size=int(
+                self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+            ),
+            underfilled_update_policy=str(
+                replay_cfg.get(
+                    "underfilled_update_policy", "postpone_until_divisible"
+                )
+            ),
+        )
 
     def _fetch_rollout_server_weight_version(self, gear_cfg: Dict[str, Any]) -> str | None:
         """PLAN.md P0.5: delegate to :func:`scorer_verification.fetch_rollout_weight_version`
@@ -383,70 +419,57 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 "so raw generation-time log-probability edges are available."
             )
 
-        from recipe.gear_tree.async_tree_rollout import collect_tree_edges
+        from recipe.gear_tree.async_tree_rollout import (
+            collect_tree_construction_summaries,
+            collect_tree_edges,
+        )
 
         rollout_out = self.actor_rollout_wg.generate_sequences(gen_batch)
         edges = collect_tree_edges(rollout_out)
+        # Zero-filter contract: per-tree construction summaries preserve the
+        # realized/allocated facts of parents (or whole trees) whose retained
+        # edge set is empty because every child had exactly zero advantage.
+        self._last_construction_summaries = collect_tree_construction_summaries(
+            rollout_out
+        )
         return self._normalize_generated_edges(edges, snapshot_id=snapshot_id)
 
     def _normalize_generated_edges(
         self, edges: List[Dict[str, Any]], *, snapshot_id: str
     ) -> List[Dict[str, Any]]:
-        import hashlib
+        """PLAN.md P0.H: delegate to the production normalizer. Strict main
+        runs require make_tree_instance_id-derived identities and refuse the
+        legacy fallback chains."""
+        from recipe.gear_tree.tree_data import normalize_generated_edges
 
-        normalized: List[Dict[str, Any]] = []
-        for idx, edge in enumerate(edges):
-            record = dict(edge)
-            # PLAN.md P0.2: derive the edge_id from the unique tree_instance_id
-            # + parent_group_id + child_segment_id so two rollouts for the
-            # same (question, snapshot) tuple never produce the same edge_id.
-            # Falls back to legacy fields to keep old fixtures/tests working.
-            tree_id = (
-                record.get("tree_id")
-                or record.get("tree_instance_id")
-                or record.get("gear_segment_id", "")
+        strict = bool(
+            (self.config.get("tree_policy") or {}).get(
+                "strict_group_integrity", False
             )
-            parent_group = (
-                record.get("parent_group_id")
-                or record.get("parent_path")
-                or record.get("gear_parent_segment_id", "")
-            )
-            child_seg = (
-                record.get("child_segment_id")
-                or record.get("gear_segment_id")
-                or str(record.get("child_index", idx))
-            )
-            qid = record.get("question_id", "")
-            key = f"{snapshot_id}|{qid}|{tree_id}|{parent_group}|{child_seg}"
-            digest = hashlib.blake2b(key.encode("utf-8"), digest_size=16).hexdigest()
-            record.setdefault("edge_id", f"{snapshot_id}:{digest}")
-            record.setdefault("policy_snapshot_id", snapshot_id)
-            if record["policy_snapshot_id"] != snapshot_id:
-                raise ValueError("Generated edge policy_snapshot_id mismatches rollout snapshot")
-            response = list(record.get("response_token_ids") or [])
-            log_probs = record.get("actor_shifted_log_probs")
-            if log_probs is None:
-                raise ValueError("Generated edge is missing generation-time actor_shifted_log_probs")
-            if len(log_probs) != len(response):
-                raise ValueError("Generated edge log-probs do not align with response tokens")
-            record.setdefault("depth", int(record.get("depth", 0) or 0))
-            record.setdefault("leaf", bool(record.get("leaf", False)))
-            record.setdefault("pruned", bool(record.get("pruned", False)))
-            record.setdefault("tree_update_mode", record.get("tree_update_mode", "spo"))
-            normalized.append(record)
-        return normalized
+        )
+        return normalize_generated_edges(
+            edges, snapshot_id=snapshot_id, strict=strict
+        )
 
     def _edges_to_update_batch(self, sampled_edges: List[Dict[str, Any]], metrics: Dict[str, Any]) -> DataProto:
         from recipe.gear_tree.tree_data import edges_to_dataproto
 
         # P0.2: use the same L_edge_max the startup validator resolved so a
         # config that clears validation cannot then fail here on a deep edge.
+        # PLAN.md P0.C: the configured loss mode decides whether the float
+        # objective-weight tensors are attached (node-balanced ablation only).
+        loss_mode = str(
+            self.config.actor_rollout_ref.actor.policy_loss.get(
+                "loss_mode", "vdra_segment_mean_ppo"
+            )
+        )
         edge_batch = edges_to_dataproto(
             sampled_edges,
             self.tokenizer,
             max_prompt_length=self._resolved_max_edge_prompt_length(),
             max_response_length=self.config.data.max_response_length,
             include_old_log_probs=True,
+            loss_mode=loss_mode,
         )
         if self.config.trainer.get("balance_batch", False):
             self._balance_batch(edge_batch, metrics=metrics)
@@ -587,14 +610,255 @@ class RayGearTreeTrainer(RayPPOTrainer):
         os.makedirs(self.config.trainer.default_local_dir, exist_ok=True)
         manifest.save(self._manifest_path())
 
-    def _update_manifest_from_edges(
+    def _update_manifest_from_generated_edges(
+        self,
+        manifest: RunManifest,
+        generated_edges: List[Dict[str, Any]],
+        *,
+        strict: bool,
+        construction_summaries: List[Dict[str, Any]] | None = None,
+    ) -> Dict[str, Any]:
+        """PLAN.md P0.B: construction-stage validation of the COMPLETE
+        generated batch, before replay insertion. ``construction_summaries``
+        carry the pre-filter facts of parents/trees whose every child was
+        zero-filtered away (they have no rows in ``generated_edges``)."""
+        return update_manifest_from_generated_edges(
+            manifest,
+            generated_edges,
+            strict=strict,
+            construction_summaries=construction_summaries,
+        )
+
+    def _update_manifest_from_replay_batch(
         self,
         manifest: RunManifest,
         sampled_edges: List[Dict[str, Any]],
         *,
         strict: bool,
     ) -> Dict[str, Any]:
-        return update_manifest_from_edges(manifest, sampled_edges, strict=strict)
+        """PLAN.md P0.B: row-local validation of the sampled replay batch.
+        Partial trees/parent groups are legal here by design."""
+        replay_buffer = getattr(self, "replay_buffer", None)
+        kwargs: Dict[str, Any] = {}
+        if replay_buffer is not None:
+            kwargs = {
+                "target_edges_per_iteration": int(
+                    replay_buffer.target_edges_per_iteration
+                ),
+                "max_edge_age_iterations": int(
+                    replay_buffer.max_edge_age_iterations
+                ),
+                "current_rollout_iteration": int(self.rollout_iteration),
+            }
+            # PLAN.md P0.A/P0.B: the per-question cap is an EDGE-sampler
+            # contract. The complete_tree ablation packs whole trees and may
+            # legitimately exceed it for a single-tree question, so the cap
+            # is only asserted on the canonical edge path.
+            if str(replay_buffer.replay_sampling_unit) == "edge":
+                kwargs["max_edges_per_question_per_iteration"] = int(
+                    replay_buffer.resolved_max_edges_per_question_per_iteration
+                )
+        return update_manifest_from_replay_batch(
+            manifest, sampled_edges, strict=strict, **kwargs
+        )
+
+    def _execute_reserved_actor_update(
+        self,
+        replay_buffer,
+        reservation,
+        sampled_edges: List[Dict[str, Any]],
+        metrics: Dict[str, Any],
+        *,
+        manifest_strict: bool,
+    ):
+        """PLAN.md M2: transaction stages for a reserved replay batch.
+
+        validation failure     -> rollback reservation, no counter mutation
+        tensorization failure  -> rollback reservation, no counter mutation
+        actor RPC exception    -> rollback reservation, failed_updates += 1
+        actor RPC success      -> return; commit + outer counters stay in fit()
+
+        An actor RPC may mutate model parameters before raising; replay
+        rollback only restores buffer state and never claims to undo a model
+        update.
+        """
+        try:
+            # PLAN.md P0.B: sampled replay batches get ROW-LOCAL checks only
+            # (edge-level replay legally splits trees and parent groups). Run
+            # BEFORE tensorization and actor update so a broken reservation
+            # cannot be converted into model inputs.
+            replay_batch_metrics = self._update_manifest_from_replay_batch(
+                self.run_manifest, sampled_edges, strict=manifest_strict
+            )
+            metrics.update(replay_batch_metrics)
+            edge_batch = self._edges_to_update_batch(sampled_edges, metrics)
+        except Exception:
+            replay_buffer.rollback(reservation)
+            raise
+        # PLAN.md P0.J: strict tensorization refuses truncation with a
+        # ValueError, so REACHING this line is the observed no-truncation
+        # event for this batch.
+        self.run_manifest.no_truncation = True
+        self.run_manifest.extras["no_truncation"] = True
+
+        t0 = time.time()
+        # P0.9: RayGearTreeTrainer never trains a critic, so there is no
+        # critic warmup to gate the actor update on. Always update.
+        try:
+            actor_output = self.actor_rollout_wg.update_actor(edge_batch)
+        except Exception:
+            replay_buffer.rollback(reservation)
+            self.failed_updates += 1
+            raise
+        return edge_batch, actor_output, time.time() - t0
+
+    @staticmethod
+    def _flatten_int_list(x) -> List[int]:
+        out: List[int] = []
+        if x is None:
+            return out
+        if isinstance(x, (list, tuple)):
+            for item in x:
+                out.extend(RayGearTreeTrainer._flatten_int_list(item))
+        else:
+            try:
+                out.append(int(x))
+            except Exception:
+                pass
+        return out
+
+    def _finalize_successful_actor_update(
+        self,
+        replay_buffer,
+        reservation,
+        actor_output,
+        sampled_edges: List[Dict[str, Any]],
+        sample_stats: Dict[str, Any],
+        metrics: Dict[str, Any],
+    ) -> None:
+        """PLAN.md M2 (item 3): commit + outer counters, then diagnostics.
+
+        Once ``update_actor`` returns successfully the model may already have
+        changed, so the reservation commit and the OUTER-update counters
+        (``successful_actor_updates``, ``global_step``) are secured
+        UNCONDITIONALLY first. Only afterwards are the DIAGNOSTIC actor
+        metrics parsed. A missing or malformed ``meta_info["metrics"]`` must
+        NOT rollback replay and must NOT undo the outer update — it only marks
+        ``optimizer_step_accounting_valid`` invalid and logs a diagnostic
+        failure. ``num_optimizer_steps_total`` is a diagnostic and advances
+        only when parsing succeeds.
+        """
+        removed = replay_buffer.commit(reservation)
+        metrics["buffer/removed_edges"] = float(len(removed))
+        metrics["buffer/size_after"] = float(len(replay_buffer))
+        self.successful_actor_updates += 1
+        # PLAN.md M1 three-counter contract: global_step advances by 1 per
+        # successful outer update_actor call (the host VERL
+        # loop/checkpoint/save/eval unit). The internal PPO optimizer-batch
+        # count accumulates separately below as an observational diagnostic.
+        self.global_steps += 1
+        metrics["training/successful_actor_updates"] = float(
+            self.successful_actor_updates
+        )
+
+        metrics_parse_ok = True
+        n_optim_steps = 0
+        actor_used_stored_old_log_probs = False
+        try:
+            meta_info = getattr(actor_output, "meta_info", None)
+            if not isinstance(meta_info, Mapping) or "metrics" not in meta_info:
+                raise KeyError("actor_output.meta_info has no 'metrics' mapping")
+            actor_metrics_meta = meta_info["metrics"]
+            if not isinstance(actor_metrics_meta, Mapping):
+                raise TypeError(
+                    "actor meta_info['metrics'] is "
+                    f"{type(actor_metrics_meta).__name__}, expected a mapping"
+                )
+            step_ints = self._flatten_int_list(
+                actor_metrics_meta.get("actor/num_optimizer_steps", None)
+            )
+            n_optim_steps = max(step_ints) if step_ints else 1
+            # PLAN.md P0.J: OBSERVED stored-old-log-prob use, reported by the
+            # actor itself. The manifest bit flips only from this metric —
+            # never from tensor presence alone.
+            used_stored_ints = self._flatten_int_list(
+                actor_metrics_meta.get("actor/used_stored_old_log_probs")
+            )
+            actor_used_stored_old_log_probs = bool(
+                used_stored_ints and min(used_stored_ints) >= 1
+            )
+            metrics.update(reduce_metrics(actor_metrics_meta))
+        except Exception as exc:  # diagnostic-only: never fatal here
+            metrics_parse_ok = False
+            metrics["vdra/actor_metrics_parse_failed"] = 1.0
+            _LOGGER.warning(
+                "actor update succeeded but its diagnostic metrics could not "
+                "be parsed (%s); committing the outer update and marking "
+                "optimizer-step accounting invalid.",
+                exc,
+            )
+
+        if metrics_parse_ok:
+            self.optimizer_steps_this_iteration = int(n_optim_steps)
+            self.num_optimizer_steps_total += int(n_optim_steps)
+        else:
+            # The outer update stands; only the internal step count is unknown.
+            self.optimizer_steps_this_iteration = 0
+
+        # PLAN.md P0.J: manifest bit only from the actor-observed metric —
+        # never inferred from tensor presence.
+        if actor_used_stored_old_log_probs:
+            self.run_manifest.stored_old_log_probs_used = True
+            self.run_manifest.extras["stored_old_log_probs_used"] = True
+        # PLAN.md P0.J: at least one successful update with no integrity
+        # failures flips ONLY the invariant bit matching the configured loss
+        # mode — segment-mean and node-balanced are different claims.
+        if self.run_manifest.group_integrity_failures == 0:
+            loss_mode = str(
+                self.config.actor_rollout_ref.actor.policy_loss.get(
+                    "loss_mode", "vdra_segment_mean_ppo"
+                )
+            )
+            if loss_mode == "vdra_node_balanced_ppo":
+                self.run_manifest.record_node_balanced_invariant_pass()
+            else:
+                self.run_manifest.record_segment_invariant_pass()
+        # PLAN.md P0.7: stamp observed counters + replay diagnostics.
+        self._record_iteration_on_manifest(
+            selected_edges=len(sampled_edges),
+            sample_stats=sample_stats,
+            actual_optimizer_steps=int(n_optim_steps),
+        )
+        # PLAN.md M2/M4: the internal optimizer-step count is a DIAGNOSTIC,
+        # not the outer training unit. A parse failure or a count/expected
+        # mismatch marks ``optimizer_step_accounting_valid`` invalid but never
+        # crashes a run whose actor already updated the model.
+        if not metrics_parse_ok:
+            self.run_manifest.optimizer_step_accounting_valid = False
+            return
+        ppo_mini = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
+        ppo_epochs = int(self.config.actor_rollout_ref.actor.get("ppo_epochs", 1))
+        if len(sampled_edges) % ppo_mini == 0:
+            expected_steps = expected_optimizer_steps(
+                selected_count=len(sampled_edges),
+                ppo_mini_batch_size=ppo_mini,
+                ppo_epochs=ppo_epochs,
+            )
+            metrics["training/optimizer_steps_expected"] = float(expected_steps)
+            if int(n_optim_steps) != expected_steps:
+                self.run_manifest.optimizer_step_accounting_valid = False
+                metrics["vdra/optimizer_step_accounting_mismatch"] = 1.0
+                _LOGGER.warning(
+                    "actor performed %d optimizer steps but %d were expected "
+                    "for %d selected edges / ppo_mini_batch_size=%d, "
+                    "ppo_epochs=%d; marking optimizer-step accounting invalid "
+                    "(diagnostic).",
+                    int(n_optim_steps),
+                    expected_steps,
+                    len(sampled_edges),
+                    ppo_mini,
+                    ppo_epochs,
+                )
 
     def fit(self):
         from omegaconf import OmegaConf
@@ -612,9 +876,8 @@ class RayGearTreeTrainer(RayPPOTrainer):
         self.successful_actor_updates = 0
         self.postponed_updates = 0
         self.failed_updates = 0
-        # PLAN.md P0.3: separate counters for rollout iteration vs true
-        # optimizer.step() calls. `global_steps` is bumped by the actual
-        # optimizer-step count returned by update_actor, never by 1 per call.
+        # PLAN.md M1: keep rollout iteration, outer global_step, and
+        # internal optimizer-step diagnostics as distinct counters.
         self.optimizer_steps_this_iteration = 0
         self.num_optimizer_steps_total = 0
         self._load_checkpoint()
@@ -629,6 +892,11 @@ class RayGearTreeTrainer(RayPPOTrainer):
             (self.config.get("tree_policy") or {}).get(
                 "strict_group_integrity", False
             )
+        )
+        # PLAN.md P0.A: the reservation path is selected by the configured
+        # sampling unit ONLY. Strictness controls validation, never sampling.
+        replay_sampling_unit = str(
+            self._replay_config().get("replay_sampling_unit", "edge")
         )
 
         os.makedirs(self.config.trainer.default_local_dir, exist_ok=True)
@@ -645,6 +913,11 @@ class RayGearTreeTrainer(RayPPOTrainer):
 
         test_freq = self.config.trainer.get("test_freq", -1)
         save_freq = self.config.trainer.get("save_freq", -1)
+        # PLAN.md P0.E: save/eval fire on CROSSED thresholds, never on
+        # modulo. Derived from the (possibly restored) global_steps so resume
+        # never re-fires an already-passed threshold.
+        self.next_eval_step = initial_next_threshold(self.global_steps, test_freq)
+        self.next_save_step = initial_next_threshold(self.global_steps, save_freq)
 
         while self.global_steps < self.total_training_steps:
             for batch_dict in self.train_dataloader:
@@ -655,6 +928,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 # postponed / failed iterations do not carry the previous
                 # iteration's count forward.
                 self.optimizer_steps_this_iteration = 0
+                # PLAN.md P0.E: pre-update value for threshold crossing and
+                # unambiguous before/after logging.
+                global_step_before_update = int(self.global_steps)
                 metrics: Dict[str, Any] = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 gen_batch = self._get_gen_batch(batch)
@@ -662,6 +938,23 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 t0 = time.time()
                 new_edges = self._generate_tree_edges(gen_batch)
                 t_gen = time.time() - t0
+                # PLAN.md P0.B: full-tree CONSTRUCTION validation runs on the
+                # complete generated batch, before replay insertion. This is
+                # the only stage that may require complete parent groups and
+                # full-tree queue identities.
+                construction_summaries = list(
+                    getattr(self, "_last_construction_summaries", []) or []
+                )
+                if new_edges or construction_summaries:
+                    construction_metrics = (
+                        self._update_manifest_from_generated_edges(
+                            self.run_manifest,
+                            new_edges,
+                            strict=manifest_strict,
+                            construction_summaries=construction_summaries,
+                        )
+                    )
+                    metrics.update(construction_metrics)
                 # PLAN.md P0.2: replay age is stamped in rollout iterations,
                 # not optimizer steps. `self.rollout_iteration` has already been
                 # incremented for this iteration above.
@@ -670,23 +963,27 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     generation_rollout_iteration=self.rollout_iteration,
                     policy_snapshot_id=self._current_policy_snapshot_id(),
                 )
-                # PLAN.md P0.2: edge-level replay is canonical. Complete-tree
-                # replay remains available for the SPO baseline ablation only.
-                if manifest_strict:
-                    reservation = replay_buffer.reserve_complete_trees_for_update(
-                        current_rollout_iteration=self.rollout_iteration
-                    )
-                else:
-                    reservation = replay_buffer.reserve_for_update(
-                        current_rollout_iteration=self.rollout_iteration
-                    )
+                # PLAN.md P0.A: canonical strict main uses EDGE-level
+                # reservation. Complete-tree replay is reachable only via the
+                # explicit `replay_sampling_unit: complete_tree` ablation and
+                # is never selected by strict_group_integrity.
+                reservation = reserve_replay_edges(
+                    replay_buffer,
+                    replay_sampling_unit=replay_sampling_unit,
+                    current_rollout_iteration=self.rollout_iteration,
+                )
                 sampled_edges = [dict(edge) for edge in reservation.edges]
                 sample_stats = reservation.stats
                 metrics.update({k: v for k, v in sample_stats.items() if k != "removed_edge_ids"})
                 metrics["buffer/new_edges"] = len(new_edges)
                 metrics["buffer/postponed_update"] = 0.0
                 metrics["training/rollout_iteration"] = float(self.rollout_iteration)
-                metrics["training/optimizer_step"] = float(self.global_steps)
+                # PLAN.md P0.E: never log a pre-update value under an
+                # ambiguous name; the final training/global_step is always the
+                # post-update value set in the timing block below.
+                metrics["training/global_step_before_update"] = float(
+                    global_step_before_update
+                )
                 metrics["training/successful_actor_updates"] = float(self.successful_actor_updates)
                 if not sampled_edges:
                     logger.log(data=metrics, step=self.global_steps)
@@ -700,75 +997,30 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     logger.log(data=metrics, step=self.global_steps)
                     continue
 
-                edge_batch = self._edges_to_update_batch(sampled_edges, metrics)
-
-                # PLAN.md P0.N7/N8: run group-integrity checks + metrics BEFORE
-                # the actor step so a broken reservation cannot corrupt state.
-                integrity_metrics = self._update_manifest_from_edges(
-                    self.run_manifest, sampled_edges, strict=manifest_strict
-                )
-                metrics.update(integrity_metrics)
-
-                t0 = time.time()
-                # P0.9: RayGearTreeTrainer never trains a critic, so there is
-                # no critic warmup to gate the actor update on. Always update.
-                try:
-                    actor_output = self.actor_rollout_wg.update_actor(edge_batch)
-                except Exception:
-                    replay_buffer.rollback(reservation)
-                    self.failed_updates += 1
-                    raise
-                actor_updated = True
-                actor_metrics_meta = actor_output.meta_info["metrics"]
-                # PLAN.md P0.3: extract the true optimizer.step() count BEFORE
-                # `reduce_metrics` mangles the per-worker list. Fall back to 1
-                # for legacy loss modes that still perform one step per call.
-                raw_step_counts = actor_metrics_meta.get(
-                    "actor/num_optimizer_steps", None
-                )
-
-                def _flatten_int_list(x):
-                    out: List[int] = []
-                    if x is None:
-                        return out
-                    if isinstance(x, (list, tuple)):
-                        for item in x:
-                            out.extend(_flatten_int_list(item))
-                    else:
-                        try:
-                            out.append(int(x))
-                        except Exception:
-                            pass
-                    return out
-
-                step_ints = _flatten_int_list(raw_step_counts)
-                n_optim_steps = max(step_ints) if step_ints else 1
-                metrics.update(reduce_metrics(actor_metrics_meta))
-                if actor_updated:
-                    removed = replay_buffer.commit(reservation)
-                    metrics["buffer/removed_edges"] = float(len(removed))
-                    metrics["buffer/size_after"] = float(len(replay_buffer))
-                    self.successful_actor_updates += 1
-                    # PLAN.md P0.3: `global_step` counts real optimizer.step()
-                    # calls; one update_actor may perform several. Bump by the
-                    # returned count so 512 selected edges + mini_batch=128
-                    # advance global_step by 4 in one iteration.
-                    self.optimizer_steps_this_iteration = int(n_optim_steps)
-                    self.global_steps += int(n_optim_steps)
-                    self.num_optimizer_steps_total = self.global_steps
-                    # PLAN.md P0.N8: at least one successful update with no
-                    # integrity failures flips the invariants-passed bit on.
-                    if self.run_manifest.group_integrity_failures == 0:
-                        self.run_manifest.record_invariant_pass()
-                    # PLAN.md P0.7: stamp observed counters + replay
-                    # diagnostics on the manifest.
-                    self._record_iteration_on_manifest(
-                        selected_edges=len(sampled_edges),
-                        sample_stats=sample_stats,
-                        actual_optimizer_steps=int(n_optim_steps),
+                # PLAN.md M2: validation, tensorization, and the actor RPC run
+                # inside one transaction helper — any failure before a
+                # successful RPC rolls the reservation back.
+                edge_batch, actor_output, t_update = (
+                    self._execute_reserved_actor_update(
+                        replay_buffer,
+                        reservation,
+                        sampled_edges,
+                        metrics,
+                        manifest_strict=manifest_strict,
                     )
-                t_update = time.time() - t0
-
+                )
+                actor_updated = True
+                # PLAN.md M2 (item 3): commit + outer counters are secured
+                # unconditionally on actor success; the diagnostic actor
+                # metrics are parsed afterwards and can never revert them.
+                self._finalize_successful_actor_update(
+                    replay_buffer,
+                    reservation,
+                    actor_output,
+                    sampled_edges,
+                    sample_stats,
+                    metrics,
+                )
                 response_tokens = edge_batch.batch["response_mask"].sum().item()
                 # PLAN.md P0.2: age uses rollout_iteration (never global_step).
                 ages = [
@@ -792,7 +1044,6 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 timing = {
                     "step": self.global_steps,
                     "rollout_iteration": self.rollout_iteration,
-                    "optimizer_step": self.global_steps,
                     "timing/generation_seconds": t_gen,
                     "timing/update_seconds": t_update,
                     "timing/train_total_seconds": t_gen + t_update,
@@ -804,6 +1055,12 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     "train/mean_edge_age": float(sum(ages) / len(ages) if ages else 0.0),
                     "train/max_edge_age": float(max(ages) if ages else 0),
                     "training/rollout_iteration": float(self.rollout_iteration),
+                    # PLAN.md P0.E: one unambiguous final global_step (the
+                    # post-update value) plus explicit before/after keys.
+                    "training/global_step_before_update": float(
+                        global_step_before_update
+                    ),
+                    "training/global_step_after_update": float(self.global_steps),
                     "training/global_step": float(self.global_steps),
                     "training/optimizer_steps_this_iteration": float(
                         self.optimizer_steps_this_iteration
@@ -839,16 +1096,31 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 logger.log(data=metrics, step=self.global_steps)
 
                 is_last_step = self.global_steps >= self.total_training_steps
+                # PLAN.md P0.E: a jump like 8 -> 12 must still fire the
+                # step-10 save/eval. Fire once when any threshold was crossed
+                # and advance the counter past every crossed threshold.
+                eval_crossed, self.next_eval_step = advance_past_thresholds(
+                    previous_step=global_step_before_update,
+                    current_step=self.global_steps,
+                    next_threshold=self.next_eval_step,
+                    freq=test_freq,
+                )
                 if (
                     test_freq > 0
-                    and (self.global_steps % test_freq == 0 or is_last_step)
+                    and (eval_crossed > 0 or is_last_step)
                     and self.val_reward_fn is not None
                 ):
                     val_metrics = self._validate()
                     if val_metrics:
                         logger.log(data=val_metrics, step=self.global_steps)
 
-                if save_freq > 0 and (self.global_steps % save_freq == 0 or is_last_step):
+                save_crossed, self.next_save_step = advance_past_thresholds(
+                    previous_step=global_step_before_update,
+                    current_step=self.global_steps,
+                    next_threshold=self.next_save_step,
+                    freq=save_freq,
+                )
+                if save_freq > 0 and (save_crossed > 0 or is_last_step):
                     self._save_checkpoint()
                     replay_metrics = self._maybe_save_replay_buffer()
                     logger.log(data=replay_metrics, step=self.global_steps)
