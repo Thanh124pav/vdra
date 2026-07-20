@@ -9,6 +9,7 @@ sampled edges to the actor update.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import uuid
@@ -16,6 +17,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
 import numpy as np
+
+_LOGGER = logging.getLogger(__name__)
 
 from verl import DataProto
 from verl.trainer.ppo.metric_utils import reduce_metrics
@@ -709,6 +712,154 @@ class RayGearTreeTrainer(RayPPOTrainer):
             raise
         return edge_batch, actor_output, time.time() - t0
 
+    @staticmethod
+    def _flatten_int_list(x) -> List[int]:
+        out: List[int] = []
+        if x is None:
+            return out
+        if isinstance(x, (list, tuple)):
+            for item in x:
+                out.extend(RayGearTreeTrainer._flatten_int_list(item))
+        else:
+            try:
+                out.append(int(x))
+            except Exception:
+                pass
+        return out
+
+    def _finalize_successful_actor_update(
+        self,
+        replay_buffer,
+        reservation,
+        actor_output,
+        sampled_edges: List[Dict[str, Any]],
+        sample_stats: Dict[str, Any],
+        metrics: Dict[str, Any],
+    ) -> None:
+        """PLAN.md M2 (item 3): commit + outer counters, then diagnostics.
+
+        Once ``update_actor`` returns successfully the model may already have
+        changed, so the reservation commit and the OUTER-update counters
+        (``successful_actor_updates``, ``global_step``) are secured
+        UNCONDITIONALLY first. Only afterwards are the DIAGNOSTIC actor
+        metrics parsed. A missing or malformed ``meta_info["metrics"]`` must
+        NOT rollback replay and must NOT undo the outer update — it only marks
+        ``optimizer_step_accounting_valid`` invalid and logs a diagnostic
+        failure. ``num_optimizer_steps_total`` is a diagnostic and advances
+        only when parsing succeeds.
+        """
+        removed = replay_buffer.commit(reservation)
+        metrics["buffer/removed_edges"] = float(len(removed))
+        metrics["buffer/size_after"] = float(len(replay_buffer))
+        self.successful_actor_updates += 1
+        # PLAN.md M1 three-counter contract: global_step advances by 1 per
+        # successful outer update_actor call (the host VERL
+        # loop/checkpoint/save/eval unit). The internal PPO optimizer-batch
+        # count accumulates separately below as an observational diagnostic.
+        self.global_steps += 1
+        metrics["training/successful_actor_updates"] = float(
+            self.successful_actor_updates
+        )
+
+        metrics_parse_ok = True
+        n_optim_steps = 0
+        actor_used_stored_old_log_probs = False
+        try:
+            meta_info = getattr(actor_output, "meta_info", None)
+            if not isinstance(meta_info, Mapping) or "metrics" not in meta_info:
+                raise KeyError("actor_output.meta_info has no 'metrics' mapping")
+            actor_metrics_meta = meta_info["metrics"]
+            if not isinstance(actor_metrics_meta, Mapping):
+                raise TypeError(
+                    "actor meta_info['metrics'] is "
+                    f"{type(actor_metrics_meta).__name__}, expected a mapping"
+                )
+            step_ints = self._flatten_int_list(
+                actor_metrics_meta.get("actor/num_optimizer_steps", None)
+            )
+            n_optim_steps = max(step_ints) if step_ints else 1
+            # PLAN.md P0.J: OBSERVED stored-old-log-prob use, reported by the
+            # actor itself. The manifest bit flips only from this metric —
+            # never from tensor presence alone.
+            used_stored_ints = self._flatten_int_list(
+                actor_metrics_meta.get("actor/used_stored_old_log_probs")
+            )
+            actor_used_stored_old_log_probs = bool(
+                used_stored_ints and min(used_stored_ints) >= 1
+            )
+            metrics.update(reduce_metrics(actor_metrics_meta))
+        except Exception as exc:  # diagnostic-only: never fatal here
+            metrics_parse_ok = False
+            metrics["vdra/actor_metrics_parse_failed"] = 1.0
+            _LOGGER.warning(
+                "actor update succeeded but its diagnostic metrics could not "
+                "be parsed (%s); committing the outer update and marking "
+                "optimizer-step accounting invalid.",
+                exc,
+            )
+
+        if metrics_parse_ok:
+            self.optimizer_steps_this_iteration = int(n_optim_steps)
+            self.num_optimizer_steps_total += int(n_optim_steps)
+        else:
+            # The outer update stands; only the internal step count is unknown.
+            self.optimizer_steps_this_iteration = 0
+
+        # PLAN.md P0.J: manifest bit only from the actor-observed metric —
+        # never inferred from tensor presence.
+        if actor_used_stored_old_log_probs:
+            self.run_manifest.stored_old_log_probs_used = True
+            self.run_manifest.extras["stored_old_log_probs_used"] = True
+        # PLAN.md P0.J: at least one successful update with no integrity
+        # failures flips ONLY the invariant bit matching the configured loss
+        # mode — segment-mean and node-balanced are different claims.
+        if self.run_manifest.group_integrity_failures == 0:
+            loss_mode = str(
+                self.config.actor_rollout_ref.actor.policy_loss.get(
+                    "loss_mode", "vdra_segment_mean_ppo"
+                )
+            )
+            if loss_mode == "vdra_node_balanced_ppo":
+                self.run_manifest.record_node_balanced_invariant_pass()
+            else:
+                self.run_manifest.record_segment_invariant_pass()
+        # PLAN.md P0.7: stamp observed counters + replay diagnostics.
+        self._record_iteration_on_manifest(
+            selected_edges=len(sampled_edges),
+            sample_stats=sample_stats,
+            actual_optimizer_steps=int(n_optim_steps),
+        )
+        # PLAN.md M2/M4: the internal optimizer-step count is a DIAGNOSTIC,
+        # not the outer training unit. A parse failure or a count/expected
+        # mismatch marks ``optimizer_step_accounting_valid`` invalid but never
+        # crashes a run whose actor already updated the model.
+        if not metrics_parse_ok:
+            self.run_manifest.optimizer_step_accounting_valid = False
+            return
+        ppo_mini = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
+        ppo_epochs = int(self.config.actor_rollout_ref.actor.get("ppo_epochs", 1))
+        if len(sampled_edges) % ppo_mini == 0:
+            expected_steps = expected_optimizer_steps(
+                selected_count=len(sampled_edges),
+                ppo_mini_batch_size=ppo_mini,
+                ppo_epochs=ppo_epochs,
+            )
+            metrics["training/optimizer_steps_expected"] = float(expected_steps)
+            if int(n_optim_steps) != expected_steps:
+                self.run_manifest.optimizer_step_accounting_valid = False
+                metrics["vdra/optimizer_step_accounting_mismatch"] = 1.0
+                _LOGGER.warning(
+                    "actor performed %d optimizer steps but %d were expected "
+                    "for %d selected edges / ppo_mini_batch_size=%d, "
+                    "ppo_epochs=%d; marking optimizer-step accounting invalid "
+                    "(diagnostic).",
+                    int(n_optim_steps),
+                    expected_steps,
+                    len(sampled_edges),
+                    ppo_mini,
+                    ppo_epochs,
+                )
+
     def fit(self):
         from omegaconf import OmegaConf
         from verl.utils.tracking import Tracking
@@ -859,105 +1010,17 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     )
                 )
                 actor_updated = True
-                actor_metrics_meta = actor_output.meta_info["metrics"]
-                # PLAN.md P0.3: extract the true optimizer.step() count BEFORE
-                # `reduce_metrics` mangles the per-worker list. Fall back to 1
-                # for legacy loss modes that still perform one step per call.
-                raw_step_counts = actor_metrics_meta.get(
-                    "actor/num_optimizer_steps", None
+                # PLAN.md M2 (item 3): commit + outer counters are secured
+                # unconditionally on actor success; the diagnostic actor
+                # metrics are parsed afterwards and can never revert them.
+                self._finalize_successful_actor_update(
+                    replay_buffer,
+                    reservation,
+                    actor_output,
+                    sampled_edges,
+                    sample_stats,
+                    metrics,
                 )
-
-                def _flatten_int_list(x):
-                    out: List[int] = []
-                    if x is None:
-                        return out
-                    if isinstance(x, (list, tuple)):
-                        for item in x:
-                            out.extend(_flatten_int_list(item))
-                    else:
-                        try:
-                            out.append(int(x))
-                        except Exception:
-                            pass
-                    return out
-
-                step_ints = _flatten_int_list(raw_step_counts)
-                n_optim_steps = max(step_ints) if step_ints else 1
-                # PLAN.md P0.J: OBSERVED stored-old-log-prob use, reported by
-                # the actor itself. The manifest bit flips only from this
-                # metric — never from tensor presence alone.
-                used_stored_ints = _flatten_int_list(
-                    actor_metrics_meta.get("actor/used_stored_old_log_probs")
-                )
-                actor_used_stored_old_log_probs = bool(
-                    used_stored_ints and min(used_stored_ints) >= 1
-                )
-                metrics.update(reduce_metrics(actor_metrics_meta))
-                if actor_updated:
-                    removed = replay_buffer.commit(reservation)
-                    metrics["buffer/removed_edges"] = float(len(removed))
-                    metrics["buffer/size_after"] = float(len(replay_buffer))
-                    self.successful_actor_updates += 1
-                    # PLAN.md M1 three-counter contract: global_step advances
-                    # by 1 per successful outer update_actor call (the host
-                    # VERL loop/checkpoint/save/eval unit). The internal PPO
-                    # optimizer-batch count accumulates separately as an
-                    # observational diagnostic only.
-                    self.optimizer_steps_this_iteration = int(n_optim_steps)
-                    self.global_steps += 1
-                    self.num_optimizer_steps_total += int(n_optim_steps)
-                    # PLAN.md P0.J: manifest bit only from the actor-observed
-                    # metric — never inferred from tensor presence.
-                    if actor_used_stored_old_log_probs:
-                        self.run_manifest.stored_old_log_probs_used = True
-                        self.run_manifest.extras["stored_old_log_probs_used"] = True
-                    # PLAN.md P0.J: at least one successful update with no
-                    # integrity failures flips ONLY the invariant bit matching
-                    # the configured loss mode — segment-mean and
-                    # node-balanced are different claims.
-                    if self.run_manifest.group_integrity_failures == 0:
-                        loss_mode = str(
-                            self.config.actor_rollout_ref.actor.policy_loss.get(
-                                "loss_mode", "vdra_segment_mean_ppo"
-                            )
-                        )
-                        if loss_mode == "vdra_node_balanced_ppo":
-                            self.run_manifest.record_node_balanced_invariant_pass()
-                        else:
-                            self.run_manifest.record_segment_invariant_pass()
-                    # PLAN.md P0.7: stamp observed counters + replay
-                    # diagnostics on the manifest.
-                    self._record_iteration_on_manifest(
-                        selected_edges=len(sampled_edges),
-                        sample_stats=sample_stats,
-                        actual_optimizer_steps=int(n_optim_steps),
-                    )
-                    # PLAN.md P0.D: with divisibility enforced before the
-                    # actor call, N_steps = N_selected/ppo_mini * ppo_epochs
-                    # exactly. A mismatch means step accounting is broken.
-                    ppo_mini = int(
-                        self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-                    )
-                    ppo_epochs = int(
-                        self.config.actor_rollout_ref.actor.get("ppo_epochs", 1)
-                    )
-                    if len(sampled_edges) % ppo_mini == 0:
-                        expected_steps = expected_optimizer_steps(
-                            selected_count=len(sampled_edges),
-                            ppo_mini_batch_size=ppo_mini,
-                            ppo_epochs=ppo_epochs,
-                        )
-                        metrics["training/optimizer_steps_expected"] = float(
-                            expected_steps
-                        )
-                        if manifest_strict and int(n_optim_steps) != expected_steps:
-                            raise AssertionError(
-                                f"actor performed {int(n_optim_steps)} optimizer "
-                                f"steps but {expected_steps} were expected for "
-                                f"{len(sampled_edges)} selected edges / "
-                                f"ppo_mini_batch_size={ppo_mini}, "
-                                f"ppo_epochs={ppo_epochs} (PLAN.md P0.D)."
-                            )
                 response_tokens = edge_batch.batch["response_mask"].sum().item()
                 # PLAN.md P0.2: age uses rollout_iteration (never global_step).
                 ages = [

@@ -219,3 +219,86 @@ class TestFitWiring:
         assert "self.global_steps +=" not in source
         assert "self.successful_actor_updates +=" not in source
         assert "self.num_optimizer_steps_total +=" not in source
+
+    def test_fit_finalizes_through_dedicated_helper(self):
+        source = inspect.getsource(RayGearTreeTrainer.fit)
+        assert "_finalize_successful_actor_update(" in source
+
+
+class TestFinalizeSuccessfulActorUpdate:
+    """PLAN.md M2 (item 3): after update_actor() returns successfully the
+    commit + outer counters (global_step, successful_actor_updates) must
+    ALWAYS happen; malformed/missing diagnostic metrics only invalidate the
+    optimizer-step accounting and never rollback replay or crash."""
+
+    def _finalize(self, trainer, buffer, reservation, sampled, actor_output):
+        metrics = {}
+        # Config needed by the finalize path.
+        trainer.config.actor_rollout_ref.actor = _Cfg(
+            ppo_mini_batch_size=1,
+            ppo_epochs=1,
+            policy_loss={"loss_mode": "vdra_segment_mean_ppo"},
+        )
+        trainer._finalize_successful_actor_update(
+            buffer,
+            reservation,
+            actor_output,
+            sampled,
+            {"buffer/unique_questions": 1},
+            metrics,
+        )
+        return metrics
+
+    def test_well_formed_metrics_commit_and_count(self):
+        # 2 reserved edges / ppo_mini=1 -> expected 2 optimizer steps.
+        trainer, buffer, reservation, sampled = _trainer_with_reservation()
+        actor_output = SimpleNamespace(
+            meta_info={"metrics": {"actor/num_optimizer_steps": [2]}}
+        )
+        metrics = self._finalize(trainer, buffer, reservation, sampled, actor_output)
+        assert buffer._reserved == {}
+        assert len(buffer) == 0  # committed
+        assert trainer.global_steps == 1
+        assert trainer.successful_actor_updates == 1
+        assert trainer.num_optimizer_steps_total == 2
+        assert trainer.run_manifest.optimizer_step_accounting_valid is True
+        assert "vdra/actor_metrics_parse_failed" not in metrics
+
+    def test_missing_metrics_key_still_commits_and_counts(self):
+        trainer, buffer, reservation, sampled = _trainer_with_reservation()
+        # Actor succeeded but meta_info has no "metrics" key.
+        actor_output = SimpleNamespace(meta_info={"something_else": 1})
+        metrics = self._finalize(trainer, buffer, reservation, sampled, actor_output)
+        # Commit + outer update stand.
+        assert buffer._reserved == {}
+        assert len(buffer) == 0
+        assert trainer.global_steps == 1
+        assert trainer.successful_actor_updates == 1
+        # num_optimizer_steps_total is a diagnostic; not advanced on failure.
+        assert trainer.num_optimizer_steps_total == 0
+        # Accounting invalid + diagnostic logged; no rollback.
+        assert trainer.run_manifest.optimizer_step_accounting_valid is False
+        assert metrics["vdra/actor_metrics_parse_failed"] == 1.0
+
+    def test_malformed_metrics_value_still_commits_and_counts(self):
+        trainer, buffer, reservation, sampled = _trainer_with_reservation()
+        # meta_info["metrics"] is not a mapping.
+        actor_output = SimpleNamespace(meta_info={"metrics": [1, 2, 3]})
+        metrics = self._finalize(trainer, buffer, reservation, sampled, actor_output)
+        assert buffer._reserved == {}
+        assert len(buffer) == 0
+        assert trainer.global_steps == 1
+        assert trainer.successful_actor_updates == 1
+        assert trainer.num_optimizer_steps_total == 0
+        assert trainer.run_manifest.optimizer_step_accounting_valid is False
+        assert metrics["vdra/actor_metrics_parse_failed"] == 1.0
+
+    def test_missing_meta_info_attr_still_commits(self):
+        trainer, buffer, reservation, sampled = _trainer_with_reservation()
+        actor_output = SimpleNamespace()  # no meta_info at all
+        metrics = self._finalize(trainer, buffer, reservation, sampled, actor_output)
+        assert len(buffer) == 0
+        assert trainer.global_steps == 1
+        assert trainer.successful_actor_updates == 1
+        assert trainer.run_manifest.optimizer_step_accounting_valid is False
+        assert metrics["vdra/actor_metrics_parse_failed"] == 1.0
