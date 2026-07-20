@@ -1147,9 +1147,10 @@ def _right_pad(ids: Sequence[int], length: int, pad_id: int) -> List[int]:
     return ids + [pad_id] * (length - len(ids))
 
 
-# PLAN.md P0.C: loss modes whose actor loss consumes the float objective
-# weight tensors. The canonical ``vdra_segment_mean_ppo`` batch-slot mean
-# does NOT — it must receive neither tensor.
+# PLAN.md P0.C: loss modes whose actor loss consumes precomputed float
+# objective-weight tensors. The canonical ``vdra_segment_mean_ppo`` path uses
+# the segment objective 1/(N_T * N_seg(T)); node-balanced weights are only for
+# the explicit ablation below.
 _LOSS_MODES_WITH_OBJECTIVE_WEIGHTS = ("vdra_node_balanced_ppo",)
 
 
@@ -1173,11 +1174,11 @@ def edges_to_dataproto(
 
     PLAN.md P0.C: ``loss_mode`` selects which float weight tensors are
     attached. The canonical ``vdra_segment_mean_ppo`` mode attaches NO
-    ``objective_weights`` / ``segment_objective_weights`` — the main loss
-    uses the equal replay-slot mean (``original_optimizer_batch_slot_count``
-    supplied by the actor). Only the explicit ``vdra_node_balanced_ppo``
-    ablation still receives its precomputed weights. Integer group/identity
-    tensors are attached unconditionally for diagnostics and validation.
+    ``objective_weights`` / ``segment_objective_weights`` here: its actor
+    loss computes the segment objective 1/(N_T * N_seg(T)) directly from the
+    row metadata. Only the explicit ``vdra_node_balanced_ppo`` ablation still
+    receives its precomputed weights. Integer group/identity tensors are
+    attached unconditionally for diagnostics and validation.
     """
     if not edges:
         raise ValueError("edges_to_dataproto received an empty edge list")
@@ -1266,10 +1267,10 @@ def edges_to_dataproto(
         batch[key] = value
 
     # PLAN.md P0.C: float objective-weight tensors are attached ONLY for the
-    # explicit node-balanced ablation. The canonical segment-mean loss uses
-    # the equal replay-slot mean and must receive neither tensor; tree- and
-    # parent-normalized weights would silently re-couple the batch to
-    # complete-tree assumptions.
+    # explicit node-balanced ablation. The canonical segment-mean loss derives
+    # 1/(N_T * N_seg(T)) from row metadata and must receive neither tensor;
+    # tree- and parent-normalized weights would silently re-couple the batch
+    # to complete-tree assumptions.
     if str(loss_mode) in _LOSS_MODES_WITH_OBJECTIVE_WEIGHTS:
         obj_weights = compute_objective_weights(edges)
         validate_objective_weights(edges, obj_weights)

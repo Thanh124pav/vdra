@@ -232,10 +232,9 @@ tree_policy:
   advantage_mode: spo_local
 
   # policy_aggregation selects the actor loss reduction. Main VDRA is
-  # `global_segment_mean` (PLAN.md P0.1). In the current preserved host
-  # contract, selected replay slots have equal outer weight; tree/queue count
-  # tensors remain diagnostics and validation inputs until the Medium manifest
-  # cleanup.
+  # `global_segment_mean` (PLAN.md P0.1): segment contributions use the
+  # canonical 1/(N_T * N_seg(T)) objective. Tree/queue count tensors remain
+  # diagnostics and validation inputs until the Medium manifest cleanup.
   #
   # Values:
   #   * global_segment_mean  — canonical main-run (PLAN.md P0.1).
