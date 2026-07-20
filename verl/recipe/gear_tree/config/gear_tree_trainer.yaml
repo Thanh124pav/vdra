@@ -109,12 +109,12 @@ gear_tree:
 
 
     # k0 pilot children and r likelihood samples per child.
-    pilot_branch_factor: 6
+    pilot_branch_factor: 7
     likelihood_samples_per_distribution: 2
 
     # Current verl runtime owns one queue manager per tree; do not claim
     # cross-root minibatch allocation until that shared context is implemented.
-    root_allocation: true
+    root_allocation: false
     # P1.3 canonical value: runtime solver acts per queue flush within one tree
     # (see PLAN.md §2.1).
     allocation_scope: per_queue_flush_within_tree
