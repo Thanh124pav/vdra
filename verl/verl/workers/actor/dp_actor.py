@@ -396,6 +396,10 @@ class DataParallelPPOActor(BasePPOActor):
             # microbatch splits preserve the pre-filter denominator.
             "segment_objective_weights",
             "tree_total_segment_count",
+            # PLAN.md §1.2/§1.3: trainer-stamped logical-batch structure for
+            # the canonical paper aggregations (sparse-execution contract).
+            "logical_batch_index",
+            "is_dummy",
         ):
             if key in data.batch.keys():
                 select_keys.append(key)
@@ -405,9 +409,82 @@ class DataParallelPPOActor(BasePPOActor):
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
-        # Split to make minibatch iterator for updating the actor
-        # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        mini_batches = data.split(self.config.ppo_mini_batch_size)
+        # PLAN.md §1.3 (user decision 2026-07-21): the canonical paper
+        # aggregations group mini-batches by the trainer-stamped LOGICAL
+        # optimizer batch, whose pre-filter denominators M_B / T_B were fixed
+        # at reservation time. Every other mode keeps verl's fixed-size split.
+        _split_loss_mode = str(self.config.policy_loss.get("loss_mode", "vanilla"))
+        _aggregation = str(
+            self.config.policy_loss.get(
+                "policy_aggregation", "tree_balanced_segment_mean"
+            )
+        ).strip().lower()
+        vdra_canonical_aggregation = (
+            _split_loss_mode == "vdra_segment_mean_ppo"
+            and _aggregation in ("segment_mean", "token_mean")
+        )
+        logical_denominators = None
+        vdra_dp_size = 1
+        n_all_zero_logical_batches = 0
+        if vdra_canonical_aggregation:
+            if "logical_batch_index" not in data.batch.keys():
+                raise ValueError(
+                    "policy_aggregation="
+                    f"{_aggregation!r} requires trainer-stamped logical "
+                    "batches (logical_batch_index tensor from "
+                    "build_logical_update_batch); refusing to fall back to a "
+                    "retained-row split (PLAN.md §1.2/§1.3)."
+                )
+            seg_counts = data.meta_info.get("original_logical_segment_count")
+            tok_counts = data.meta_info.get("original_logical_token_count")
+            if not seg_counts or not tok_counts or len(seg_counts) != len(tok_counts):
+                raise ValueError(
+                    "canonical VDRA aggregation requires per-logical-batch "
+                    "original_logical_segment_count / "
+                    "original_logical_token_count lists in meta_info "
+                    "(PLAN.md §1.3); got "
+                    f"{seg_counts!r} / {tok_counts!r}."
+                )
+            if self.ulysses_sequence_parallel_size > 1:
+                raise NotImplementedError(
+                    "canonical VDRA aggregations are only specified for "
+                    "ulysses_sequence_parallel_size == 1; the data-parallel "
+                    "group for the dp-size reducer compensation is undefined "
+                    "under sequence parallel (PLAN.md §1.3 — discuss before "
+                    "enabling)."
+                )
+            _world = (
+                torch.distributed.get_world_size()
+                if torch.distributed.is_initialized()
+                else 1
+            )
+            _stamped_dp = int(data.meta_info.get("logical_dp_size", _world))
+            if _stamped_dp != _world:
+                raise ValueError(
+                    "trainer padded logical batches for dp_size="
+                    f"{_stamped_dp} but the actual data-parallel world size "
+                    f"is {_world}; rank shares would diverge (PLAN.md §1.2)."
+                )
+            vdra_dp_size = _world
+            _idx = data.batch["logical_batch_index"]
+            mini_batches = []
+            logical_denominators = []
+            for _k in range(len(seg_counts)):
+                _sel = torch.nonzero(_idx == _k, as_tuple=False).squeeze(-1)
+                if _sel.numel() == 0:
+                    # All-zero logical batch: no rows on ANY rank by
+                    # construction, so every rank skips this optimizer step
+                    # consistently (PLAN.md §1.3 approved skip).
+                    n_all_zero_logical_batches += 1
+                    continue
+                mini_batches.append(data[_sel])
+                logical_denominators.append(
+                    (float(seg_counts[_k]), float(tok_counts[_k]))
+                )
+        else:
+            # Split to make minibatch iterator for updating the actor
+            # See PPO paper for details. https://arxiv.org/abs/1707.06347
+            mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         # P0.4: replay/tree edges carry stored generation-time old_log_probs
         # that must be preserved as the PPO denominator, even in the
@@ -433,9 +510,18 @@ class DataParallelPPOActor(BasePPOActor):
         # preserve the loss weights w_s = 1 / (N_T * N_seg(T)).
         original_optimizer_batch_slot_count = len(mini_batches[0]) if mini_batches else 0
         original_optimizer_batch_tree_count = None
+        logical_segment_count = None
+        logical_token_count = None
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 original_optimizer_batch_slot_count = len(mini_batch)
+                if logical_denominators is not None:
+                    # PLAN.md §1.3: fixed pre-filter denominators of THIS
+                    # logical batch, stamped at reservation time — reused by
+                    # every micro-batch and identical on every DP rank.
+                    logical_segment_count, logical_token_count = (
+                        logical_denominators[batch_idx]
+                    )
                 if "tree_group_ids" in mini_batch.batch.keys():
                     original_optimizer_batch_tree_count = int(
                         torch.unique(mini_batch.batch["tree_group_ids"]).numel()
@@ -476,7 +562,15 @@ class DataParallelPPOActor(BasePPOActor):
                         "vdra_node_balanced_ppo",
                         "vdra_segment_mean_ppo",
                     )
-                    if vdra_mode:
+                    if vdra_canonical_aggregation:
+                        # PLAN.md §1.3: the FSDP/DDP reducer AVERAGES rank
+                        # gradients (measured, docs/h1_fsdp_parity_report.md)
+                        # while the canonical loss divides the LOCAL numerator
+                        # by the GLOBAL logical denominator — multiply by the
+                        # actual data-parallel size so the average reproduces
+                        # the single-rank objective exactly.
+                        loss_scale_factor = float(vdra_dp_size)
+                    elif vdra_mode:
                         loss_scale_factor = 1.0
                     elif self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
@@ -561,6 +655,19 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_kwargs["original_optimizer_batch_tree_count"] = (
                             original_optimizer_batch_tree_count
                         )
+                    # PLAN.md §1.3: canonical paper aggregations receive the
+                    # trainer-stamped pre-filter logical denominators.
+                    if (
+                        logical_denominators is not None
+                        and "original_logical_segment_count"
+                        in policy_loss_fn.__code__.co_varnames
+                    ):
+                        loss_kwargs["original_logical_segment_count"] = (
+                            logical_segment_count
+                        )
+                        loss_kwargs["original_logical_token_count"] = (
+                            logical_token_count
+                        )
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(**loss_kwargs)
 
                     if entropy_coeff != 0:
@@ -614,6 +721,12 @@ class DataParallelPPOActor(BasePPOActor):
         # optimizer_steps_this_iteration. Stored under the standard verl
         # `metrics` key so it is emitted through `reduce_metrics` unchanged.
         metrics.setdefault("actor/num_optimizer_steps", []).append(int(num_optimizer_steps))
+        if vdra_canonical_aggregation:
+            # PLAN.md §1.3: all-zero logical batches are skipped consistently
+            # on every rank (no forward/backward/optimizer.step) and reported.
+            metrics.setdefault("actor/all_zero_logical_batches", []).append(
+                int(n_all_zero_logical_batches)
+            )
         # PLAN.md P0.J: OBSERVED fact for the manifest — 1.0 only when the
         # stored generation-time old_log_probs were actually kept as the PPO
         # ratio denominator (i.e. this update was not treated as on-policy

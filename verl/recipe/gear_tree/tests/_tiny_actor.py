@@ -168,11 +168,20 @@ def make_actor_config(
     mini: int = 128,
     micro: int = 64,
     reduction: str = "mean",
+    aggregation: str | None = None,
     batch_slot_ablation: bool = False,
     grad_clip: float = 1.0,
 ):
     from verl.workers.config.actor import FSDPActorConfig, PolicyLossConfig
 
+    policy_loss_kwargs = dict(
+        loss_mode="vdra_segment_mean_ppo",
+        segment_token_reduction=reduction,
+        use_prob_mask=False,
+        batch_slot_mean_ablation=batch_slot_ablation,
+    )
+    if aggregation is not None:
+        policy_loss_kwargs["policy_aggregation"] = aggregation
     return FSDPActorConfig(
         strategy=strategy,
         rollout_n=1,
@@ -183,12 +192,7 @@ def make_actor_config(
         grad_clip=grad_clip,
         use_torch_compile=False,
         use_dynamic_bsz=False,
-        policy_loss=PolicyLossConfig(
-            loss_mode="vdra_segment_mean_ppo",
-            segment_token_reduction=reduction,
-            use_prob_mask=False,
-            batch_slot_mean_ablation=batch_slot_ablation,
-        ),
+        policy_loss=PolicyLossConfig(**policy_loss_kwargs),
     )
 
 

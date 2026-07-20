@@ -1328,3 +1328,180 @@ def edges_to_dataproto(
         ),
     }
     return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+
+
+def build_logical_update_batch(
+    slots: List[Dict[str, Any]],
+    tokenizer,
+    *,
+    max_prompt_length: int,
+    max_response_length: int,
+    ppo_mini_batch_size: int,
+    dp_size: int,
+    loss_mode: str = "vdra_segment_mean_ppo",
+    include_old_log_probs: bool = True,
+) -> Tuple[Optional[DataProto], Dict[str, float]]:
+    """PLAN.md §1.2/§1.3 (2026-07-21): tensorize a reservation of LOGICAL slots.
+
+    ``slots`` is the reservation in RESERVATION ORDER: metadata-only zero
+    slots (``is_ledger_slot``) and trainable rows interleaved. This function:
+
+    1. partitions the slots into logical optimizer batches of
+       ``ppo_mini_batch_size`` BEFORE any tensor filtering;
+    2. computes the exact PRE-FILTER denominators per batch ``B``:
+       ``M_B`` = logical slot count, ``T_B`` = sum of ``response_token_count``
+       over EVERY slot in ``B`` (zero slots included) — failing fast when any
+       record lacks a positive ``response_token_count`` (no
+       ``tree_total_segment_count`` approximation, no retained-row fallback);
+    3. tensorizes ONLY the trainable rows, padding each batch's rows to a
+       multiple of ``dp_size`` with collective-safe dummy rows (exact-zero
+       advantage, one pad token, counted in NO denominator or replay metric);
+    4. orders rows RANK-MAJOR (all of rank 0's rows for batches 0..K-1, then
+       rank 1's, ...) so verl's contiguous ``DataProto.chunk`` hands every
+       rank the same number of rows for every logical batch — no FSDP rank
+       can skip a collective another rank enters;
+    5. stamps ``logical_batch_index``/``is_dummy`` row tensors and the
+       per-batch ``original_logical_segment_count`` /
+       ``original_logical_token_count`` lists (one value per logical batch,
+       never one per call) plus ``logical_dp_size`` into ``meta_info``.
+
+    Returns ``(None, stats)`` when EVERY logical batch is all-zero — the
+    trainer records an explicit skipped update (no update_actor RPC, no
+    global_step, no scheduler.step; PLAN.md §1.3).
+    """
+    from recipe.gear_tree.replay_buffer import is_ledger_slot
+
+    n = len(slots)
+    mini = int(ppo_mini_batch_size)
+    dp = int(dp_size)
+    if n <= 0:
+        raise ValueError("build_logical_update_batch received an empty reservation")
+    if mini <= 0 or dp <= 0:
+        raise ValueError(
+            f"ppo_mini_batch_size={ppo_mini_batch_size!r} and dp_size={dp_size!r} "
+            "must be positive"
+        )
+    if n % mini != 0:
+        raise ValueError(
+            f"reservation of {n} logical slots is not divisible by "
+            f"ppo_mini_batch_size={mini}; the postpone_until_divisible policy "
+            "must gate the update BEFORE tensorization (PLAN.md P0.D/§1.2)."
+        )
+
+    n_batches = n // mini
+    segment_counts: List[float] = []
+    token_counts: List[float] = []
+    per_batch_rows: List[List[Dict[str, Any]]] = []
+    all_zero_batches = 0
+    for k in range(n_batches):
+        batch_slots = slots[k * mini : (k + 1) * mini]
+        t_b = 0
+        for slot in batch_slots:
+            count = slot.get("response_token_count")
+            if count is None:
+                count = len(slot.get("response_token_ids") or []) or None
+            if count is None or int(count) <= 0:
+                raise ValueError(
+                    "logical slot/edge is missing a positive "
+                    "response_token_count; the exact pre-filter T_B cannot be "
+                    "reconstructed (PLAN.md §1.2 — never approximate with "
+                    f"tree_total_segment_count). Offending record edge_id="
+                    f"{slot.get('edge_id')!r}."
+                )
+            t_b += int(count)
+        rows = [s for s in batch_slots if not is_ledger_slot(s)]
+        if not rows:
+            all_zero_batches += 1
+        segment_counts.append(float(mini))
+        token_counts.append(float(t_b))
+        per_batch_rows.append(rows)
+
+    total_rows = sum(len(rows) for rows in per_batch_rows)
+    stats: Dict[str, float] = {
+        "vdra/logical_slots": float(n),
+        "vdra/logical_batches": float(n_batches),
+        "vdra/all_zero_logical_batches": float(all_zero_batches),
+        "vdra/tensor_rows": float(total_rows),
+    }
+    if total_rows == 0:
+        stats["vdra/skipped_zero_gradient_updates"] = 1.0
+        stats["vdra/dummy_rows"] = 0.0
+        return None, stats
+
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+
+    def _dummy_row(batch_idx: int, i: int) -> Dict[str, Any]:
+        return {
+            "edge_id": f"__vdra_dummy__|{batch_idx}|{i}",
+            "question_id": "__vdra_dummy__",
+            "tree_id": "__vdra_dummy__",
+            "parent_group_id": "__vdra_dummy__/p",
+            "child_segment_id": f"__vdra_dummy__/{batch_idx}/{i}",
+            "allocated_k": 1,
+            "sample_multiplicity": 1,
+            "tree_total_segment_count": 1,
+            "queue_flush_id": "0",
+            "queue_released_segment_count": 1,
+            "query_token_ids": [int(pad_id)],
+            "response_token_ids": [int(pad_id)],
+            "actor_shifted_log_probs": [0.0],
+            "advantage": 0.0,
+            "value": 0.0,
+            "reward": 0.0,
+            "is_dummy": True,
+        }
+
+    # Round-robin rank assignment per logical batch, dummies appended last so
+    # real rows spread as evenly as possible.
+    n_dummy = 0
+    per_rank_rows: List[List[Dict[str, Any]]] = [[] for _ in range(dp)]
+    per_rank_batch_idx: List[List[int]] = [[] for _ in range(dp)]
+    for k, rows in enumerate(per_batch_rows):
+        if not rows:
+            # All-zero logical batch: zero rows on EVERY rank, so all ranks
+            # skip optimizer step k consistently (PLAN.md §1.3).
+            continue
+        padded = list(rows)
+        while len(padded) % dp != 0:
+            padded.append(_dummy_row(k, len(padded)))
+            n_dummy += 1
+        for i, row in enumerate(padded):
+            rank = i % dp
+            per_rank_rows[rank].append(row)
+            per_rank_batch_idx[rank].append(k)
+
+    ordered_rows: List[Dict[str, Any]] = []
+    ordered_batch_idx: List[int] = []
+    rows_per_rank = {len(rows) for rows in per_rank_rows}
+    if len(rows_per_rank) != 1:
+        raise AssertionError(
+            "rank shares diverged after dummy padding; this is a bug in "
+            f"build_logical_update_batch (shares={sorted(rows_per_rank)})"
+        )
+    for rank in range(dp):
+        ordered_rows.extend(per_rank_rows[rank])
+        ordered_batch_idx.extend(per_rank_batch_idx[rank])
+
+    batch = edges_to_dataproto(
+        ordered_rows,
+        tokenizer,
+        max_prompt_length=max_prompt_length,
+        max_response_length=max_response_length,
+        include_old_log_probs=include_old_log_probs,
+        loss_mode=loss_mode,
+    )
+    batch.batch["logical_batch_index"] = torch.tensor(
+        ordered_batch_idx, dtype=torch.int64
+    )
+    batch.batch["is_dummy"] = torch.tensor(
+        [1 if row.get("is_dummy") else 0 for row in ordered_rows],
+        dtype=torch.int64,
+    )
+    batch.meta_info["original_logical_segment_count"] = segment_counts
+    batch.meta_info["original_logical_token_count"] = token_counts
+    batch.meta_info["logical_batch_count"] = int(n_batches)
+    batch.meta_info["logical_dp_size"] = int(dp)
+    stats["vdra/dummy_rows"] = float(n_dummy)
+    return batch, stats
