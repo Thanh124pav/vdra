@@ -429,9 +429,12 @@ def extract_edges_from_tree(
         "queue_released_segment_count": {
             str(k): int(v) for k, v in queue_released_segment_count.items()
         },
-        # Per-parent PRE-FILTER construction facts. This is the only record
-        # that survives for a parent whose every child was zero-filtered
-        # (retained == 0): such parents have no rows in ``edges`` at all.
+        # Per-parent PRE-FILTER construction facts. Under sparse execution
+        # (``emit_zero_slots``) a parent whose every child had exactly zero
+        # advantage still contributes metadata-only LOGICAL SLOTS to
+        # ``edges`` — it just contributes no TRAINABLE rows. These summary
+        # counts remain the authoritative construction record either way, and
+        # are the only record when zero slots are not emitted at all.
         "parent_construction": {
             pgid: {
                 "realized": int(slot["realized"]),

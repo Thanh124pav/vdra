@@ -1439,14 +1439,31 @@ def build_logical_update_batch(
                 "objective and must not be reused (PLAN.md §4)."
             )
         raw_mask = slot.get("prob_mask_token_count")
-        if raw_mask is None and not is_ledger_slot(slot):
-            # A trainable row still carries its log-probs, so the count is
-            # derivable with the SHARED predicate (identical semantics).
+        if not is_ledger_slot(slot):
+            # PLAN.md §1: a TRAINABLE row still carries its payload, so its
+            # stamped counts must AGREE with it — never merely be present.
+            response_ids = slot.get("response_token_ids") or []
+            if response_ids and resp != len(response_ids):
+                raise ValueError(
+                    f"logical edge {slot.get('edge_id')!r} stamps "
+                    f"response_token_count={resp} but carries "
+                    f"{len(response_ids)} response tokens (PLAN.md §1)."
+                )
             log_probs = slot.get("actor_shifted_log_probs")
             if log_probs is not None:
-                raw_mask = count_prob_mask_active_tokens(
+                recomputed = count_prob_mask_active_tokens(
                     log_probs, probability_mask_threshold
                 )
+                if raw_mask is None:
+                    raw_mask = recomputed
+                elif int(raw_mask) != recomputed:
+                    raise ValueError(
+                        f"logical edge {slot.get('edge_id')!r} stamps "
+                        f"prob_mask_token_count={int(raw_mask)} but its stored "
+                        f"old log-probs give {recomputed} active tokens at "
+                        f"threshold={float(probability_mask_threshold)} "
+                        "(PLAN.md §1)."
+                    )
         if use_prob_mask and raw_mask is None:
             raise ValueError(
                 "policy_aggregation='token_mean' with use_prob_mask=true "

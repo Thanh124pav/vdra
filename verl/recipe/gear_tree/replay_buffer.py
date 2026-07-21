@@ -20,6 +20,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
 
+# PLAN.md §1: the SHARED active-token predicate, so a stamped count is
+# verified against exactly the semantics the actor loss will apply.
+from recipe.gear_tree.prob_mask import count_prob_mask_active_tokens
+
 
 _REQUIRED_EDGE_FIELDS = (
     "edge_id",
@@ -457,6 +461,9 @@ class GearTreeReplayBuffer:
             # can never be recomputed. Validate at INSERTION, not only at
             # checkpoint restore.
             self._validate_record_mask_identity(record)
+            # PLAN.md §1: a trainable edge still carries its payload, so its
+            # stamped counts must agree with it exactly.
+            self.validate_trainable_count_identity(record)
             seen_ids.add(edge_id)
             prepared.append(record)
         # All-or-nothing commit.
@@ -1004,7 +1011,12 @@ class GearTreeReplayBuffer:
                 if not line.strip():
                     continue
                 edge = json.loads(line)
+                # PLAN.md §4: validate EVERY restored record, not just the
+                # checkpoint-level mask metadata — a hand-edited or
+                # partially-migrated row must not slip in.
                 buffer._validate_edge(edge)
+                buffer._validate_record_mask_identity(edge)
+                buffer.validate_trainable_count_identity(edge)
                 buffer._edges[str(edge["edge_id"])] = edge
         return buffer
 
@@ -1028,6 +1040,54 @@ class GearTreeReplayBuffer:
                 f"{float(self.probability_mask_threshold)}; its "
                 "prob_mask_token_count was computed under a different "
                 "objective and must not be reused (PLAN.md §4)."
+            )
+
+    @staticmethod
+    def validate_trainable_count_identity(record: Mapping[str, Any]) -> None:
+        """PLAN.md §1: a TRAINABLE edge keeps its payload, so its stamped
+        denominator metadata must agree with that payload exactly.
+
+        ``response_token_count`` must equal the response length, and
+        ``prob_mask_token_count`` must equal the shared predicate's count over
+        the stored old log-probs at the stamped threshold. A drift here would
+        silently corrupt ``T_B_response`` / ``T_B_prob_mask``.
+
+        Metadata-only zero slots are exempt: their payload was intentionally
+        discarded, so nothing can be recomputed — only their stamped schema
+        and ranges are checked (see :meth:`_validate_edge`).
+        """
+        if is_ledger_slot(record):
+            return
+        stamped_resp = record.get("response_token_count")
+        if stamped_resp is None:
+            # Pre-migration record without the counts; range/identity checks
+            # elsewhere still apply.
+            return
+        response_ids = record.get("response_token_ids") or []
+        if int(stamped_resp) != len(response_ids):
+            raise ValueError(
+                f"replay edge {record.get('edge_id')!r} stamps "
+                f"response_token_count={int(stamped_resp)} but carries "
+                f"{len(response_ids)} response tokens; the pre-filter "
+                "denominator would be wrong (PLAN.md §1)."
+            )
+        stamped_mask = record.get("prob_mask_token_count")
+        if stamped_mask is None:
+            return
+        threshold = record.get("probability_mask_threshold")
+        if threshold is None:
+            return
+        log_probs = record.get("actor_shifted_log_probs")
+        if log_probs is None:
+            return
+        recomputed = count_prob_mask_active_tokens(log_probs, float(threshold))
+        if int(stamped_mask) != recomputed:
+            raise ValueError(
+                f"replay edge {record.get('edge_id')!r} stamps "
+                f"prob_mask_token_count={int(stamped_mask)} but its stored "
+                f"old log-probs give {recomputed} active tokens at "
+                f"threshold={float(threshold)}; the masked denominator would "
+                "be wrong (PLAN.md §1)."
             )
 
     @staticmethod

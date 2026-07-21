@@ -731,8 +731,21 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_kwargs["is_dummy"] = model_inputs.get("is_dummy", None)
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(**loss_kwargs)
 
+                    # PLAN.md §2: entropy/KL are AUXILIARY per-token objectives
+                    # that must not see collective-safety padding either —
+                    # otherwise a non-strict result would depend on the DP size
+                    # (which decides how many dummy rows exist). The PG term is
+                    # already dummy-safe inside the loss.
+                    _dummy_flag = model_inputs.get("is_dummy", None)
+                    if _dummy_flag is None:
+                        aux_mask = response_mask
+                    else:
+                        aux_mask = response_mask * (
+                            ~_dummy_flag.bool()
+                        ).unsqueeze(-1).to(dtype=response_mask.dtype)
+
                     if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=aux_mask, loss_agg_mode=loss_agg_mode)
 
                         # compute policy loss
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
@@ -745,7 +758,7 @@ class DataParallelPPOActor(BasePPOActor):
                         kld = kl_penalty(
                             logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
                         )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        kl_loss = agg_loss(loss_mat=kld, loss_mask=aux_mask, loss_agg_mode=loss_agg_mode)
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor

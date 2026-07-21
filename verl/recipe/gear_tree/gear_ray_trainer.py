@@ -754,8 +754,10 @@ class RayGearTreeTrainer(RayPPOTrainer):
     ) -> Dict[str, Any]:
         """PLAN.md P0.B: construction-stage validation of the COMPLETE
         generated batch, before replay insertion. ``construction_summaries``
-        carry the pre-filter facts of parents/trees whose every child was
-        zero-filtered away (they have no rows in ``generated_edges``)."""
+        carry the pre-filter facts of parents/trees whose every child had
+        exactly zero advantage. Under sparse execution those children still
+        appear in ``generated_edges`` as metadata-only logical slots (no
+        TRAINABLE rows); the summaries remain authoritative either way."""
         return update_manifest_from_generated_edges(
             manifest,
             generated_edges,
@@ -893,6 +895,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
         removed = replay_buffer.commit(reservation)
         metrics["buffer/removed_edges"] = float(len(removed))
         metrics["buffer/size_after"] = float(len(replay_buffer))
+        # PLAN.md §6: this iteration DID run the actor, so clear the skip flag
+        # a previous fully-skipped iteration may have set.
+        self.run_manifest.actor_update_skipped = False
         self.successful_actor_updates += 1
         # PLAN.md M1 three-counter contract: global_step advances by 1 per
         # successful outer update_actor call (the host VERL
@@ -919,7 +924,18 @@ class RayGearTreeTrainer(RayPPOTrainer):
             step_ints = self._flatten_int_list(
                 actor_metrics_meta.get("actor/num_optimizer_steps", None)
             )
-            n_optim_steps = max(step_ints) if step_ints else 1
+            if not step_ints:
+                # PLAN.md §3: NEVER invent a step count. The outer update is
+                # already committed and must stay committed, but the internal
+                # optimizer-step accounting becomes UNKNOWN — defaulting to 1
+                # would fabricate a diagnostic and could make a broken run
+                # look correctly accounted.
+                raise KeyError(
+                    "actor meta_info['metrics'] has no "
+                    "'actor/num_optimizer_steps'; optimizer-step accounting "
+                    "is unknown for this update"
+                )
+            n_optim_steps = max(step_ints)
             # PLAN.md P0.J: OBSERVED stored-old-log-prob use, reported by the
             # actor itself. The manifest bit flips only from this metric —
             # never from tensor presence alone.
@@ -1188,6 +1204,69 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     metrics["vdra/skipped_zero_gradient_updates"] = float(
                         self.skipped_zero_gradient_updates
                     )
+                    # PLAN.md §6: a fully skipped iteration is a real, visible
+                    # event — write its timing row and persist the manifest so
+                    # it is auditable, with expected == actual == 0 optimizer
+                    # steps and the outer counters untouched.
+                    skip_ages = [
+                        self.rollout_iteration
+                        - int(
+                            edge.get(
+                                "generation_rollout_iteration",
+                                edge.get("generation_step", self.rollout_iteration),
+                            )
+                        )
+                        for edge in sampled_edges
+                    ]
+                    skip_timing = {
+                        "step": self.global_steps,
+                        "rollout_iteration": self.rollout_iteration,
+                        "actor_update_skipped": True,
+                        "timing/generation_seconds": t_gen,
+                        "timing/update_seconds": 0.0,
+                        "train/logical_slots": float(len(sampled_edges)),
+                        "train/trainable_tensor_rows": 0.0,
+                        "train/dummy_rows": 0.0,
+                        "train/real_response_tokens": 0.0,
+                        "train/mean_edge_age": float(
+                            sum(skip_ages) / len(skip_ages) if skip_ages else 0.0
+                        ),
+                        "train/max_edge_age": float(max(skip_ages) if skip_ages else 0),
+                        "training/rollout_iteration": float(self.rollout_iteration),
+                        "training/global_step": float(self.global_steps),
+                        "training/expected_optimizer_steps": 0.0,
+                        "training/optimizer_steps_this_iteration": 0.0,
+                        "training/num_optimizer_steps_total": float(
+                            self.num_optimizer_steps_total
+                        ),
+                        "vdra/skipped_zero_gradient_updates": float(
+                            self.skipped_zero_gradient_updates
+                        ),
+                        "vdra/all_zero_advantage_logical_batches": float(
+                            metrics.get(
+                                "vdra/all_zero_advantage_logical_batches", 0.0
+                            )
+                        ),
+                        "vdra/zero_active_token_logical_batches": float(
+                            metrics.get(
+                                "vdra/zero_active_token_logical_batches", 0.0
+                            )
+                        ),
+                    }
+                    with open(timing_path, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(skip_timing) + "\n")
+                    metrics.update(skip_timing)
+                    # Observed facts for a skipped update: zero steps expected
+                    # and zero performed, so the accounting stays valid.
+                    self.optimizer_steps_this_iteration = 0
+                    self._expected_optimizer_steps = 0
+                    self.run_manifest.actor_update_skipped = True
+                    self._record_iteration_on_manifest(
+                        selected_edges=len(sampled_edges),
+                        sample_stats=sample_stats,
+                        actual_optimizer_steps=0,
+                    )
+                    self._save_manifest(self.run_manifest)
                     logger.log(data=metrics, step=self.global_steps)
                     continue
                 actor_updated = True

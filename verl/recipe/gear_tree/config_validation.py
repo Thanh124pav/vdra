@@ -196,6 +196,29 @@ def validate_policy_loss_consistency(
                 f"probability_mask_threshold={_thr!r} is invalid; must "
                 "satisfy 0 < threshold <= 1 (PLAN.md §1)."
             )
+        # PLAN.md §5: canonical logical batching partitions the reservation
+        # into EXACT ppo_mini_batch_size batches before tensor filtering; a
+        # tail logical batch is not implemented, so an indivisible reservation
+        # would fail at tensorization instead of being gated up front.
+        if policy_agg in ("segment_mean", "token_mean"):
+            _replay = (gt.get("replay_buffer") or {})
+            _underfilled = str(
+                _replay.get(
+                    "underfilled_update_policy", "postpone_until_divisible"
+                )
+            )
+            if _underfilled == "use_available":
+                raise ValueError(
+                    "policy_aggregation="
+                    f"{policy_agg!r} requires "
+                    "gear_tree.replay_buffer.underfilled_update_policy="
+                    "'postpone_until_divisible'. Canonical logical batching "
+                    "partitions the reservation into exact "
+                    "ppo_mini_batch_size logical batches BEFORE tensor "
+                    "filtering, and tail logical batches are not implemented "
+                    "(PLAN.md §5); 'use_available' would produce an "
+                    "indivisible reservation."
+                )
 
     if strict:
         # PLAN.md §1.3/M5: the strict canonical main path must be the exact

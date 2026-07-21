@@ -99,6 +99,11 @@ class RunManifest:
     fresh_iid_row_count_matches_allocated_k: bool = True
     replay_age_uses_rollout_iteration: bool = False
     optimizer_step_accounting_valid: bool = False
+    # PLAN.md §6: true when the LAST iteration was a fully skipped update
+    # (every logical batch was all_zero_advantage / zero_active_tokens), so
+    # no actor RPC ran and global_step / the scheduler did not advance.
+    # Observational: it never gates main-run validity.
+    actor_update_skipped: bool = False
     unique_tree_ids_verified: bool = False
 
     # Running counters (updated by the trainer)
