@@ -43,6 +43,16 @@ from recipe.gear_tree.manifest_lifecycle import (
     update_manifest_from_replay_batch,
 )
 from recipe.gear_tree.run_manifest import (
+    ITERATION_STATUS_ACTOR_FAILED,
+    ITERATION_STATUS_ALL_ZERO_SKIPPED,
+    ITERATION_STATUS_FAILED_BEFORE_ACTOR,
+    ITERATION_STATUS_MIXED_ZERO_SIGNAL_SKIPPED,
+    ITERATION_STATUS_NO_SAMPLE,
+    ITERATION_STATUS_POSTPONED,
+    ITERATION_STATUS_UPDATED,
+    ITERATION_STATUS_ZERO_ACTIVE_SKIPPED,
+    VALID_ITERATION_STATUSES,
+    ZERO_SIGNAL_SKIP_STATUSES,
     POLICY_AGGREGATION_LEGACY,
     POLICY_AGGREGATION_VDRA,
     RunManifest,
@@ -156,7 +166,16 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     "probability_mask_threshold", 0.9
                 )
             ),
+            # PLAN.md §4: canonical runs never recompute missing metadata.
+            require_logical_denominator_metadata=self._is_canonical_aggregation(),
         )
+
+    def _is_canonical_aggregation(self) -> bool:
+        """True for the canonical paper objectives (segment_mean/token_mean)."""
+        pl = self.config.actor_rollout_ref.actor.policy_loss
+        return str(pl.get("loss_mode", "")) == "vdra_segment_mean_ppo" and str(
+            pl.get("policy_aggregation", "segment_mean")
+        ).strip().lower() in ("segment_mean", "token_mean")
 
     def _ensure_replay_buffer(self) -> GearTreeReplayBuffer:
         if not hasattr(self, "replay_buffer"):
@@ -270,6 +289,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 ),
                 reset_replay_on_objective_mismatch=bool(
                     replay_cfg.get("reset_replay_on_objective_mismatch", False)
+                ),
+                require_logical_denominator_metadata=(
+                    self._is_canonical_aggregation()
                 ),
             )
             metrics["buffer/checkpoint_restored"] = 1.0
@@ -830,6 +852,8 @@ class RayGearTreeTrainer(RayPPOTrainer):
             edge_batch = self._edges_to_update_batch(sampled_edges, metrics)
         except Exception:
             replay_buffer.rollback(reservation)
+            # PLAN.md §5: validation/tensorization failed BEFORE the actor RPC.
+            self._set_iteration_status(ITERATION_STATUS_FAILED_BEFORE_ACTOR)
             raise
         if edge_batch is None:
             # PLAN.md §1.3: every logical batch of this reservation is
@@ -853,6 +877,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
         except Exception:
             replay_buffer.rollback(reservation)
             self.failed_updates += 1
+            # PLAN.md §5: the actor RPC itself failed — model parameters may
+            # already have changed, which replay rollback cannot undo.
+            self._set_iteration_status(ITERATION_STATUS_ACTOR_FAILED)
             raise
         return edge_batch, actor_output, time.time() - t0
 
@@ -895,9 +922,11 @@ class RayGearTreeTrainer(RayPPOTrainer):
         removed = replay_buffer.commit(reservation)
         metrics["buffer/removed_edges"] = float(len(removed))
         metrics["buffer/size_after"] = float(len(replay_buffer))
-        # PLAN.md §6: this iteration DID run the actor, so clear the skip flag
-        # a previous fully-skipped iteration may have set.
-        self.run_manifest.actor_update_skipped = False
+        # PLAN.md §5/§6: this iteration DID run the actor. The status write
+        # also clears the derived actor_update_skipped compatibility flag.
+        self._set_iteration_status(ITERATION_STATUS_UPDATED)
+        # PLAN.md §2: only a successful actor update breaks a skip streak.
+        self.consecutive_skipped_updates = 0
         self.successful_actor_updates += 1
         # PLAN.md M1 three-counter contract: global_step advances by 1 per
         # successful outer update_actor call (the host VERL
@@ -1014,6 +1043,95 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 expected_steps,
             )
 
+    def _set_iteration_status(self, status: str) -> str:
+        """PLAN.md §5: record what THIS iteration did.
+
+        ``actor_update_skipped`` is DERIVED here so the boolean can never
+        disagree with the authoritative status.
+        """
+        if status not in VALID_ITERATION_STATUSES:
+            raise ValueError(
+                f"unknown iteration status {status!r}; expected one of "
+                f"{VALID_ITERATION_STATUSES}"
+            )
+        self.run_manifest.last_iteration_status = status
+        self.run_manifest.actor_update_skipped = status in ZERO_SIGNAL_SKIP_STATUSES
+        return status
+
+    @staticmethod
+    def _zero_signal_skip_status(metrics: Mapping[str, Any]) -> str:
+        """Classify a fully skipped reservation by WHY every batch skipped."""
+        n_all_zero = float(metrics.get("vdra/all_zero_advantage_logical_batches", 0.0))
+        n_zero_active = float(
+            metrics.get("vdra/zero_active_token_logical_batches", 0.0)
+        )
+        if n_all_zero > 0 and n_zero_active > 0:
+            return ITERATION_STATUS_MIXED_ZERO_SIGNAL_SKIPPED
+        if n_zero_active > 0:
+            return ITERATION_STATUS_ZERO_ACTIVE_SKIPPED
+        return ITERATION_STATUS_ALL_ZERO_SKIPPED
+
+    def _enforce_livelock_guards(self, metrics: Dict[str, Any]) -> None:
+        """PLAN.md §2: a run whose reservations are all zero-signal never
+        advances ``global_step``, so without a guard it can live-lock.
+
+        Saves whatever state it can, then raises with the full context.
+        """
+        gt = self._gear_tree_config()
+        raw_limit = gt.get("max_consecutive_skipped_updates", 50)
+        limit = int(raw_limit) if raw_limit is not None else 0
+        if limit <= 0 or self.consecutive_skipped_updates < limit:
+            return
+        try:
+            self._save_manifest(self.run_manifest)
+        except Exception as exc:  # best effort — we are already aborting
+            _LOGGER.warning("could not persist the manifest before abort: %s", exc)
+        try:
+            self._maybe_save_replay_buffer()
+        except Exception as exc:
+            _LOGGER.warning("could not persist the replay buffer before abort: %s", exc)
+        raise RuntimeError(
+            "VDRA aborting: "
+            f"{self.consecutive_skipped_updates} consecutive fully skipped "
+            f"updates reached the configured limit "
+            f"gear_tree.max_consecutive_skipped_updates={limit}. A skipped "
+            "update consumes a reservation but performs no optimizer step, so "
+            "global_step cannot advance and the run would live-lock. "
+            f"global_step={self.global_steps}, "
+            f"rollout_iteration={self.rollout_iteration}, "
+            "all_zero_advantage_logical_batches="
+            f"{metrics.get('vdra/all_zero_advantage_logical_batches', 0.0)}, "
+            "zero_active_token_logical_batches="
+            f"{metrics.get('vdra/zero_active_token_logical_batches', 0.0)}. "
+            "Check the advantage/reward signal, or raise the limit "
+            "(<= 0 or null disables the guard)."
+        )
+
+    def _log_livelock_counters(self, metrics: Dict[str, Any]) -> None:
+        """PLAN.md §2: make the guard state visible on every iteration."""
+        gt = self._gear_tree_config()
+        raw_skip = gt.get("max_consecutive_skipped_updates", 50)
+        raw_iters = gt.get("max_rollout_iterations", None)
+        metrics["training/consecutive_skipped_updates"] = float(
+            self.consecutive_skipped_updates
+        )
+        metrics["training/max_consecutive_skipped_updates"] = float(
+            int(raw_skip) if raw_skip is not None else 0
+        )
+        metrics["training/max_rollout_iterations"] = float(
+            int(raw_iters) if raw_iters is not None else 0
+        )
+
+    def _rollout_iteration_budget_exhausted(self) -> bool:
+        """PLAN.md §2: stop after ``max_rollout_iterations`` even when
+        ``global_step`` never reached ``total_training_steps`` (which is what
+        happens when iterations keep getting skipped or postponed)."""
+        raw = self._gear_tree_config().get("max_rollout_iterations", None)
+        limit = int(raw) if raw is not None else 0
+        if limit <= 0:
+            return False
+        return int(self.rollout_iteration) >= limit
+
     def _resolve_expected_optimizer_steps(self, selected_count: int):
         """Authoritative expected internal optimizer-step count (PLAN.md §8).
 
@@ -1055,6 +1173,10 @@ class RayGearTreeTrainer(RayPPOTrainer):
         # PLAN.md §1.3: observational counter for explicit all-zero skipped
         # updates (session-local diagnostic; never drives the outer loop).
         self.skipped_zero_gradient_updates = 0
+        # PLAN.md §2: consecutive zero-signal skips, for the anti-livelock
+        # guard. Reset only by a SUCCESSFUL actor update — a postponed or
+        # empty iteration leaves it untouched.
+        self.consecutive_skipped_updates = 0
         # PLAN.md M1: keep rollout iteration, outer global_step, and
         # internal optimizer-step diagnostics as distinct counters.
         self.optimizer_steps_this_iteration = 0
@@ -1099,8 +1221,23 @@ class RayGearTreeTrainer(RayPPOTrainer):
         self.next_save_step = initial_next_threshold(self.global_steps, save_freq)
 
         while self.global_steps < self.total_training_steps:
+            # PLAN.md §2: stop on the rollout-iteration budget even though
+            # global_step has not reached total_training_steps — that is
+            # exactly the state a skipped/postponed run gets stuck in.
+            if self._rollout_iteration_budget_exhausted():
+                _LOGGER.warning(
+                    "stopping: rollout_iteration=%d reached "
+                    "gear_tree.max_rollout_iterations while global_step=%d < "
+                    "total_training_steps=%d.",
+                    self.rollout_iteration,
+                    self.global_steps,
+                    self.total_training_steps,
+                )
+                break
             for batch_dict in self.train_dataloader:
                 if self.global_steps >= self.total_training_steps:
+                    break
+                if self._rollout_iteration_budget_exhausted():
                     break
                 self.rollout_iteration += 1
                 # PLAN.md P0.3: reset per-iteration optimizer-step counter so
@@ -1169,6 +1306,12 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 )
                 metrics["training/successful_actor_updates"] = float(self.successful_actor_updates)
                 if not sampled_edges:
+                    # PLAN.md §2/§5: an empty reservation is NOT a zero-signal
+                    # skip and must not reset the consecutive-skip counter.
+                    metrics["training/last_iteration_status"] = (
+                        self._set_iteration_status(ITERATION_STATUS_NO_SAMPLE)
+                    )
+                    self._log_livelock_counters(metrics)
                     logger.log(data=metrics, step=self.global_steps)
                     continue
                 if self._should_postpone_sampled_update(sampled_edges):
@@ -1177,6 +1320,12 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     metrics["buffer/postponed_update"] = 1.0
                     metrics["training/postponed_updates"] = float(self.postponed_updates)
                     metrics["buffer/size_after"] = float(len(replay_buffer))
+                    # PLAN.md §2/§5: a postponed iteration does not reset the
+                    # consecutive-skip counter either.
+                    metrics["training/last_iteration_status"] = (
+                        self._set_iteration_status(ITERATION_STATUS_POSTPONED)
+                    )
+                    self._log_livelock_counters(metrics)
                     logger.log(data=metrics, step=self.global_steps)
                     continue
 
@@ -1218,12 +1367,26 @@ class RayGearTreeTrainer(RayPPOTrainer):
                         )
                         for edge in sampled_edges
                     ]
+                    # PLAN.md §5: classify WHY every logical batch skipped.
+                    skip_status = self._set_iteration_status(
+                        self._zero_signal_skip_status(metrics)
+                    )
+                    # PLAN.md §2: only a zero-signal skip advances the
+                    # consecutive-skip counter.
+                    self.consecutive_skipped_updates += 1
+                    # PLAN.md §6: a skipped iteration still consumed
+                    # generation time, so it contributes to the totals.
+                    cum_train += t_gen
                     skip_timing = {
                         "step": self.global_steps,
                         "rollout_iteration": self.rollout_iteration,
                         "actor_update_skipped": True,
+                        "last_iteration_status": skip_status,
                         "timing/generation_seconds": t_gen,
                         "timing/update_seconds": 0.0,
+                        "timing/train_total_seconds": t_gen,
+                        "timing/cumulative_train_seconds": cum_train,
+                        "timing/wall_seconds": time.time() - loop_start,
                         "train/logical_slots": float(len(sampled_edges)),
                         "train/trainable_tensor_rows": 0.0,
                         "train/dummy_rows": 0.0,
@@ -1239,6 +1402,14 @@ class RayGearTreeTrainer(RayPPOTrainer):
                         "training/num_optimizer_steps_total": float(
                             self.num_optimizer_steps_total
                         ),
+                        "training/successful_actor_updates": float(
+                            self.successful_actor_updates
+                        ),
+                        "training/postponed_updates": float(self.postponed_updates),
+                        "training/failed_updates": float(self.failed_updates),
+                        "training/consecutive_skipped_updates": float(
+                            self.consecutive_skipped_updates
+                        ),
                         "vdra/skipped_zero_gradient_updates": float(
                             self.skipped_zero_gradient_updates
                         ),
@@ -1253,21 +1424,42 @@ class RayGearTreeTrainer(RayPPOTrainer):
                             )
                         ),
                     }
-                    with open(timing_path, "a", encoding="utf-8") as fh:
-                        fh.write(json.dumps(skip_timing) + "\n")
+                    # PLAN.md §1: the reservation is ALREADY committed, so a
+                    # bookkeeping I/O failure must never crash training.
+                    try:
+                        with open(timing_path, "a", encoding="utf-8") as fh:
+                            fh.write(json.dumps(skip_timing) + "\n")
+                    except Exception as exc:
+                        metrics["vdra/timing_write_failed"] = 1.0
+                        _LOGGER.warning(
+                            "Failed to write the timing row after a skipped "
+                            "update: %s",
+                            exc,
+                        )
                     metrics.update(skip_timing)
                     # Observed facts for a skipped update: zero steps expected
                     # and zero performed, so the accounting stays valid.
                     self.optimizer_steps_this_iteration = 0
                     self._expected_optimizer_steps = 0
-                    self.run_manifest.actor_update_skipped = True
                     self._record_iteration_on_manifest(
                         selected_edges=len(sampled_edges),
                         sample_stats=sample_stats,
                         actual_optimizer_steps=0,
                     )
-                    self._save_manifest(self.run_manifest)
+                    try:
+                        self._save_manifest(self.run_manifest)
+                    except Exception as exc:
+                        metrics["vdra/manifest_save_failed"] = 1.0
+                        _LOGGER.warning(
+                            "Failed to persist the VDRA manifest after a "
+                            "skipped update: %s",
+                            exc,
+                        )
+                    self._log_livelock_counters(metrics)
                     logger.log(data=metrics, step=self.global_steps)
+                    # PLAN.md §2: abort a live-locked run (skips never advance
+                    # global_step) AFTER the state above has been persisted.
+                    self._enforce_livelock_guards(metrics)
                     continue
                 actor_updated = True
                 # PLAN.md M2 (item 3): commit + outer counters are secured
@@ -1316,9 +1508,17 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 expected_optim_steps = self._resolve_expected_optimizer_steps(
                     len(sampled_edges)
                 )
+                self._log_livelock_counters(metrics)
                 timing = {
                     "step": self.global_steps,
                     "rollout_iteration": self.rollout_iteration,
+                    # PLAN.md §5: authoritative record of what this iteration
+                    # did, plus the derived compatibility flag.
+                    "last_iteration_status": self.run_manifest.last_iteration_status,
+                    "actor_update_skipped": self.run_manifest.actor_update_skipped,
+                    "training/consecutive_skipped_updates": float(
+                        self.consecutive_skipped_updates
+                    ),
                     "timing/generation_seconds": t_gen,
                     "timing/update_seconds": t_update,
                     "timing/train_total_seconds": t_gen + t_update,

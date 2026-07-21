@@ -37,10 +37,29 @@ Canonical contract exercised end to end on CPU:
 - Strict canonical sparse mode requires `entropy_coeff == 0`,
   `use_kl_loss == false`, `kl_loss_coef == 0` — sparse omission preserves
   the policy-gradient term exactly but not a dense auxiliary objective.
-- Replay checkpoints persist the objective-mask identity (logical-slot
+- Replay checkpoints persist the objective-mask identity (logical-record
   schema v2); restore fails fast on a mask/threshold mismatch or a legacy
   checkpoint lacking active-token counts, with an explicit
   `reset_replay_on_objective_mismatch` opt-out that DISCARDS the rows.
+  Canonical runs additionally require the complete schema-v2 denominator
+  metadata on every trainable edge and never recompute it silently; a
+  checkpoint never claims v2 while holding incomplete records.
+- Canonical logical-batch VDRA supports the POLICY-GRADIENT objective only:
+  entropy/KL are rejected at startup regardless of `strict_vdra`, because
+  their normalization is not yet guaranteed to be invariant to the
+  micro-batch partitioning of a logical batch.
+- Anti-livelock guards: `gear_tree.max_consecutive_skipped_updates` (50)
+  aborts a run whose reservations keep carrying no learning signal (skips
+  never advance `global_step`), and `gear_tree.max_rollout_iterations`
+  stops a run whose `global_step` is stuck below `total_training_steps`.
+  Both are disabled by `null`/`<= 0`.
+- Every iteration records `last_iteration_status` (updated /
+  all_zero_skipped / zero_active_skipped / mixed_zero_signal_skipped /
+  postponed / no_sample / failed_before_actor / actor_failed); the legacy
+  `actor_update_skipped` boolean is derived from it. Fully skipped
+  iterations write a timing row (including cumulative and wall-clock time)
+  and persist the manifest, with bookkeeping I/O failures logged rather
+  than fatal — the replay reservation is already committed.
 - Sparse tensor execution over the logical-slot ledger: advantages from the
   complete sibling set, zero-advantage segments become metadata-only slots
   that count toward reservation / caps / `target_edges_per_iteration` /

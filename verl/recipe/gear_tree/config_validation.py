@@ -196,6 +196,28 @@ def validate_policy_loss_consistency(
                 f"probability_mask_threshold={_thr!r} is invalid; must "
                 "satisfy 0 < threshold <= 1 (PLAN.md §1)."
             )
+        # PLAN.md §3: canonical logical-batch VDRA supports the
+        # POLICY-GRADIENT objective only. Entropy/KL are per-token auxiliary
+        # reductions whose normalization is not yet guaranteed to be
+        # invariant to the micro-batch partitioning of a logical batch, so
+        # they are refused REGARDLESS of strict_vdra rather than silently
+        # producing a partition-dependent objective.
+        if policy_agg in ("segment_mean", "token_mean"):
+            actor_cfg = config.actor_rollout_ref.actor
+            _entropy = float(actor_cfg.get("entropy_coeff", 0.0) or 0.0)
+            _use_kl = bool(actor_cfg.get("use_kl_loss", False))
+            _kl_coef = float(actor_cfg.get("kl_loss_coef", 0.0) or 0.0)
+            if _entropy != 0.0 or _use_kl or _kl_coef != 0.0:
+                raise ValueError(
+                    "Canonical logical-batch VDRA currently supports the "
+                    "policy-gradient objective only. Entropy/KL auxiliary "
+                    "reductions are not yet guaranteed to preserve the same "
+                    "normalization across microbatches. Disable them or use "
+                    "an explicitly supported non-canonical loss path. "
+                    f"(policy_aggregation={policy_agg!r}, "
+                    f"entropy_coeff={_entropy}, use_kl_loss={_use_kl}, "
+                    f"kl_loss_coef={_kl_coef}; PLAN.md §3)"
+                )
         # PLAN.md §5: canonical logical batching partitions the reservation
         # into EXACT ppo_mini_batch_size batches before tensor filtering; a
         # tail logical batch is not implemented, so an indivisible reservation
@@ -256,26 +278,4 @@ def validate_policy_loss_consistency(
                 "tensor-execution policy over the logical-slot ledger "
                 "(corrected meaning, PLAN.md §1.2). Dense execution of zero "
                 "rows is not the canonical strict path."
-            )
-        # PLAN.md §10: omitting exact-zero rows is mathematically equivalent
-        # to dense execution for the POLICY-GRADIENT term only. Entropy and
-        # KL are per-token auxiliary objectives that a zero-advantage row
-        # WOULD contribute to densely, and no zero-slot auxiliary contract
-        # exists yet — so strict sparse canonical mode must refuse them
-        # rather than silently claim sparse/dense parity.
-        actor_cfg = config.actor_rollout_ref.actor
-        _entropy = float(actor_cfg.get("entropy_coeff", 0.0) or 0.0)
-        _use_kl = bool(actor_cfg.get("use_kl_loss", False))
-        _kl_coef = float(actor_cfg.get("kl_loss_coef", 0.0) or 0.0)
-        if _entropy != 0.0 or _use_kl or _kl_coef != 0.0:
-            raise ValueError(
-                "strict canonical sparse VDRA requires entropy_coeff == 0, "
-                "use_kl_loss == false and kl_loss_coef == 0 (PLAN.md §10); "
-                f"got entropy_coeff={_entropy}, use_kl_loss={_use_kl}, "
-                f"kl_loss_coef={_kl_coef}. Sparse zero-slot execution omits "
-                "exact-zero rows from the tensor batch, which preserves the "
-                "policy-gradient objective exactly but NOT a dense "
-                "entropy/KL objective those rows would also contribute to. "
-                "Set strict_vdra=false to run this as an explicitly "
-                "objective-changing ablation, or disable entropy/KL."
             )

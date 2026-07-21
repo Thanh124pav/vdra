@@ -31,6 +31,40 @@ POLICY_AGGREGATION_TREE_BALANCED = "tree_balanced_segment_mean"  # ablation
 POLICY_AGGREGATION_VDRA = "vdra_node_balanced"  # deprecated main; kept as ablation
 POLICY_AGGREGATION_LEGACY = "legacy_token_mean"
 
+# PLAN.md §5: what the last training iteration actually did. A boolean
+# cannot distinguish a zero-signal skip from a postponed or empty iteration,
+# so this status is the authoritative record; ``actor_update_skipped`` is
+# derived from it.
+ITERATION_STATUS_NOT_STARTED = "not_started"
+ITERATION_STATUS_UPDATED = "updated"
+ITERATION_STATUS_ALL_ZERO_SKIPPED = "all_zero_skipped"
+ITERATION_STATUS_ZERO_ACTIVE_SKIPPED = "zero_active_skipped"
+ITERATION_STATUS_MIXED_ZERO_SIGNAL_SKIPPED = "mixed_zero_signal_skipped"
+ITERATION_STATUS_POSTPONED = "postponed"
+ITERATION_STATUS_NO_SAMPLE = "no_sample"
+ITERATION_STATUS_FAILED_BEFORE_ACTOR = "failed_before_actor"
+ITERATION_STATUS_ACTOR_FAILED = "actor_failed"
+
+VALID_ITERATION_STATUSES = (
+    ITERATION_STATUS_NOT_STARTED,
+    ITERATION_STATUS_UPDATED,
+    ITERATION_STATUS_ALL_ZERO_SKIPPED,
+    ITERATION_STATUS_ZERO_ACTIVE_SKIPPED,
+    ITERATION_STATUS_MIXED_ZERO_SIGNAL_SKIPPED,
+    ITERATION_STATUS_POSTPONED,
+    ITERATION_STATUS_NO_SAMPLE,
+    ITERATION_STATUS_FAILED_BEFORE_ACTOR,
+    ITERATION_STATUS_ACTOR_FAILED,
+)
+
+# The statuses that mean "a reservation was consumed but no optimizer step
+# ran because it carried no learning signal".
+ZERO_SIGNAL_SKIP_STATUSES = (
+    ITERATION_STATUS_ALL_ZERO_SKIPPED,
+    ITERATION_STATUS_ZERO_ACTIVE_SKIPPED,
+    ITERATION_STATUS_MIXED_ZERO_SIGNAL_SKIPPED,
+)
+
 # PLAN.md P0.1: within-segment token reduction must be exactly one of these.
 SEGMENT_TOKEN_REDUCTION_MEAN = "mean"
 SEGMENT_TOKEN_REDUCTION_SUM = "sum"
@@ -99,10 +133,12 @@ class RunManifest:
     fresh_iid_row_count_matches_allocated_k: bool = True
     replay_age_uses_rollout_iteration: bool = False
     optimizer_step_accounting_valid: bool = False
-    # PLAN.md §6: true when the LAST iteration was a fully skipped update
-    # (every logical batch was all_zero_advantage / zero_active_tokens), so
-    # no actor RPC ran and global_step / the scheduler did not advance.
-    # Observational: it never gates main-run validity.
+    # PLAN.md §5: what the LAST iteration actually did. A single boolean
+    # cannot distinguish a zero-signal skip from a postponed or empty
+    # iteration, so the status string is authoritative and
+    # ``actor_update_skipped`` is DERIVED from it for compatibility.
+    # Observational: neither gates main-run validity.
+    last_iteration_status: str = ITERATION_STATUS_NOT_STARTED
     actor_update_skipped: bool = False
     unique_tree_ids_verified: bool = False
 

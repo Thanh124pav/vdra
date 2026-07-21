@@ -46,10 +46,24 @@ gear_tree:
   # TreeRL-style discount (only used by treerl_style_ablation).
   treerl_gamma: 0.9
 
-  # Stage 1 zero-filter contract: despite the legacy name, true removes
-  # only exact-zero advantages after all realized non-pruned segments have
-  # been counted; positive and negative advantages are retained.
+  # Sparse-execution contract (PLAN.md §1.2): despite the legacy name, true
+  # removes exact-zero advantages from TENSOR EXECUTION only, after all
+  # realized non-pruned segments have been counted. Those segments still
+  # enter replay as metadata-only logical slots and still count in the
+  # M_B / T_B denominators; positive and negative advantages are retained.
   only_adv_greater_than_zero: true
+
+  # PLAN.md §2 anti-livelock guards. A fully skipped update consumes a
+  # reservation but performs no optimizer step, so global_step cannot
+  # advance — without these a zero-signal run would never terminate.
+  #
+  #   max_consecutive_skipped_updates: abort after this many consecutive
+  #       fully skipped reservations. null or <= 0 disables the guard.
+  #   max_rollout_iterations: stop the run after this many rollout
+  #       iterations even if global_step never reached
+  #       total_training_steps. null or <= 0 disables the guard.
+  max_consecutive_skipped_updates: 50
+  max_rollout_iterations: null
 
   replay_buffer:
     enabled: true

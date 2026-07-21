@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+import warnings
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -987,11 +988,13 @@ def _construction_summary_failures(
 ) -> List[str]:
     """Validate extraction-time construction summaries.
 
-    Covers the facts that retained edges cannot represent: a parent (or a
-    whole tree) whose every child had exactly zero advantage retains no rows,
-    so its pre-filter ``realized == allocated_k`` contract and its queue
-    identity can only be checked here. Zero-filtered rows themselves are
-    never re-inserted into replay.
+    Covers the facts that TRAINABLE edges cannot represent: a parent (or a
+    whole tree) whose every child had exactly zero advantage produces no
+    trainable tensor rows, so its pre-filter ``realized == allocated_k``
+    contract and its queue identity can only be checked here. Under sparse
+    execution those children DO enter replay as metadata-only logical slots
+    (they count toward reservation, caps and the M_B / T_B denominators);
+    they simply never become trainable rows.
     """
     details: List[str] = []
     for summary in construction_summaries:
@@ -1455,6 +1458,17 @@ def build_logical_update_batch(
                     log_probs, probability_mask_threshold
                 )
                 if raw_mask is None:
+                    # PLAN.md §4: legacy/non-canonical records may still be
+                    # completed here, but never silently — a canonical run
+                    # rejects them upstream in the replay validator.
+                    warnings.warn(
+                        "recomputing a missing prob_mask_token_count for "
+                        f"edge {slot.get('edge_id')!r}; canonical VDRA "
+                        "requires the stamped schema-v2 denominator metadata "
+                        "(PLAN.md §4).",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                     raw_mask = recomputed
                 elif int(raw_mask) != recomputed:
                     raise ValueError(
