@@ -91,12 +91,11 @@ def run_ppo(config) -> None:
         ray.timeline(filename=timeline_json_file)
 
 
-@ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
-class TaskRunner:
-    """Ray remote class for executing distributed PPO training tasks.
+class TaskRunnerBase:
+    """Plain runner base for executing distributed PPO training tasks.
 
-    This class encapsulates the main training logic and runs as a Ray remote actor
-    to enable distributed execution across multiple nodes and GPUs.
+    ``TaskRunner`` wraps this class as a Ray actor below; recipe entrypoints can
+    subclass this base without inheriting from a Ray actor class.
 
     Attributes:
         role_worker_mapping: Dictionary mapping Role enums to Ray remote worker classes
@@ -106,6 +105,9 @@ class TaskRunner:
     def __init__(self):
         self.role_worker_mapping = {}
         self.mapping = {}
+
+    def healthcheck(self) -> bool:
+        return True
 
     def add_actor_rollout_worker(self, config):
         """Add actor rollout worker based on the actor strategy."""
@@ -315,6 +317,10 @@ class TaskRunner:
 
         # Start the training process.
         trainer.fit()
+
+
+# please make sure main_task is not scheduled on head
+TaskRunner = ray.remote(num_cpus=1)(TaskRunnerBase)
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True):

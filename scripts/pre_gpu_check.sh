@@ -20,6 +20,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
 export PYTHONPATH="${REPO_ROOT}/verl${PYTHONPATH:+:${PYTHONPATH}}"
+export TMPDIR=/tmp
+export TMP=/tmp
+export TEMP=/tmp
 
 log() {
     printf "[pre_gpu_check] %s\n" "$*" >&2
@@ -33,6 +36,17 @@ fail() {
 log "1/20 compileall vdra_core and gear_tree"
 python -m compileall -q vdra_core verl/recipe/gear_tree \
     || fail "compileall failed"
+
+log "1b/20 real Ray entrypoint imports"
+python - <<'PY'
+import verl.trainer.main_ppo
+import recipe.gear_tree.main_gear_tree
+print("RAY_ENTRYPOINT_IMPORT=PASS")
+PY
+
+log "1c/20 Ray entrypoint actor healthchecks"
+python -m pytest verl/recipe/gear_tree/tests/test_main_gear_tree_entrypoint.py -q \
+    || fail "Ray entrypoint actor tests failed"
 
 log "2/20 targeted CPU tests (root)"
 python -m pytest tests/ -q \
@@ -68,12 +82,6 @@ python scripts/check_hydra_composition.py \
 
 log "5/20 PolicyLossConfig schema validation (invalid value must raise)"
 python -c "
-# Same compatibility shim the recipe tests and check_hydra_composition.py use:
-# newer transformers releases removed AutoModelForVision2Seq, which
-# verl.utils.model imports eagerly.
-import transformers
-if not hasattr(transformers, 'AutoModelForVision2Seq'):
-    transformers.AutoModelForVision2Seq = object
 from verl.workers.config.actor import PolicyLossConfig
 pl = PolicyLossConfig(loss_mode='vdra_segment_mean_ppo', segment_token_reduction='mean')
 assert pl.segment_token_reduction == 'mean'

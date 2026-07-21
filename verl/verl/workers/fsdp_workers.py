@@ -281,13 +281,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     ):
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
-        from transformers import (
-            AutoConfig,
-            AutoModel,
-            AutoModelForCausalLM,
-            AutoModelForImageTextToText,
-            AutoModelForVision2Seq,
-        )
+        from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+
+        try:
+            from transformers import AutoModelForImageTextToText
+        except ImportError:  # transformers < 4.54
+            AutoModelForImageTextToText = None
+        try:
+            from transformers import AutoModelForVision2Seq
+        except ImportError:  # transformers >= 4.54 / 5.x
+            AutoModelForVision2Seq = AutoModelForImageTextToText
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
@@ -315,8 +318,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
+        attn_implementation = override_model_config.get("attn_implementation", "flash_attention_2")
         actor_model_config = AutoConfig.from_pretrained(
-            local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2"
+            local_path, trust_remote_code=trust_remote_code, attn_implementation=attn_implementation
         )
         # TODO: VL models use VisionAttention, which directly uses flash_attention in transformers>=4.53
         # which will be patched by _ulysses_flash_attention_forward, but errorly misses position_ids
@@ -364,11 +368,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     case _:
                         actor_module_class = AutoModel
             else:
-                if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
+                if (
+                    AutoModelForVision2Seq is not None
+                    and type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys()
+                ):
                     actor_module_class = AutoModelForVision2Seq
                 elif type(actor_model_config) in AutoModelForCausalLM._model_mapping.keys():
                     actor_module_class = AutoModelForCausalLM
-                elif type(actor_model_config) in AutoModelForImageTextToText._model_mapping.keys():
+                elif (
+                    AutoModelForImageTextToText is not None
+                    and type(actor_model_config) in AutoModelForImageTextToText._model_mapping.keys()
+                ):
                     actor_module_class = AutoModelForImageTextToText
                 else:
                     actor_module_class = AutoModel

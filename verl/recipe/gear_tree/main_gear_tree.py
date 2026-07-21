@@ -1,6 +1,6 @@
 """Entry point for the GEAR/Tree recipe.
 
-Subclasses verl's ``TaskRunner`` to (1) use ``GearTreeActorRolloutWorker`` (adds
+Subclasses verl's ``TaskRunnerBase`` to (1) use ``GearTreeActorRolloutWorker`` (adds
 the dispatched ``build_trees`` method) and (2) run ``RayGearTreeTrainer`` (tree
 rollout loop). Importing the recipe modules registers ``treetune_ppo`` (policy
 loss) and ``gear_math`` (reward manager). Config lives in ``./config``.
@@ -14,7 +14,7 @@ import hydra
 import ray
 from omegaconf import OmegaConf
 
-from verl.trainer.main_ppo import TaskRunner, create_rl_dataset, create_rl_sampler
+from verl.trainer.main_ppo import TaskRunnerBase, create_rl_dataset, create_rl_sampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 
 # Import for decorator side effects (registers treetune_ppo + gear_math + the
@@ -25,7 +25,7 @@ import recipe.gear_tree.async_tree_rollout  # noqa: F401
 
 
 @ray.remote(num_cpus=1)
-class GearTreeTaskRunner(TaskRunner):
+class GearTreeTaskRunner(TaskRunnerBase):
     def add_actor_rollout_worker(self, config):
         """Pick the worker by rollout backend.
 

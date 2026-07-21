@@ -74,17 +74,12 @@ Canonical contract exercised end to end on CPU:
   retired `batch_slot_mean_ablation` flag, `token_mean` + `sum`, strict main
   without `only_adv_greater_than_zero=true`.
 
-## Known environmental non-issues (NOT introduced here, not GPU-fixable locally)
+## Ray entrypoint status
 
-```text
-import recipe.gear_tree.main_gear_tree in a bare process raises
-  ray.actor.ActorClassInheritanceException
-```
-
-This is structural and PRE-EXISTING (baseline de9ff6f already declares
-`@ray.remote class GearTreeTaskRunner(TaskRunner)`). It only triggers when
-the module is imported standalone without a Ray runtime; the real entrypoint
-runs under `ray.init`. It is unrelated to the objective migration.
+The Ray actor inheritance issue was a real CPU/runtime entrypoint bug.
+`TaskRunner` is now split into `TaskRunnerBase` plus a Ray actor wrapper.
+`GearTreeTaskRunner` subclasses `TaskRunnerBase`. The real entrypoint import
+and local Ray actor startup are covered by CPU tests.
 
 ## Only the server GPU smoke can verify (expected remaining risk surface)
 
