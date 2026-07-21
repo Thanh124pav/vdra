@@ -79,7 +79,7 @@ def _matrix_cell(resolved: dict) -> tuple[str, str, str, str]:
         (
             # Smoke D: full VDRA (segment-average main path, PLAN.md P0.1).
             "smoke_d_full_vdra",
-            ("global_segment_mean", "budget_allocation", "fresh_iid", "vdra_segment_mean_ppo"),
+            ("segment_mean", "budget_allocation", "fresh_iid", "vdra_segment_mean_ppo"),
         ),
     ],
 )
@@ -106,7 +106,7 @@ def test_smoke_d_full_vdra_enables_strict_group_integrity():
     resolved = _resolved("smoke_d_full_vdra")
     assert resolved["tree_policy"]["strict_group_integrity"] is True
     # PLAN.md P0.1: main VDRA is the segment-average path.
-    assert resolved["tree_policy"]["policy_aggregation"] == "global_segment_mean"
+    assert resolved["tree_policy"]["policy_aggregation"] == "segment_mean"
     assert resolved["tree_policy"]["segment_token_reduction"] == "mean"
     policy_loss = resolved["actor_rollout_ref"]["actor"]["policy_loss"]
     assert policy_loss["loss_mode"] == "vdra_segment_mean_ppo"
@@ -140,7 +140,7 @@ def test_segment_token_reduction_sum_override_preserves_pipeline():
         },
     )
     # Only the two segment_token_reduction knobs differ.
-    assert overridden["tree_policy"]["policy_aggregation"] == "global_segment_mean"
+    assert overridden["tree_policy"]["policy_aggregation"] == "segment_mean"
     assert (
         overridden["actor_rollout_ref"]["actor"]["policy_loss"]["loss_mode"]
         == "vdra_segment_mean_ppo"

@@ -40,12 +40,17 @@ class _Cfg:
         use_prob_mask: bool = False,
         ratio_threshold: float = 1e6,
         segment_token_reduction: str = "mean",
+        # PLAN.md §1.3: this suite exercises the tree-balanced weighted
+        # objective (segment_objective_weights / 1/(N_T*N_seg)), which is
+        # now the labeled tree_balanced_segment_mean ablation.
+        policy_aggregation: str = "tree_balanced_segment_mean",
     ) -> None:
         self.clip_ratio = clip_ratio
         self._d = {
             "use_prob_mask": use_prob_mask,
             "ratio_threshold": ratio_threshold,
             "segment_token_reduction": segment_token_reduction,
+            "policy_aggregation": policy_aggregation,
         }
 
     def get(self, key: str, default=None):

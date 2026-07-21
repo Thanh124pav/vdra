@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+import warnings
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -87,7 +88,11 @@ def group_tensors_for_edges(edges: Sequence[Dict[str, Any]]) -> Dict[str, torch.
 
 
 def compute_segment_objective_weights(edges: Sequence[Dict[str, Any]]) -> List[float]:
-    """PLAN.md P0.4: precompute the segment-average weight for every row.
+    """Precompute the TREE-BALANCED weight for every row (PLAN.md P0.4).
+
+    This is the ``tree_balanced_segment_mean`` ABLATION weight, NOT a
+    canonical objective: ``segment_mean`` / ``token_mean`` use the
+    trainer-stamped logical denominators ``M_B`` / ``T_B`` instead.
 
     For every retained segment ``s`` in tree ``T`` in a batch of ``N_T`` trees::
 
@@ -651,16 +656,38 @@ def normalize_generated_edges(
             raise ValueError(
                 "Generated edge policy_snapshot_id mismatches rollout snapshot"
             )
-        response = list(record.get("response_token_ids") or [])
-        log_probs = record.get("actor_shifted_log_probs")
-        if log_probs is None:
-            raise ValueError(
-                "Generated edge is missing generation-time actor_shifted_log_probs"
-            )
-        if len(log_probs) != len(response):
-            raise ValueError(
-                "Generated edge log-probs do not align with response tokens"
-            )
+        is_slot = (
+            "trainable_edge_id" in record and record["trainable_edge_id"] is None
+        )
+        if is_slot:
+            # PLAN.md §1.2: metadata-only logical slot — same identity
+            # derivation as trainable edges, no payload checks. Its
+            # pre-filter response_token_count must already be stamped.
+            if int(record.get("response_token_count", 0) or 0) <= 0:
+                raise ValueError(
+                    "Generated logical slot is missing a positive "
+                    "response_token_count (PLAN.md §1.2)."
+                )
+            if float(record.get("advantage", 1.0) or 0.0) != 0.0:
+                raise ValueError(
+                    "Generated logical slot must carry exactly zero "
+                    "advantage (PLAN.md §1.2)."
+                )
+        else:
+            response = list(record.get("response_token_ids") or [])
+            log_probs = record.get("actor_shifted_log_probs")
+            if log_probs is None:
+                raise ValueError(
+                    "Generated edge is missing generation-time actor_shifted_log_probs"
+                )
+            if len(log_probs) != len(response):
+                raise ValueError(
+                    "Generated edge log-probs do not align with response tokens"
+                )
+            # PLAN.md §1.2: a trainable record that participates in the
+            # sparse ledger points at itself once its edge_id is final.
+            if "advantage_is_zero" in record:
+                record.setdefault("trainable_edge_id", record["edge_id"])
         record.setdefault("depth", int(record.get("depth", 0) or 0))
         record.setdefault("leaf", bool(record.get("leaf", False)))
         record.setdefault("pruned", bool(record.get("pruned", False)))
@@ -917,8 +944,9 @@ def validate_tree_construction(
     queue_failures, queue_details = _queue_segment_identity_failures(edges)
     failures.extend(queue_details)
 
-    # Extraction-time construction summaries: the only construction record
-    # for parents/trees whose every child was zero-filtered away.
+    # Extraction-time construction summaries preserve parent/tree facts
+    # when every child has exactly zero advantage. Those children still enter
+    # replay as metadata-only logical slots and produce no trainable tensor rows.
     summary_failure_count = 0
     if construction_summaries:
         summary_details = _construction_summary_failures(construction_summaries)
@@ -961,11 +989,13 @@ def _construction_summary_failures(
 ) -> List[str]:
     """Validate extraction-time construction summaries.
 
-    Covers the facts that retained edges cannot represent: a parent (or a
-    whole tree) whose every child had exactly zero advantage retains no rows,
-    so its pre-filter ``realized == allocated_k`` contract and its queue
-    identity can only be checked here. Zero-filtered rows themselves are
-    never re-inserted into replay.
+    Covers the facts that TRAINABLE edges cannot represent: a parent (or a
+    whole tree) whose every child had exactly zero advantage produces no
+    trainable tensor rows, so its pre-filter ``realized == allocated_k``
+    contract and its queue identity can only be checked here. Under sparse
+    execution those children DO enter replay as metadata-only logical slots
+    (they count toward reservation, caps and the M_B / T_B denominators);
+    they simply never become trainable rows.
     """
     details: List[str] = []
     for summary in construction_summaries:
@@ -1148,9 +1178,10 @@ def _right_pad(ids: Sequence[int], length: int, pad_id: int) -> List[int]:
 
 
 # PLAN.md P0.C: loss modes whose actor loss consumes precomputed float
-# objective-weight tensors. The canonical ``vdra_segment_mean_ppo`` path uses
-# the segment objective 1/(N_T * N_seg(T)); node-balanced weights are only for
-# the explicit ablation below.
+# objective-weight tensors. The canonical ``vdra_segment_mean_ppo`` path
+# (segment_mean / token_mean) needs NONE: it uses the trainer-stamped logical
+# batch denominators M_B / T_B. Node-balanced weights are only for the
+# explicit ablation below.
 _LOSS_MODES_WITH_OBJECTIVE_WEIGHTS = ("vdra_node_balanced_ppo",)
 
 
@@ -1172,13 +1203,15 @@ def edges_to_dataproto(
     Non-tensor fields: ``uid`` (per source question, for grouping/logging),
     ``question_id``, ``reward_model``, ``extra_info``.
 
-    PLAN.md P0.C: ``loss_mode`` selects which float weight tensors are
-    attached. The canonical ``vdra_segment_mean_ppo`` mode attaches NO
-    ``objective_weights`` / ``segment_objective_weights`` here: its actor
-    loss computes the segment objective 1/(N_T * N_seg(T)) directly from the
-    row metadata. Only the explicit ``vdra_node_balanced_ppo`` ablation still
-    receives its precomputed weights. Integer group/identity tensors are
-    attached unconditionally for diagnostics and validation.
+    PLAN.md P0.C/§1.3: ``loss_mode`` selects which float weight tensors are
+    attached. The canonical ``vdra_segment_mean_ppo`` path attaches NO
+    tree-balanced objective weights: ``segment_mean`` / ``token_mean`` use
+    the trainer-stamped logical batch denominators ``M_B`` / ``T_B``. The
+    formula ``1/(N_T * N_seg(T))`` belongs only to the
+    ``tree_balanced_segment_mean`` ablation. Only the explicit
+    ``vdra_node_balanced_ppo`` ablation still receives its precomputed
+    weights. Integer group/identity tensors are attached unconditionally for
+    diagnostics and validation.
     """
     if not edges:
         raise ValueError("edges_to_dataproto received an empty edge list")
@@ -1267,10 +1300,12 @@ def edges_to_dataproto(
         batch[key] = value
 
     # PLAN.md P0.C: float objective-weight tensors are attached ONLY for the
-    # explicit node-balanced ablation. The canonical segment-mean loss derives
-    # 1/(N_T * N_seg(T)) from row metadata and must receive neither tensor;
-    # tree- and parent-normalized weights would silently re-couple the batch
-    # to complete-tree assumptions.
+    # explicit node-balanced ablation. The CANONICAL paper objectives
+    # (segment_mean / token_mean) weigh rows uniformly by the trainer-stamped
+    # pre-filter logical denominators M_B / T_B and must receive neither
+    # tensor; tree- and parent-normalized weights would silently re-couple the
+    # batch to complete-tree assumptions. (The 1/(N_T * N_seg(T)) formula
+    # belongs to the tree_balanced_segment_mean ABLATION only.)
     if str(loss_mode) in _LOSS_MODES_WITH_OBJECTIVE_WEIGHTS:
         obj_weights = compute_objective_weights(edges)
         validate_objective_weights(edges, obj_weights)
@@ -1306,3 +1341,362 @@ def edges_to_dataproto(
         ),
     }
     return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+
+
+def build_logical_update_batch(
+    slots: List[Dict[str, Any]],
+    tokenizer,
+    *,
+    max_prompt_length: int,
+    max_response_length: int,
+    ppo_mini_batch_size: int,
+    dp_size: int,
+    loss_mode: str = "vdra_segment_mean_ppo",
+    include_old_log_probs: bool = True,
+    use_prob_mask: bool = False,
+    probability_mask_threshold: float = 0.9,
+    require_logical_denominator_metadata: bool = False,
+) -> Tuple[Optional[DataProto], Dict[str, float]]:
+    """PLAN.md §1.2/§1.3/§5/§6 (2026-07-21): tensorize a reservation of LOGICAL slots.
+
+    ``slots`` is the reservation in RESERVATION ORDER: metadata-only zero
+    slots (``is_ledger_slot``) and trainable rows interleaved. This function:
+
+    1. partitions the slots into logical optimizer batches of
+       ``ppo_mini_batch_size`` BEFORE any tensor filtering;
+    2. computes the exact PRE-FILTER denominators per batch ``B``:
+       ``M_B`` = logical slot count,
+       ``T_B_response`` = sum of ``response_token_count``,
+       ``T_B_prob_mask`` = sum of ``prob_mask_token_count``,
+       each over EVERY slot in ``B`` (zero slots included) — failing fast
+       when a record lacks the count the SELECTED objective needs (no
+       ``tree_total_segment_count`` approximation, no retained-row fallback);
+    3. classifies each logical batch (PLAN.md §6):
+       ``all_zero_advantage`` (no trainable rows),
+       ``zero_active_tokens`` (trainable rows exist but no effective active
+       token on any of them), otherwise ``trainable``;
+    4. tensorizes ONLY the trainable rows of TRAINABLE batches, padding each
+       to a multiple of ``dp_size`` with collective-safe dummy rows
+       (exact-zero advantage, one pad token, explicitly masked and counted in
+       NO denominator or replay metric);
+    5. orders rows RANK-MAJOR (all of rank 0's rows for batches 0..K-1, then
+       rank 1's, ...) so verl's contiguous ``DataProto.chunk`` hands every
+       rank the same number of rows for every logical batch — no FSDP rank
+       can skip a collective another rank enters;
+    6. stamps ``logical_batch_index``/``is_dummy`` row tensors and the
+       per-batch ``original_logical_segment_count`` /
+       ``original_logical_response_token_count`` /
+       ``original_logical_prob_mask_token_count`` /
+       ``logical_batch_status`` lists (one value per logical batch, never one
+       per call) plus ``logical_dp_size`` into ``meta_info``.
+
+    Returns ``(None, stats)`` when EVERY logical batch is skipped — the
+    trainer records an explicit skipped update (no update_actor RPC, no
+    global_step, no scheduler.step; PLAN.md §1.3/§7).
+    """
+    from recipe.gear_tree.prob_mask import count_prob_mask_active_tokens
+    from recipe.gear_tree.replay_buffer import is_ledger_slot
+
+    n = len(slots)
+    mini = int(ppo_mini_batch_size)
+    dp = int(dp_size)
+    if n <= 0:
+        raise ValueError("build_logical_update_batch received an empty reservation")
+    if mini <= 0 or dp <= 0:
+        raise ValueError(
+            f"ppo_mini_batch_size={ppo_mini_batch_size!r} and dp_size={dp_size!r} "
+            "must be positive"
+        )
+    if n % mini != 0:
+        raise ValueError(
+            f"reservation of {n} logical slots is not divisible by "
+            f"ppo_mini_batch_size={mini}; the postpone_until_divisible policy "
+            "must gate the update BEFORE tensorization (PLAN.md P0.D/§1.2)."
+        )
+
+    emitted_legacy_warnings = set()
+
+    def _warn_legacy_missing(field: str, edge_id: Any, message: str) -> None:
+        # Warn once per build and field: legacy callers still get an explicit
+        # signal without flooding large local parity tests.
+        if field in emitted_legacy_warnings:
+            return
+        emitted_legacy_warnings.add(field)
+        warnings.warn(message.format(edge_id=edge_id), RuntimeWarning, stacklevel=2)
+
+    def _slot_counts(slot: Dict[str, Any]) -> Tuple[int, int]:
+        """(response_token_count, prob_mask_token_count) — stamped, never
+        recomputed for a zero slot whose log-prob payload was removed."""
+        if require_logical_denominator_metadata:
+            missing = [
+                name
+                for name in (
+                    "response_token_count",
+                    "prob_mask_token_count",
+                    "probability_mask_threshold",
+                )
+                if slot.get(name) is None
+            ]
+            if missing:
+                raise ValueError(
+                    "canonical logical record is missing schema-v2 "
+                    "denominator metadata fields "
+                    f"{missing}; offending edge_id={slot.get('edge_id')!r} "
+                    "(PLAN.md §4)."
+                )
+        raw_resp = slot.get("response_token_count")
+        if raw_resp is None:
+            response_ids = slot.get("response_token_ids") or []
+            if response_ids:
+                _warn_legacy_missing(
+                    "response_token_count",
+                    slot.get("edge_id"),
+                    "recomputing a missing response_token_count for "
+                    "edge {edge_id!r}; canonical VDRA requires the stamped "
+                    "schema-v2 denominator metadata (PLAN.md §4).",
+                )
+                raw_resp = len(response_ids)
+            else:
+                raw_resp = None
+        if raw_resp is None or int(raw_resp) <= 0:
+            raise ValueError(
+                "logical slot/edge is missing a positive "
+                "response_token_count; the exact pre-filter denominator "
+                "cannot be reconstructed (PLAN.md §1.2 — never approximate "
+                "with tree_total_segment_count). Offending record edge_id="
+                f"{slot.get('edge_id')!r}."
+            )
+        resp = int(raw_resp)
+        # PLAN.md §4: second line of defence for direct/test callers that
+        # bypass replay insertion — a stamped count from another threshold
+        # must never be consumed under this one.
+        raw_thr = slot.get("probability_mask_threshold")
+        if raw_thr is not None and abs(
+            float(raw_thr) - float(probability_mask_threshold)
+        ) > 1e-12:
+            raise ValueError(
+                f"logical record {slot.get('edge_id')!r} stamps "
+                f"probability_mask_threshold={float(raw_thr)} but this batch "
+                f"is being built with {float(probability_mask_threshold)}; "
+                "its prob_mask_token_count was computed under a different "
+                "objective and must not be reused (PLAN.md §4)."
+            )
+        if raw_thr is None:
+            _warn_legacy_missing(
+                "probability_mask_threshold",
+                slot.get("edge_id"),
+                "logical record {edge_id!r} is missing "
+                "probability_mask_threshold; legacy/non-canonical batching "
+                "will use the current threshold, but canonical VDRA requires "
+                "the stamped schema-v2 metadata (PLAN.md §4).",
+            )
+        raw_mask = slot.get("prob_mask_token_count")
+        if not is_ledger_slot(slot):
+            # PLAN.md §1: a TRAINABLE row still carries its payload, so its
+            # stamped counts must AGREE with it — never merely be present.
+            response_ids = slot.get("response_token_ids") or []
+            if response_ids and resp != len(response_ids):
+                raise ValueError(
+                    f"logical edge {slot.get('edge_id')!r} stamps "
+                    f"response_token_count={resp} but carries "
+                    f"{len(response_ids)} response tokens (PLAN.md §1)."
+                )
+            log_probs = slot.get("actor_shifted_log_probs")
+            if log_probs is not None:
+                recomputed = count_prob_mask_active_tokens(
+                    log_probs, probability_mask_threshold
+                )
+                if raw_mask is None:
+                    # PLAN.md §4: legacy/non-canonical records may still be
+                    # completed here, but never silently — a canonical run
+                    # rejects them upstream in the replay validator.
+                    _warn_legacy_missing(
+                        "prob_mask_token_count",
+                        slot.get("edge_id"),
+                        "recomputing a missing prob_mask_token_count for "
+                        "edge {edge_id!r}; canonical VDRA requires the "
+                        "stamped schema-v2 denominator metadata (PLAN.md §4).",
+                    )
+                    raw_mask = recomputed
+                elif int(raw_mask) != recomputed:
+                    raise ValueError(
+                        f"logical edge {slot.get('edge_id')!r} stamps "
+                        f"prob_mask_token_count={int(raw_mask)} but its stored "
+                        f"old log-probs give {recomputed} active tokens at "
+                        f"threshold={float(probability_mask_threshold)} "
+                        "(PLAN.md §1)."
+                    )
+        if use_prob_mask and raw_mask is None:
+            raise ValueError(
+                "policy_aggregation='token_mean' with use_prob_mask=true "
+                "requires a stamped prob_mask_token_count on every logical "
+                "record; a zero slot's active count can NEVER be recomputed "
+                "because its old-log-prob payload was removed (PLAN.md §4). "
+                f"Offending record edge_id={slot.get('edge_id')!r}."
+            )
+        mask_count = 0 if raw_mask is None else int(raw_mask)
+        if not (0 <= mask_count <= resp):
+            raise ValueError(
+                "prob_mask_token_count must satisfy 0 <= count <= "
+                f"response_token_count; got {mask_count} > {resp} for "
+                f"edge_id={slot.get('edge_id')!r} (PLAN.md §4)."
+            )
+        return resp, mask_count
+
+    STATUS_TRAINABLE = "trainable"
+    STATUS_ALL_ZERO = "all_zero_advantage"
+    STATUS_ZERO_ACTIVE = "zero_active_tokens"
+
+    n_batches = n // mini
+    segment_counts: List[float] = []
+    response_token_counts: List[float] = []
+    prob_mask_token_counts: List[float] = []
+    statuses: List[str] = []
+    trainable_active_tokens: List[float] = []
+    per_batch_rows: List[List[Dict[str, Any]]] = []
+    all_zero_batches = 0
+    zero_active_batches = 0
+    for k in range(n_batches):
+        batch_slots = slots[k * mini : (k + 1) * mini]
+        t_resp = 0
+        t_mask = 0
+        for slot in batch_slots:
+            resp, mask_count = _slot_counts(slot)
+            t_resp += resp
+            t_mask += mask_count
+        rows = [s for s in batch_slots if not is_ledger_slot(s)]
+        # PLAN.md §6: executable signal counts EFFECTIVE active tokens on the
+        # nonzero-advantage trainable rows only.
+        active = 0
+        for row in rows:
+            resp, mask_count = _slot_counts(row)
+            active += mask_count if use_prob_mask else resp
+        if not rows:
+            status = STATUS_ALL_ZERO
+            all_zero_batches += 1
+            rows = []
+        elif active <= 0:
+            status = STATUS_ZERO_ACTIVE
+            zero_active_batches += 1
+            rows = []  # nothing executable: no tensor rows for this batch
+        else:
+            status = STATUS_TRAINABLE
+        segment_counts.append(float(mini))
+        response_token_counts.append(float(t_resp))
+        prob_mask_token_counts.append(float(t_mask))
+        statuses.append(status)
+        trainable_active_tokens.append(float(active))
+        per_batch_rows.append(rows)
+
+    total_rows = sum(len(rows) for rows in per_batch_rows)
+    total_response_tokens = sum(response_token_counts)
+    total_mask_tokens = sum(prob_mask_token_counts)
+    stats: Dict[str, float] = {
+        "vdra/logical_slots": float(n),
+        "vdra/logical_batches": float(n_batches),
+        "vdra/all_zero_advantage_logical_batches": float(all_zero_batches),
+        "vdra/zero_active_token_logical_batches": float(zero_active_batches),
+        "vdra/trainable_logical_batches": float(
+            n_batches - all_zero_batches - zero_active_batches
+        ),
+        "vdra/tensor_rows": float(total_rows),
+        "vdra/prob_mask_active_token_fraction": (
+            float(total_mask_tokens / total_response_tokens)
+            if total_response_tokens > 0
+            else 0.0
+        ),
+    }
+    if total_rows == 0:
+        stats["vdra/skipped_zero_gradient_updates"] = 1.0
+        stats["vdra/dummy_rows"] = 0.0
+        return None, stats
+
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+
+    def _dummy_row(batch_idx: int, i: int) -> Dict[str, Any]:
+        return {
+            "edge_id": f"__vdra_dummy__|{batch_idx}|{i}",
+            "question_id": "__vdra_dummy__",
+            "tree_id": "__vdra_dummy__",
+            "parent_group_id": "__vdra_dummy__/p",
+            "child_segment_id": f"__vdra_dummy__/{batch_idx}/{i}",
+            "allocated_k": 1,
+            "sample_multiplicity": 1,
+            "tree_total_segment_count": 1,
+            "queue_flush_id": "0",
+            "queue_released_segment_count": 1,
+            "query_token_ids": [int(pad_id)],
+            "response_token_ids": [int(pad_id)],
+            "actor_shifted_log_probs": [0.0],
+            "advantage": 0.0,
+            "value": 0.0,
+            "reward": 0.0,
+            "is_dummy": True,
+        }
+
+    # Round-robin rank assignment per logical batch, dummies appended last so
+    # real rows spread as evenly as possible.
+    n_dummy = 0
+    per_rank_rows: List[List[Dict[str, Any]]] = [[] for _ in range(dp)]
+    per_rank_batch_idx: List[List[int]] = [[] for _ in range(dp)]
+    for k, rows in enumerate(per_batch_rows):
+        if not rows:
+            # Skipped logical batch (all_zero_advantage or zero_active_tokens):
+            # zero rows on EVERY rank, so all ranks skip optimizer step k
+            # consistently (PLAN.md §1.3/§7).
+            continue
+        padded = list(rows)
+        while len(padded) % dp != 0:
+            padded.append(_dummy_row(k, len(padded)))
+            n_dummy += 1
+        for i, row in enumerate(padded):
+            rank = i % dp
+            per_rank_rows[rank].append(row)
+            per_rank_batch_idx[rank].append(k)
+
+    ordered_rows: List[Dict[str, Any]] = []
+    ordered_batch_idx: List[int] = []
+    rows_per_rank = {len(rows) for rows in per_rank_rows}
+    if len(rows_per_rank) != 1:
+        raise AssertionError(
+            "rank shares diverged after dummy padding; this is a bug in "
+            f"build_logical_update_batch (shares={sorted(rows_per_rank)})"
+        )
+    for rank in range(dp):
+        ordered_rows.extend(per_rank_rows[rank])
+        ordered_batch_idx.extend(per_rank_batch_idx[rank])
+
+    batch = edges_to_dataproto(
+        ordered_rows,
+        tokenizer,
+        max_prompt_length=max_prompt_length,
+        max_response_length=max_response_length,
+        include_old_log_probs=include_old_log_probs,
+        loss_mode=loss_mode,
+    )
+    batch.batch["logical_batch_index"] = torch.tensor(
+        ordered_batch_idx, dtype=torch.int64
+    )
+    batch.batch["is_dummy"] = torch.tensor(
+        [1 if row.get("is_dummy") else 0 for row in ordered_rows],
+        dtype=torch.int64,
+    )
+    # PLAN.md §5/§6: aligned per-logical-batch lists (one value per batch,
+    # never one for the whole update_actor call).
+    batch.meta_info["original_logical_segment_count"] = segment_counts
+    batch.meta_info["original_logical_response_token_count"] = response_token_counts
+    batch.meta_info["original_logical_prob_mask_token_count"] = prob_mask_token_counts
+    batch.meta_info["logical_batch_status"] = statuses
+    batch.meta_info["logical_batch_trainable_active_tokens"] = trainable_active_tokens
+    batch.meta_info["logical_batch_count"] = int(n_batches)
+    batch.meta_info["logical_dp_size"] = int(dp)
+    # The objective-mask identity the denominators were computed under, so the
+    # actor can assert it matches its own configuration.
+    batch.meta_info["logical_use_prob_mask"] = bool(use_prob_mask)
+    batch.meta_info["logical_probability_mask_threshold"] = float(
+        probability_mask_threshold
+    )
+    stats["vdra/dummy_rows"] = float(n_dummy)
+    return batch, stats

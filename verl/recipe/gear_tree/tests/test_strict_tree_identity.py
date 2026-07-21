@@ -372,7 +372,7 @@ class TestManifestCollisionDetection:
         )
 
         manifest = build_run_manifest(
-            tree_policy={"policy_aggregation": "global_segment_mean"},
+            tree_policy={"policy_aggregation": "segment_mean"},
             gear_tree_cfg={},
             actor_loss_mode="vdra_segment_mean_ppo",
         )

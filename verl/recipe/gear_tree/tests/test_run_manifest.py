@@ -20,6 +20,8 @@ def _valid_main_manifest(*, reduction: str = SEGMENT_TOKEN_REDUCTION_MEAN) -> Ru
     m = RunManifest(
         policy_aggregation=POLICY_AGGREGATION_SEGMENT_MEAN,
         segment_token_reduction=reduction,
+        # PLAN.md §14: OBSERVED denominator mode must match the objective.
+        observed_logical_denominator="segment_slots",
         advantage_mode="spo_local",
         complete_tree_replay=True,
         complete_parent_microbatches=True,

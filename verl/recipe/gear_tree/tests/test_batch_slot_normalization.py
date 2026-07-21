@@ -1,24 +1,24 @@
-"""Batch-slot mean N_B normalization tests (labeled LEGACY ablation).
+"""Uniform slot-mean (segment_mean) normalization tests.
 
-The batch-slot mean
+The uniform slot mean
 
-    L_B = (1/N_B) * sum_{s in retained(B)} L_s^r,
+    L_B = (1/M_B) * sum_{s in tensor rows} L_s^r,
 
-with ``N_B`` the retained replay-slot count, is NOT the canonical VDRA
-normalization: retained-slot counts shrink under the zero-advantage filter,
-which breaks the (L1+L2+0+0)/4 parity. It survives only behind the explicit
-``policy_loss.batch_slot_mean_ablation=true`` flag, and these tests pin its
-arithmetic under that label:
+with ``M_B`` the PRE-FILTER logical-batch slot count, is the canonical paper
+``policy_aggregation='segment_mean'`` objective (PLAN.md §1.3). ``M_B`` is
+stamped by the trainer and counts zero-advantage slots that carry no tensor
+rows, so dropping those rows leaves the loss unchanged. These tests pin its
+arithmetic:
 
 * full-vs-split gradient parity for mean AND sum;
 * row permutation invariance;
 * microbatch fragmentation into 2, 4, 8 pieces gives the same gradient;
 * mean vs sum are numerically distinct on non-uniform active lengths.
 
-``TestCanonicalTreeSegmentMean`` covers the canonical path
-``w_s = 1 / (N_T * N_seg(T))`` with the pre-filter
-``tree_total_segment_count`` and the split-invariant ``N_T`` passed from
-the original optimizer batch.
+``TestCanonicalTreeSegmentMean`` covers the labeled
+``tree_balanced_segment_mean`` ablation ``w_s = 1 / (N_T * N_seg(T))`` with
+the pre-filter ``tree_total_segment_count`` and the split-invariant ``N_T``
+passed from the original optimizer batch.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from recipe.gear_tree.policy_loss import compute_policy_loss_vdra_segment_mean
 
 
 def _actor_cfg(
-    reduction: str = "mean", *, batch_slot_mean_ablation: bool = True
+    reduction: str = "mean", *, aggregation: str = "segment_mean"
 ) -> ActorConfig:
     return ActorConfig(
         strategy="fsdp",
@@ -46,7 +46,7 @@ def _actor_cfg(
         policy_loss=PolicyLossConfig(
             loss_mode="vdra_segment_mean_ppo",
             segment_token_reduction=reduction,
-            batch_slot_mean_ablation=batch_slot_mean_ablation,
+            policy_aggregation=aggregation,
         ),
     )
 
@@ -74,7 +74,7 @@ def _loss_from_batch(
         advantages=advantages,
         response_mask=response_mask,
         config=cfg,
-        original_optimizer_batch_slot_count=n_b,
+        original_logical_segment_count=n_b,
     )[0]
 
 
@@ -96,7 +96,7 @@ class TestFullVsSplit:
             advantages=advantages,
             response_mask=response_mask,
             config=cfg,
-            original_optimizer_batch_slot_count=n_rows,
+            original_logical_segment_count=n_rows,
         )[0]
         loss_ref.backward()
         grad_ref = theta_ref.grad.detach().clone()
@@ -113,7 +113,7 @@ class TestFullVsSplit:
                 advantages=advantages[s],
                 response_mask=response_mask[s],
                 config=cfg,
-                original_optimizer_batch_slot_count=n_rows,
+                original_logical_segment_count=n_rows,
             )[0]
             loss_k.backward()
         grad_split = theta.grad.detach().clone()
@@ -134,7 +134,7 @@ class TestFullVsSplit:
             advantages=advantages,
             response_mask=response_mask,
             config=cfg,
-            original_optimizer_batch_slot_count=n_rows,
+            original_logical_segment_count=n_rows,
         )[0]
         loss_a.backward()
 
@@ -146,7 +146,7 @@ class TestFullVsSplit:
             advantages=advantages[perm],
             response_mask=response_mask[perm],
             config=cfg,
-            original_optimizer_batch_slot_count=n_rows,
+            original_logical_segment_count=n_rows,
         )[0]
         loss_b.backward()
         assert torch.allclose(theta_a.grad, theta_b.grad, atol=1e-6)
@@ -166,10 +166,10 @@ class TestModeDistinction:
     def test_mean_row_loss_unchanged_by_active_token_duplication(self):
         cfg = _actor_cfg("mean")
         loss_short = compute_policy_loss_vdra_segment_mean(
-            *self._one_row(2), config=cfg, original_optimizer_batch_slot_count=1
+            *self._one_row(2), config=cfg, original_logical_segment_count=1
         )[0]
         loss_long = compute_policy_loss_vdra_segment_mean(
-            *self._one_row(4), config=cfg, original_optimizer_batch_slot_count=1
+            *self._one_row(4), config=cfg, original_logical_segment_count=1
         )[0]
         assert torch.allclose(loss_short, loss_long, atol=1e-6), (
             f"mean row loss should be independent of active-token count: "
@@ -179,10 +179,10 @@ class TestModeDistinction:
     def test_sum_row_loss_scales_with_active_token_count(self):
         cfg = _actor_cfg("sum")
         loss_short = compute_policy_loss_vdra_segment_mean(
-            *self._one_row(2), config=cfg, original_optimizer_batch_slot_count=1
+            *self._one_row(2), config=cfg, original_logical_segment_count=1
         )[0]
         loss_long = compute_policy_loss_vdra_segment_mean(
-            *self._one_row(4), config=cfg, original_optimizer_batch_slot_count=1
+            *self._one_row(4), config=cfg, original_logical_segment_count=1
         )[0]
         # 4 identical active tokens should give 2× the loss of 2 active tokens.
         assert torch.allclose(loss_long, 2.0 * loss_short, atol=1e-6), (
@@ -214,16 +214,15 @@ class TestDenominatorContract:
     def test_zero_slot_count_raises(self):
         cfg = _actor_cfg("mean")
         rows = _fake_rows(4)
-        with pytest.raises(ValueError, match="original_optimizer_batch_slot_count"):
+        with pytest.raises(ValueError, match="must be > 0"):
             _loss_from_batch(rows, cfg, n_b=0)
 
-    def test_missing_all_denominator_sources_raises(self):
-        """Neither the canonical (tree count, segment counts) inputs nor the
-        ablation flag nor a legacy fallback → hard error, no silent path.
-        """
-        cfg = _actor_cfg("mean", batch_slot_mean_ablation=False)
+    def test_missing_logical_denominator_raises(self):
+        """segment_mean without the trainer-stamped M_B is a hard error —
+        no retained-row fallback (PLAN.md §1.3)."""
+        cfg = _actor_cfg("mean")
         rows = _fake_rows(4)
-        with pytest.raises(ValueError, match="requires either"):
+        with pytest.raises(ValueError, match="original_logical_segment_count"):
             compute_policy_loss_vdra_segment_mean(
                 old_log_prob=rows[0],
                 log_prob=rows[1],
@@ -232,11 +231,10 @@ class TestDenominatorContract:
                 config=cfg,
             )
 
-    def test_slot_count_without_ablation_flag_is_not_canonical(self):
-        """``original_optimizer_batch_slot_count`` alone must NOT be accepted
-        as the canonical denominator — it is reachable only behind the
-        labeled ``batch_slot_mean_ablation`` flag."""
-        cfg = _actor_cfg("mean", batch_slot_mean_ablation=False)
+    def test_tree_balanced_without_inputs_raises(self):
+        """The tree_balanced ablation with no tree inputs is a hard error —
+        no silent path."""
+        cfg = _actor_cfg("mean", aggregation="tree_balanced_segment_mean")
         rows = _fake_rows(4)
         with pytest.raises(ValueError, match="requires either"):
             compute_policy_loss_vdra_segment_mean(
@@ -245,7 +243,6 @@ class TestDenominatorContract:
                 advantages=rows[2],
                 response_mask=rows[3],
                 config=cfg,
-                original_optimizer_batch_slot_count=4,
             )
 
 
@@ -279,7 +276,7 @@ class TestCanonicalTreeSegmentMean:
     @pytest.mark.parametrize("splits", [1, 2, 4])
     def test_split_invariance_with_fixed_tree_count(self, reduction, splits):
         n_rows, n_trees = 64, 8
-        cfg = _actor_cfg(reduction, batch_slot_mean_ablation=False)
+        cfg = _actor_cfg(reduction, aggregation="tree_balanced_segment_mean")
         rows, _tree_ids, seg_counts = self._rows_with_trees(n_rows, n_trees)
 
         theta_ref = nn.Parameter(torch.zeros(1))
@@ -304,7 +301,7 @@ class TestCanonicalTreeSegmentMean:
 
     def test_canonical_matches_reference_weights(self):
         n_rows, n_trees = 32, 4
-        cfg = _actor_cfg("mean", batch_slot_mean_ablation=False)
+        cfg = _actor_cfg("mean", aggregation="tree_balanced_segment_mean")
         rows, _tree_ids, seg_counts = self._rows_with_trees(n_rows, n_trees)
         loss = self._canonical_loss(
             rows,
@@ -324,7 +321,7 @@ class TestCanonicalTreeSegmentMean:
         assert torch.allclose(loss, expected, atol=1e-5)
 
     def test_zero_tree_count_raises(self):
-        cfg = _actor_cfg("mean", batch_slot_mean_ablation=False)
+        cfg = _actor_cfg("mean", aggregation="tree_balanced_segment_mean")
         rows, _tree_ids, seg_counts = self._rows_with_trees(8, 2)
         with pytest.raises(
             ValueError, match="original_optimizer_batch_tree_count"

@@ -7,11 +7,13 @@ Exercises the ACTUAL production actor entry point (no rewritten mirror):
 real ``_optimizer_step()`` calls, report them via
 ``actor/num_optimizer_steps``, and observe stored-old-log-prob use via
 ``actor/used_stored_old_log_probs``.
+
+The tiny model / actor / batch builders are shared with the FSDP2 parity
+harness via ``_tiny_actor.py``; the edge data and every assertion here are
+unchanged from the original extraction source.
 """
 
 from __future__ import annotations
-
-from types import SimpleNamespace
 
 import pytest
 
@@ -19,37 +21,19 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("tensordict")
 
 import torch.distributed as dist  # noqa: E402
-import transformers  # noqa: E402
 
-if not hasattr(transformers, "AutoModelForVision2Seq"):
-    transformers.AutoModelForVision2Seq = object
+try:  # namespace-package import under PYTHONPATH=verl
+    from recipe.gear_tree.tests import _tiny_actor
+except ImportError:  # flat rootdir-relative import
+    import _tiny_actor
 
-import recipe.gear_tree.policy_loss  # noqa: E402,F401 — registers the VDRA losses
-from recipe.gear_tree.tree_data import edges_to_dataproto  # noqa: E402
+build_batch = _tiny_actor.build_batch
+make_actor = _tiny_actor.make_actor
+TinyLM = _tiny_actor.TinyLM
 
-VOCAB = 32
 N_EDGES = 512
 MINI = 128
 MICRO = 64
-
-
-class _Tok:
-    pad_token_id = 0
-    eos_token_id = 0
-
-
-class TinyLM(torch.nn.Module):
-    """Minimal causal-LM-shaped module: returns ``.logits`` like HF models."""
-
-    def __init__(self):
-        super().__init__()
-        torch.manual_seed(0)
-        self.embed = torch.nn.Embedding(VOCAB, 8)
-        self.head = torch.nn.Linear(8, VOCAB)
-
-    def forward(self, input_ids=None, attention_mask=None, position_ids=None, use_cache=False, **_):
-        logits = self.head(self.embed(input_ids))
-        return SimpleNamespace(logits=logits)
 
 
 @pytest.fixture(scope="module")
@@ -91,52 +75,24 @@ def _edges(n: int = N_EDGES, advantage: float = 1.0) -> list[dict]:
     ]
 
 
-def _actor_config():
-    from verl.workers.config.actor import FSDPActorConfig, PolicyLossConfig
-
-    return FSDPActorConfig(
-        strategy="fsdp",
-        rollout_n=1,
-        ppo_mini_batch_size=MINI,
-        ppo_micro_batch_size_per_gpu=MICRO,
-        ppo_epochs=1,
-        clip_ratio=0.2,
-        grad_clip=1.0,
-        use_torch_compile=False,
-        use_dynamic_bsz=False,
-        policy_loss=PolicyLossConfig(
-            loss_mode="vdra_segment_mean_ppo",
-            segment_token_reduction="mean",
-            use_prob_mask=False,
-        ),
-    )
-
-
 def _build_batch(n: int = N_EDGES, advantage: float = 1.0):
-    batch = edges_to_dataproto(
-        _edges(n=n, advantage=advantage),
-        _Tok(),
-        max_prompt_length=6,
-        max_response_length=4,
-        include_old_log_probs=True,
-        loss_mode="vdra_segment_mean_ppo",
-    )
-    batch.meta_info["temperature"] = 1.0
-    # P0.4: replay edges force the stored PPO denominator.
-    batch.meta_info["force_stored_old_log_probs"] = True
-    return batch
+    return build_batch(_edges(n=n, advantage=advantage))
 
 
 def _make_actor():
-    from verl.workers.actor.dp_actor import DataParallelPPOActor
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TinyLM().to(device)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-    actor = DataParallelPPOActor(
-        config=_actor_config(), actor_module=model, actor_optimizer=optimizer
+    # The tree-balanced ablation path keeps verl's fixed-size mini-batch
+    # split, which is exactly the 512/128 -> 4-step control flow this file
+    # pins. The canonical aggregations' logical-batch grouping is covered by
+    # test_logical_update_batch.py / the FSDP2 parity harness.
+    return make_actor(
+        config=_tiny_actor.make_actor_config(
+            strategy="fsdp",
+            mini=MINI,
+            micro=MICRO,
+            reduction="mean",
+            aggregation="tree_balanced_segment_mean",
+        )
     )
-    return actor, model, optimizer
 
 
 @pytest.mark.usefixtures("single_process_group")

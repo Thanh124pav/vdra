@@ -21,7 +21,11 @@ if not hasattr(transformers, "AutoModelForVision2Seq"):
 
 from recipe.gear_tree.gear_ray_trainer import RayGearTreeTrainer
 from recipe.gear_tree.replay_buffer import GearTreeReplayBuffer
-from recipe.gear_tree.run_manifest import RunManifest
+from recipe.gear_tree.run_manifest import (
+    ITERATION_STATUS_ACTOR_FAILED,
+    ITERATION_STATUS_FAILED_BEFORE_ACTOR,
+    RunManifest,
+)
 
 
 class _Cfg(SimpleNamespace):
@@ -61,7 +65,7 @@ def _trainer_with_reservation(n_edges=2):
         actor_rollout_ref=_Cfg(
             actor=_Cfg(
                 ppo_mini_batch_size=1,
-                policy_loss={"loss_mode": "vdra_segment_mean_ppo"},
+                policy_loss={"loss_mode": "vdra_segment_mean_ppo", "policy_aggregation": "tree_balanced_segment_mean"},
             )
         ),
         gear_tree={
@@ -121,6 +125,10 @@ class TestPreActorFailures:
         assert trainer.failed_updates == 0
         assert trainer.run_manifest.replay_batch_failures == 1
         assert trainer.run_manifest.no_truncation is False
+        assert (
+            trainer.run_manifest.last_iteration_status
+            == ITERATION_STATUS_FAILED_BEFORE_ACTOR
+        )
 
     def test_tensorization_failure_rolls_back_without_counters(self):
         trainer, buffer, reservation, sampled = _trainer_with_reservation()
@@ -137,6 +145,10 @@ class TestPreActorFailures:
         assert trainer.failed_updates == 0
         assert trainer.run_manifest.replay_batch_failures == 0
         assert trainer.run_manifest.no_truncation is False
+        assert (
+            trainer.run_manifest.last_iteration_status
+            == ITERATION_STATUS_FAILED_BEFORE_ACTOR
+        )
 
     def test_overlength_row_is_a_real_tensorization_failure(self):
         trainer, buffer, reservation, sampled = _trainer_with_reservation()
@@ -147,6 +159,10 @@ class TestPreActorFailures:
             )
         _assert_rolled_back_and_counters_untouched(trainer, buffer, 2)
         assert trainer.failed_updates == 0
+        assert (
+            trainer.run_manifest.last_iteration_status
+            == ITERATION_STATUS_FAILED_BEFORE_ACTOR
+        )
 
     def test_actor_rpc_failure_rolls_back_and_counts_failed_update(self):
         trainer, buffer, reservation, sampled = _trainer_with_reservation()
@@ -167,6 +183,7 @@ class TestPreActorFailures:
         # Tensorization succeeded before the RPC, so the observed
         # no-truncation event did happen for this batch.
         assert trainer.run_manifest.no_truncation is True
+        assert trainer.run_manifest.last_iteration_status == ITERATION_STATUS_ACTOR_FAILED
         # Rolled-back edges must be reservable again.
         again = buffer.reserve_for_update(current_rollout_iteration=1)
         assert sorted(again.edge_ids) == ["e0", "e1"]
@@ -237,7 +254,7 @@ class TestFinalizeSuccessfulActorUpdate:
         trainer.config.actor_rollout_ref.actor = _Cfg(
             ppo_mini_batch_size=1,
             ppo_epochs=1,
-            policy_loss={"loss_mode": "vdra_segment_mean_ppo"},
+            policy_loss={"loss_mode": "vdra_segment_mean_ppo", "policy_aggregation": "tree_balanced_segment_mean"},
         )
         trainer._finalize_successful_actor_update(
             buffer,
@@ -262,6 +279,7 @@ class TestFinalizeSuccessfulActorUpdate:
         assert trainer.successful_actor_updates == 1
         assert trainer.num_optimizer_steps_total == 2
         assert trainer.run_manifest.optimizer_step_accounting_valid is True
+        assert trainer.run_manifest.optimizer_step_accounting_unverifiable == 0
         assert "vdra/actor_metrics_parse_failed" not in metrics
 
     def test_missing_metrics_key_still_commits_and_counts(self):
@@ -278,6 +296,7 @@ class TestFinalizeSuccessfulActorUpdate:
         assert trainer.num_optimizer_steps_total == 0
         # Accounting invalid + diagnostic logged; no rollback.
         assert trainer.run_manifest.optimizer_step_accounting_valid is False
+        assert trainer.run_manifest.optimizer_step_accounting_unverifiable == 1
         assert metrics["vdra/actor_metrics_parse_failed"] == 1.0
 
     def test_malformed_metrics_value_still_commits_and_counts(self):
@@ -291,6 +310,7 @@ class TestFinalizeSuccessfulActorUpdate:
         assert trainer.successful_actor_updates == 1
         assert trainer.num_optimizer_steps_total == 0
         assert trainer.run_manifest.optimizer_step_accounting_valid is False
+        assert trainer.run_manifest.optimizer_step_accounting_unverifiable == 1
         assert metrics["vdra/actor_metrics_parse_failed"] == 1.0
 
     def test_missing_meta_info_attr_still_commits(self):
@@ -301,4 +321,89 @@ class TestFinalizeSuccessfulActorUpdate:
         assert trainer.global_steps == 1
         assert trainer.successful_actor_updates == 1
         assert trainer.run_manifest.optimizer_step_accounting_valid is False
+        assert trainer.run_manifest.optimizer_step_accounting_unverifiable == 1
         assert metrics["vdra/actor_metrics_parse_failed"] == 1.0
+
+    def test_unverifiable_optimizer_accounting_never_heals(self):
+        trainer, buffer, reservation, sampled = _trainer_with_reservation()
+        self._finalize(
+            trainer,
+            buffer,
+            reservation,
+            sampled,
+            SimpleNamespace(meta_info={"something_else": 1}),
+        )
+        assert trainer.run_manifest.optimizer_step_accounting_observations == 0
+        assert trainer.run_manifest.optimizer_step_accounting_unverifiable == 1
+        assert trainer.run_manifest.optimizer_step_accounting_valid is False
+
+        buffer2 = GearTreeReplayBuffer(
+            target_edges_per_iteration=512,
+            max_edge_age_iterations=8,
+            max_edges_per_question_per_iteration=32,
+            sampling_seed=0,
+        )
+        buffer2.add(
+            [_edge("e2"), _edge("e3")],
+            generation_rollout_iteration=1,
+            policy_snapshot_id="global_step:1",
+        )
+        reservation2 = buffer2.reserve_for_update(current_rollout_iteration=1)
+        sampled2 = [dict(edge) for edge in reservation2.edges]
+        self._finalize(
+            trainer,
+            buffer2,
+            reservation2,
+            sampled2,
+            SimpleNamespace(
+                meta_info={"metrics": {"actor/num_optimizer_steps": [2]}}
+            ),
+        )
+        assert trainer.run_manifest.optimizer_step_accounting_observations == 1
+        assert trainer.run_manifest.optimizer_step_accounting_failures == 0
+        assert trainer.run_manifest.optimizer_step_accounting_unverifiable == 1
+        assert trainer.run_manifest.optimizer_step_accounting_valid is False
+
+    def test_optimizer_accounting_failure_never_heals(self):
+        trainer, buffer, reservation, sampled = _trainer_with_reservation()
+        # 2 reserved edges / ppo_mini=1 expects 2 internal steps, but actor
+        # reports only 1. This is diagnostic-only, yet the failure is
+        # monotonic in the manifest.
+        self._finalize(
+            trainer,
+            buffer,
+            reservation,
+            sampled,
+            SimpleNamespace(
+                meta_info={"metrics": {"actor/num_optimizer_steps": [1]}}
+            ),
+        )
+        assert trainer.run_manifest.optimizer_step_accounting_observations == 1
+        assert trainer.run_manifest.optimizer_step_accounting_failures == 1
+        assert trainer.run_manifest.optimizer_step_accounting_valid is False
+
+        buffer2 = GearTreeReplayBuffer(
+            target_edges_per_iteration=512,
+            max_edge_age_iterations=8,
+            max_edges_per_question_per_iteration=32,
+            sampling_seed=0,
+        )
+        buffer2.add(
+            [_edge("e2"), _edge("e3")],
+            generation_rollout_iteration=1,
+            policy_snapshot_id="global_step:1",
+        )
+        reservation2 = buffer2.reserve_for_update(current_rollout_iteration=1)
+        sampled2 = [dict(edge) for edge in reservation2.edges]
+        self._finalize(
+            trainer,
+            buffer2,
+            reservation2,
+            sampled2,
+            SimpleNamespace(
+                meta_info={"metrics": {"actor/num_optimizer_steps": [2]}}
+            ),
+        )
+        assert trainer.run_manifest.optimizer_step_accounting_observations == 2
+        assert trainer.run_manifest.optimizer_step_accounting_failures == 1
+        assert trainer.run_manifest.optimizer_step_accounting_valid is False

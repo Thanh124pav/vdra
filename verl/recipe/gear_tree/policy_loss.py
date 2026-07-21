@@ -5,16 +5,17 @@ Three losses are registered here:
 * ``treetune_ppo`` — the byte-faithful port of treetune's
   ``PPOTrainer._compute_actor_loss`` used by SPO/TreeRL/TreePO/GEAR-*. Kept as
   the SPO baseline and legacy aggregation; see the module docstring below.
-* ``vdra_segment_mean_ppo`` — canonical main-run loss. It applies configurable
-  within-segment token reduction and normalizes each retained row by the tree
-  segment mean ``w_s = 1 / (N_T * N_seg(T))``, where ``N_T`` is the unique-tree
-  count of the ORIGINAL optimizer batch and ``N_seg(T)`` is the PRE-FILTER
-  ``tree_total_segment_count`` — so removing exact-zero-advantage rows leaves
-  the loss unchanged. The historical batch-slot mean over retained replay
-  slots survives only behind the labeled ``batch_slot_mean_ablation`` flag.
-  No float ``segment_objective_weights`` tensor is needed on the canonical
-  path (it is derived from the integer counts); that tensor belongs only to
-  the explicit node-balanced ablation.
+* ``vdra_segment_mean_ppo`` — canonical main-run loss family
+  (PLAN.md §1.3, 2026-07-21). ``policy_loss.policy_aggregation`` selects:
+  ``segment_mean`` (canonical DEFAULT — every original logical segment slot
+  weighs ``1/M_B``), ``token_mean`` (every original valid token weighs
+  ``1/T_B``), or ``tree_balanced_segment_mean`` (labeled ABLATION — the
+  historical ``w_s = 1 / (N_T * N_seg(T))`` tree-balanced objective). The
+  canonical denominators ``M_B``/``T_B`` are the PRE-FILTER logical-batch
+  counts stamped by the trainer (zero-advantage slots included), so sparse
+  tensor execution never changes the objective. No float
+  ``segment_objective_weights`` tensor is needed on any canonical path;
+  that tensor belongs only to the explicit node-balanced ablation.
 * ``vdra_node_balanced_ppo`` — legacy parent-balanced ablation. NOT the main
   VDRA path (PLAN.md P0.1). Kept for controlled comparison runs; it must not
   be selected by the main config.
@@ -43,6 +44,15 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+# PLAN.md §1: the probability-mask predicate is defined ONCE in a
+# dependency-light module and shared with extraction-time counting; these
+# re-exports keep the historical `policy_loss.<helper>` import paths working.
+from recipe.gear_tree.prob_mask import (  # noqa: F401
+    DEFAULT_PROBABILITY_MASK_THRESHOLD,
+    count_prob_mask_active_tokens,
+    effective_action_mask,
+    probability_mask_active,
+)
 from verl.trainer.ppo.core_algos import register_policy_loss
 
 if TYPE_CHECKING:  # ActorConfig is only used as a type hint; avoid a hard import.
@@ -99,17 +109,23 @@ def _ppo_clipped_token_surrogate(
     cliprange: float,
     use_prob_mask: bool,
     rollout_is_weights: Optional[torch.Tensor],
+    probability_mask_threshold: float = DEFAULT_PROBABILITY_MASK_THRESHOLD,
+    is_dummy: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute the per-token PPO-clip surrogate loss and diagnostics.
 
     Returns ``(pg_losses, action_mask, ratio, pg_losses1, pg_losses2)``. The
-    caller decides how to reduce ``pg_losses`` over ``action_mask``.
+    caller decides how to reduce ``pg_losses`` over ``action_mask``, which is
+    already the dummy-safe effective mask.
     """
 
-    action_mask = response_mask
-    if use_prob_mask:
-        prob_mask = torch.exp(old_log_prob) < 0.9
-        action_mask = action_mask.bool() & prob_mask
+    action_mask = effective_action_mask(
+        response_mask,
+        old_log_prob,
+        use_prob_mask=use_prob_mask,
+        probability_mask_threshold=probability_mask_threshold,
+        is_dummy=is_dummy,
+    )
     action_mask = action_mask.to(dtype=advantages.dtype)
 
     log_ratio = (log_prob - old_log_prob) * action_mask
@@ -148,6 +164,13 @@ def compute_policy_loss_treetune(
     # PLAN.md P0.F: read PolicyLossConfig fields from config.policy_loss.*.
     cliprange = float(config.clip_ratio)              # PPOHParams.cliprange = 0.2
     use_prob_mask = bool(_resolve_policy_loss_field(config, "use_prob_mask", True))
+    # PLAN.md §1: authoritative threshold from the config — never hard-coded.
+    probability_mask_threshold = float(
+        _resolve_policy_loss_field(
+            config, "probability_mask_threshold",
+            DEFAULT_PROBABILITY_MASK_THRESHOLD,
+        )
+    )
     ratio_threshold = float(
         _resolve_policy_loss_field(config, "ratio_threshold", 10.0)
     )
@@ -156,6 +179,7 @@ def compute_policy_loss_treetune(
         old_log_prob, log_prob, advantages, response_mask,
         cliprange=cliprange, use_prob_mask=use_prob_mask,
         rollout_is_weights=rollout_is_weights,
+        probability_mask_threshold=probability_mask_threshold,
     )
 
     pg_loss = _weighted_masked_mean(pg_losses, action_mask, edge_weights=edge_weights)
@@ -361,12 +385,47 @@ def compute_policy_loss_vdra_segment_mean(
     tree_total_segment_count: torch.Tensor | None = None,
     original_optimizer_batch_slot_count: int | None = None,
     original_optimizer_batch_tree_count: int | None = None,
+    original_logical_segment_count: float | None = None,
+    original_logical_response_token_count: float | None = None,
+    original_logical_prob_mask_token_count: float | None = None,
+    is_dummy: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Canonical VDRA main-run loss (tree segment mean).
+    """VDRA main-run loss family (PLAN.md §1.3, user decision 2026-07-21).
 
-    Canonical semantics (main path)
-    ------------------------------
-    Per-row weights are computed over the ORIGINAL optimizer batch:
+    Canonical paper objectives (``policy_loss.policy_aggregation``)
+    ---------------------------------------------------------------
+    Both use the PRE-FILTER denominators of the LOGICAL optimizer batch the
+    rows were reserved into (stamped by the trainer, passed by
+    ``dp_actor.update_policy``; zero-advantage slots count in the
+    denominator even though they carry no tensor rows):
+
+        segment_mean:  L_B = sum_{u in rows} L_u / M_B,
+                       L_u = sum_t A_ut * ell_ut / sum_t A_ut
+                       (A = the dummy-safe EFFECTIVE action mask; an empty
+                        A_u yields a differentiable zero segment loss while
+                        the slot still counts in M_B),
+                       M_B = original_logical_segment_count
+
+        token_mean:    L_B = sum_{u,t} A_ut * ell_ut / T_B, where the
+                       denominator MATCHES the numerator's mask:
+                       use_prob_mask=false -> T_B =
+                           original_logical_response_token_count
+                       use_prob_mask=true  -> T_B =
+                           original_logical_prob_mask_token_count
+                       A probability-masked numerator is NEVER divided by
+                       the unmasked response-token count (PLAN.md §5).
+
+    Example: advantages [pos, neg, 0, 0] -> tensor rows [L1, L2],
+    M_B = 4, segment_mean loss = (L1 + L2) / 4.
+
+    These paths return the LOCAL numerator over the fixed logical
+    denominator; the distributed dp-size compensation for the averaging
+    reducer lives in ``dp_actor`` (``loss_scale_factor``), never here.
+
+    Tree-balanced ablation (``policy_aggregation=tree_balanced_segment_mean``)
+    --------------------------------------------------------------------------
+    The historical objective, per-row weights over the ORIGINAL optimizer
+    batch:
 
         L_B = sum_{s in retained(B)} w_s * L_s^r,
         w_s = 1 / (N_T * N_seg(T)),
@@ -375,26 +434,20 @@ def compute_policy_loss_vdra_segment_mean(
     batch (passed by ``dp_actor.update_policy`` as
     ``original_optimizer_batch_tree_count`` so microbatch splits preserve
     it) and ``N_seg(T)`` is the PRE-FILTER ``tree_total_segment_count`` of
-    the row's tree. Because ``N_seg(T)`` is the pre-filter count, removing
-    exact-zero-advantage rows leaves the loss unchanged:
-
-        advantages [pos, neg, 0, 0] -> retained [L1, L2]
-        loss = (L1 + L2 + 0 + 0) / 4 = (L1 + L2) / 4.
+    the row's tree. Measured NON-parity under multi-rank FSDP dispatch
+    (docs/h1_fsdp_parity_report.md) — labeled ablation only.
 
     ``L_s^r`` is either ``TokenMean(pg_row)`` (``r=mean``) or the raw token
     sum (``r=sum``).
 
-    Labeled legacy batch-slot ablation
-    ---------------------------------
-    ``policy_loss.batch_slot_mean_ablation=true`` selects the pre-zero-filter
-    batch-slot mean ``L_B = (1/N_B) * sum_s L_s^r`` with
-    ``N_B = original_optimizer_batch_slot_count`` (the retained replay-slot
-    count). It is NOT the canonical denominator — retained-slot counts shrink
-    under zero filtering — and exists only as an explicitly labeled ablation.
+    Retired ``batch_slot_mean_ablation`` flag
+    -----------------------------------------
+    The flag's mathematics IS the canonical ``segment_mean``; configs that
+    still set it fail fast with a migration message (PLAN.md §1.3).
 
     Legacy tree-average fallbacks
     -----------------------------
-    When neither the canonical inputs nor the ablation flag are present,
+    When the tree-balanced ablation inputs are absent,
     ``segment_objective_weights`` (precomputed ``w_s``) or
     ``(tree_group_ids, tree_total_segment_count)`` reproduce the same
     tree-average identity for unit tests; the derived fallback computes
@@ -413,6 +466,13 @@ def compute_policy_loss_vdra_segment_mean(
     cliprange = float(config.clip_ratio)
     # PLAN.md P0.F: PolicyLossConfig fields read from config.policy_loss.*.
     use_prob_mask = bool(_resolve_policy_loss_field(config, "use_prob_mask", True))
+    # PLAN.md §1: authoritative threshold from the config — never hard-coded.
+    probability_mask_threshold = float(
+        _resolve_policy_loss_field(
+            config, "probability_mask_threshold",
+            DEFAULT_PROBABILITY_MASK_THRESHOLD,
+        )
+    )
     # PLAN.md P0.4: report the ratio as a metric; do NOT skip microbatches on
     # the canonical VDRA path.
     ratio_threshold = float(
@@ -423,41 +483,130 @@ def compute_policy_loss_vdra_segment_mean(
         old_log_prob, log_prob, advantages, response_mask,
         cliprange=cliprange, use_prob_mask=use_prob_mask,
         rollout_is_weights=rollout_is_weights,
+        probability_mask_threshold=probability_mask_threshold,
+        # PLAN.md §9: dummy rows are masked EXPLICITLY, never left to the
+        # probability mask to remove by accident.
+        is_dummy=is_dummy,
     )
 
     row_losses = _segment_row_losses(pg_losses, action_mask, reduction=reduction)
 
-    batch_slot_mean_ablation = bool(
-        _resolve_policy_loss_field(config, "batch_slot_mean_ablation", False)
-    )
-    if batch_slot_mean_ablation:
-        # Labeled legacy batch-slot ablation — NOT the canonical denominator.
-        # Retained-slot counts shrink under zero-advantage filtering, so this
-        # path is reachable only via the explicit config flag.
-        if original_optimizer_batch_slot_count is None:
-            raise ValueError(
-                "policy_loss.batch_slot_mean_ablation=true requires "
-                "original_optimizer_batch_slot_count from the actor."
-            )
-        n_b = int(original_optimizer_batch_slot_count)
-        if n_b <= 0:
-            raise ValueError(
-                "original_optimizer_batch_slot_count must be > 0 for the "
-                "batch-slot ablation loss."
-            )
-        pg_loss = row_losses.sum() / float(n_b)
-    elif (
+    policy_aggregation = str(
+        _resolve_policy_loss_field(config, "policy_aggregation", "segment_mean")
+    ).strip().lower()
+    if policy_aggregation == "global_segment_mean":
+        # PLAN.md §11: cross-level validation canonicalizes this legacy token
+        # BEFORE runtime. Seeing it here means validation was bypassed.
+        raise RuntimeError(
+            "internal configuration error: policy_aggregation="
+            "'global_segment_mean' reached the actor loss. Cross-level "
+            "validation must canonicalize it to 'tree_balanced_segment_mean' "
+            "(non-strict) or reject it (strict); it must NEVER mean "
+            "'segment_mean' (PLAN.md §1.3/§11)."
+        )
+    if policy_aggregation not in (
+        "token_mean",
+        "segment_mean",
+        "tree_balanced_segment_mean",
+    ):
+        raise ValueError(
+            f"policy_loss.policy_aggregation={policy_aggregation!r} is invalid; "
+            "must be one of {'token_mean', 'segment_mean', "
+            "'tree_balanced_segment_mean'} (PLAN.md §1.3)."
+        )
+
+    # PLAN.md §1.3: the batch_slot_mean_ablation flag was RETIRED — its
+    # mathematics IS the canonical segment_mean. Reject configs that still
+    # set it instead of silently ignoring them.
+    if bool(_resolve_policy_loss_field(config, "batch_slot_mean_ablation", False)):
+        raise ValueError(
+            "policy_loss.batch_slot_mean_ablation was retired (PLAN.md §1.3): "
+            "its mathematics is exactly policy_aggregation='segment_mean'. "
+            "Remove the flag and set policy_aggregation explicitly."
+        )
+    if policy_aggregation in ("segment_mean", "token_mean"):
+        # Canonical paper objectives — pre-filter LOGICAL batch denominators
+        # only. No retained-row fallback, no tree-count approximation
+        # (PLAN.md §1.3).
+        if policy_aggregation == "segment_mean":
+            if original_logical_segment_count is None:
+                raise ValueError(
+                    "policy_aggregation='segment_mean' requires the "
+                    "pre-filter logical-batch slot count "
+                    "(original_logical_segment_count stamped by the trainer); "
+                    "refusing to fall back to the retained tensor-row count "
+                    "(PLAN.md §1.3)."
+                )
+            m_b = float(original_logical_segment_count)
+            if m_b <= 0:
+                raise ValueError(
+                    "original_logical_segment_count must be > 0 for "
+                    "segment_mean; got "
+                    f"{original_logical_segment_count!r}."
+                )
+            pg_loss = row_losses.sum() / m_b
+        else:  # token_mean
+            if reduction == "sum":
+                raise ValueError(
+                    "policy_aggregation='token_mean' has no within-segment "
+                    "reduction; segment_token_reduction='sum' would be "
+                    "silently ignored, which strict VDRA forbids "
+                    "(PLAN.md §1.3)."
+                )
+            # PLAN.md §5: the denominator MUST match the numerator's mask.
+            if use_prob_mask:
+                raw_t_b = original_logical_prob_mask_token_count
+                field = "original_logical_prob_mask_token_count"
+                why = (
+                    "use_prob_mask=true masks the numerator, so it must be "
+                    "normalized by the pre-filter PROBABILITY-MASK-ACTIVE "
+                    "token count — never by the unmasked response-token count"
+                )
+            else:
+                raw_t_b = original_logical_response_token_count
+                field = "original_logical_response_token_count"
+                why = (
+                    "use_prob_mask=false keeps every valid response token, so "
+                    "the pre-filter RESPONSE-token count is the denominator"
+                )
+            if raw_t_b is None:
+                raise ValueError(
+                    f"policy_aggregation='token_mean' requires {field} "
+                    "stamped by the trainer; refusing to fall back to the "
+                    f"retained-token count (PLAN.md §5). {why}."
+                )
+            t_b = float(raw_t_b)
+            if t_b <= 0:
+                raise ValueError(
+                    f"{field} must be > 0 for token_mean; got {raw_t_b!r}."
+                )
+            token_numerator = (pg_losses * action_mask).sum()
+            pg_loss = token_numerator / t_b
+
+        avg_ratio = _masked_mean(ratio, action_mask)
+        _ = avg_ratio
+        _ = ratio_threshold
+        pg_clipfrac = _masked_mean(
+            torch.gt(pg_losses2, pg_losses1).float(), action_mask
+        )
+        approx_kl = 0.5 * _masked_mean((log_prob - old_log_prob) ** 2, action_mask)
+        pg_clipfrac_lower = torch.zeros((), dtype=pg_loss.dtype, device=pg_loss.device)
+        return pg_loss, pg_clipfrac, approx_kl, pg_clipfrac_lower
+
+    if (
         original_optimizer_batch_tree_count is not None
         and tree_total_segment_count is not None
     ):
-        # Canonical main path: w_s = 1 / (N_T * N_seg(T)) with N_T fixed from
-        # the ORIGINAL optimizer batch (microbatch-split invariant) and
-        # N_seg(T) the pre-filter tree_total_segment_count per row.
+        # tree_balanced_segment_mean ABLATION: w_s = 1 / (N_T * N_seg(T))
+        # with N_T fixed from the ORIGINAL optimizer batch (microbatch-split
+        # invariant) and N_seg(T) the pre-filter tree_total_segment_count per
+        # row. Measured NON-parity under multi-rank FSDP dispatch
+        # (docs/h1_fsdp_parity_report.md) — never a main-run objective.
         n_tree = int(original_optimizer_batch_tree_count)
         if n_tree <= 0:
             raise ValueError(
                 "original_optimizer_batch_tree_count must be > 0 for the "
-                "canonical VDRA tree-segment-mean loss."
+                "VDRA tree-balanced segment-mean ablation."
             )
         counts = tree_total_segment_count.to(
             dtype=row_losses.dtype, device=row_losses.device
@@ -492,13 +641,15 @@ def compute_policy_loss_vdra_segment_mean(
         pg_loss = (w * row_losses).sum()
     else:
         raise ValueError(
-            "vdra_segment_mean_ppo requires either "
+            "vdra_segment_mean_ppo with "
+            "policy_aggregation='tree_balanced_segment_mean' requires either "
             "(original_optimizer_batch_tree_count, tree_total_segment_count) "
-            "for the canonical tree-segment-mean path, "
-            "policy_loss.batch_slot_mean_ablation=true with "
-            "original_optimizer_batch_slot_count for the labeled legacy "
-            "ablation, or segment_objective_weights / (tree_group_ids, "
-            "tree_total_segment_count) for the legacy tree-average fallback."
+            "for the split-invariant ablation path, or "
+            "segment_objective_weights / (tree_group_ids, "
+            "tree_total_segment_count) for the legacy tree-average fallback. "
+            "The canonical paper objectives use "
+            "policy_aggregation='segment_mean'/'token_mean' with the "
+            "trainer-stamped logical denominators (PLAN.md §1.3)."
         )
 
     # Report ratio as a metric.
@@ -582,6 +733,13 @@ def compute_policy_loss_vdra_node_balanced(
     cliprange = float(config.clip_ratio)
     # PLAN.md P0.F: PolicyLossConfig fields read from config.policy_loss.*.
     use_prob_mask = bool(_resolve_policy_loss_field(config, "use_prob_mask", True))
+    # PLAN.md §1: authoritative threshold from the config — never hard-coded.
+    probability_mask_threshold = float(
+        _resolve_policy_loss_field(
+            config, "probability_mask_threshold",
+            DEFAULT_PROBABILITY_MASK_THRESHOLD,
+        )
+    )
     # PLAN.md P0.4: do NOT apply ratio_threshold as a per-microbatch skip on
     # the canonical VDRA path; only report the diagnostic. Legacy skip lives
     # in treetune_ppo.
@@ -593,6 +751,7 @@ def compute_policy_loss_vdra_node_balanced(
         old_log_prob, log_prob, advantages, response_mask,
         cliprange=cliprange, use_prob_mask=use_prob_mask,
         rollout_is_weights=rollout_is_weights,
+        probability_mask_threshold=probability_mask_threshold,
     )
 
     # Stage 1: token mean per child segment (one row per child).

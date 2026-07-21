@@ -220,6 +220,11 @@ async def build_tree_edges_async(
     treepo_global_weight: float = 0.5,
     treerl_gamma: float = 0.9,
     only_adv_greater_than_zero: bool = False,
+    emit_zero_slots: bool = False,
+    # PLAN.md §1/§2: the AUTHORITATIVE threshold, propagated per request from
+    # actor.policy_loss so extraction-time active-token counting uses exactly
+    # the value the actor loss will mask with.
+    probability_mask_threshold: float = 0.9,
     vineppo_K: int = 0,
     unfinished_penalty: float = 0.0,
     demo_logger: Any = None,
@@ -270,6 +275,8 @@ async def build_tree_edges_async(
         tree_update_mode=tree_update_mode, treepo_global_weight=treepo_global_weight,
         treerl_gamma=treerl_gamma,
         emit_pruned_edges=False,
+        emit_zero_slots=emit_zero_slots,
+        probability_mask_threshold=probability_mask_threshold,
         strict_fresh_iid=strict_fresh_iid,
         collect_construction_summaries=collect_construction_summaries,
     )
@@ -570,6 +577,21 @@ try:  # keep CPU-importable when agent_loop isn't installed
                     "before generate_sequences (see PLAN.md P0.1)."
                 )
             snapshot_id = str(snapshot_id)
+            # PLAN.md §2: the objective-mask configuration is propagated
+            # PER REQUEST from actor.policy_loss (the single source of truth).
+            # Never read a stale constructor-time copy — after resume or
+            # config composition it can disagree with the actor.
+            if "policy_probability_mask_threshold" not in kwargs:
+                raise RuntimeError(
+                    "TreeAgentLoop.run received no "
+                    "policy_probability_mask_threshold via non_tensor_batch "
+                    "kwargs; the trainer must propagate the resolved "
+                    "actor.policy_loss mask configuration to every rollout "
+                    "request (PLAN.md §2)."
+                )
+            probability_mask_threshold = float(
+                kwargs["policy_probability_mask_threshold"]
+            )
             # PLAN.md P0.2: pass rollout_iteration + a per-row uuid so the
             # tree builder mints a globally-unique tree_instance_id. The
             # (snapshot, question, iteration) tuple alone would still let two
@@ -621,11 +643,17 @@ try:  # keep CPU-importable when agent_loop isn't installed
 
                 self._gate.set_terminal_reward_fn(_terminal_grader)
 
-            # Stage 1: the shipped main config sets only_adv_greater_than_zero
-            # to true, which removes exact-zero advantages after construction
-            # counts are stamped. The runtime fallback stays false only for
-            # legacy configs that omit the field.
+            # PLAN.md §1.2 (2026-07-21): only_adv_greater_than_zero=true now
+            # means SPARSE TENSOR EXECUTION — advantages are computed from
+            # the complete sibling set, then exact-zero children become
+            # metadata-only logical slots (emit_zero_slots) that stay in
+            # replay bookkeeping and the M_B/T_B denominators. The flag never
+            # removes slots from the objective. The runtime fallback stays
+            # false only for legacy configs that omit the field.
             construction_summaries: List[Dict[str, Any]] = []
+            _sparse_zero_execution = bool(
+                self._gt.get("only_adv_greater_than_zero", False)
+            )
             edges = await build_tree_edges_async(
                 prompt_text, prompt_ids, data_instance,
                 segment_generator=per_call_gen, reward_fn=self._reward_fn,
@@ -635,7 +663,9 @@ try:  # keep CPU-importable when agent_loop isn't installed
                 adv_method=self._gt.get("adv_method", "rloo"),
                 treepo_global_weight=self._gt.get("treepo_global_weight", 0.5),
                 treerl_gamma=self._gt.get("treerl_gamma", 0.9),
-                only_adv_greater_than_zero=self._gt.get("only_adv_greater_than_zero", False),
+                only_adv_greater_than_zero=_sparse_zero_execution,
+                emit_zero_slots=_sparse_zero_execution,
+                probability_mask_threshold=probability_mask_threshold,
                 vineppo_K=self._gt.get("vineppo_K", 0),
                 gear_node_expander=self._node_expander,
                 policy_snapshot_id=snapshot_id,
@@ -670,11 +700,12 @@ try:  # keep CPU-importable when agent_loop isn't installed
                 metrics=AgentLoopMetrics(),
                 extra_fields={
                     "gear_tree_edges": edges,
-                    # Zero-filter contract: per-tree construction summaries
-                    # preserve realized/allocated facts even when a parent —
-                    # or the entire tree — retained no edges because every
-                    # child had exactly zero advantage. Zero rows themselves
-                    # never travel to replay.
+                    # Zero-filter contract (PLAN.md §1.2): per-tree
+                    # construction summaries preserve realized/allocated
+                    # facts. Under sparse execution the exact-zero children
+                    # travel to replay as metadata-only logical slots (never
+                    # as trainable rows), so reservation and the M_B/T_B
+                    # denominators keep the pre-filter counts.
                     "gear_tree_construction_summaries": construction_summaries,
                     # PLAN.md P1.R4: emit the resolved sampling params so
                     # downstream logging can prove which distribution the

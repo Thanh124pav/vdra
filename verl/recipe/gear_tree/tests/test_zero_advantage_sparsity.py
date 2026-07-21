@@ -1,10 +1,14 @@
 """Zero-advantage sparse-vs-dense + unique ID tests.
 
-Stage 1 production computes advantages before filtering, retains positive and
-negative advantages, and removes exact-zero rows before replay insertion to
-save compute. The canonical loss weights ``w_s = 1 / (N_T * N_seg(T))`` use
-the PRE-FILTER ``tree_total_segment_count``, so dropping zero rows leaves the
-loss unchanged — the (L1+L2+0+0)/4 parity asserted below.
+Production computes advantages before filtering, retains positive and
+negative advantages, and drops exact-zero rows from tensor execution to save
+compute. This suite exercises that invariance on the
+``tree_balanced_segment_mean`` ablation, whose weights
+``w_s = 1 / (N_T * N_seg(T))`` use the PRE-FILTER ``tree_total_segment_count``
+so dropping zero rows leaves the loss unchanged — the (L1+L2+0+0)/4 parity
+asserted below. (The canonical paper objectives achieve the same invariance
+through the pre-filter M_B / T_B denominators that count zero slots; that is
+covered by test_policy_aggregation_loss.py and test_logical_update_batch.py.)
 
 Additional invariant:
 * replay insertion rejects duplicate ``edge_id`` transactionally (unique
@@ -33,6 +37,7 @@ def _actor_cfg(reduction: str = "mean") -> ActorConfig:
         policy_loss=PolicyLossConfig(
             loss_mode="vdra_segment_mean_ppo",
             segment_token_reduction=reduction,
+            policy_aggregation="tree_balanced_segment_mean",
         ),
     )
 

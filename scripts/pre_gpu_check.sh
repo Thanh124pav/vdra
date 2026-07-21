@@ -68,6 +68,12 @@ python scripts/check_hydra_composition.py \
 
 log "5/20 PolicyLossConfig schema validation (invalid value must raise)"
 python -c "
+# Same compatibility shim the recipe tests and check_hydra_composition.py use:
+# newer transformers releases removed AutoModelForVision2Seq, which
+# verl.utils.model imports eagerly.
+import transformers
+if not hasattr(transformers, 'AutoModelForVision2Seq'):
+    transformers.AutoModelForVision2Seq = object
 from verl.workers.config.actor import PolicyLossConfig
 pl = PolicyLossConfig(loss_mode='vdra_segment_mean_ppo', segment_token_reduction='mean')
 assert pl.segment_token_reduction == 'mean'

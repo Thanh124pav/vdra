@@ -21,12 +21,51 @@ from typing import Any, Dict, Optional
 
 
 # Canonical values used by the manifest — mirror the tree_policy config.
-# PLAN.md P0.1 / P0.6: the main VDRA path uses `global_segment_mean`; the
-# legacy parent-balanced value is preserved for ablation runs but is NOT a
-# valid main-run choice.
-POLICY_AGGREGATION_SEGMENT_MEAN = "global_segment_mean"
+# PLAN.md §1.3 (2026-07-21): the main VDRA path uses the paper objectives
+# `segment_mean` (default) or `token_mean`. The historical tree-balanced
+# objective (formerly named `global_segment_mean`) and the parent-balanced
+# value are preserved for ablation runs but are NOT valid main-run choices.
+POLICY_AGGREGATION_SEGMENT_MEAN = "segment_mean"
+POLICY_AGGREGATION_TOKEN_MEAN = "token_mean"
+POLICY_AGGREGATION_TREE_BALANCED = "tree_balanced_segment_mean"  # ablation
 POLICY_AGGREGATION_VDRA = "vdra_node_balanced"  # deprecated main; kept as ablation
 POLICY_AGGREGATION_LEGACY = "legacy_token_mean"
+
+# PLAN.md §5: what the last training iteration actually did. A boolean
+# cannot distinguish a zero-signal skip from a postponed or empty iteration,
+# so this status is the authoritative record; ``actor_update_skipped`` is
+# derived from it.
+ITERATION_STATUS_NOT_STARTED = "not_started"
+ITERATION_STATUS_RUNNING = "running"
+ITERATION_STATUS_UPDATED = "updated"
+ITERATION_STATUS_ALL_ZERO_SKIPPED = "all_zero_skipped"
+ITERATION_STATUS_ZERO_ACTIVE_SKIPPED = "zero_active_skipped"
+ITERATION_STATUS_MIXED_ZERO_SIGNAL_SKIPPED = "mixed_zero_signal_skipped"
+ITERATION_STATUS_POSTPONED = "postponed"
+ITERATION_STATUS_NO_SAMPLE = "no_sample"
+ITERATION_STATUS_FAILED_BEFORE_ACTOR = "failed_before_actor"
+ITERATION_STATUS_ACTOR_FAILED = "actor_failed"
+
+VALID_ITERATION_STATUSES = (
+    ITERATION_STATUS_NOT_STARTED,
+    ITERATION_STATUS_RUNNING,
+    ITERATION_STATUS_UPDATED,
+    ITERATION_STATUS_ALL_ZERO_SKIPPED,
+    ITERATION_STATUS_ZERO_ACTIVE_SKIPPED,
+    ITERATION_STATUS_MIXED_ZERO_SIGNAL_SKIPPED,
+    ITERATION_STATUS_POSTPONED,
+    ITERATION_STATUS_NO_SAMPLE,
+    ITERATION_STATUS_FAILED_BEFORE_ACTOR,
+    ITERATION_STATUS_ACTOR_FAILED,
+)
+
+# The statuses that mean "a reservation was consumed but no optimizer step
+# ran because it carried no learning signal".
+ZERO_SIGNAL_SKIP_STATUSES = (
+    ITERATION_STATUS_ALL_ZERO_SKIPPED,
+    ITERATION_STATUS_ZERO_ACTIVE_SKIPPED,
+    ITERATION_STATUS_MIXED_ZERO_SIGNAL_SKIPPED,
+)
 
 # PLAN.md P0.1: within-segment token reduction must be exactly one of these.
 SEGMENT_TOKEN_REDUCTION_MEAN = "mean"
@@ -56,6 +95,18 @@ class RunManifest:
     segment_token_reduction: str = SEGMENT_TOKEN_REDUCTION_MEAN
     advantage_mode: str = ADVANTAGE_MODE_ABLATION
     segment_definition: str = SEGMENT_DEFINITION_FIXED
+    tree_shape: list[int] = field(default_factory=list)
+    trees_per_question: int = 1
+    segment_length: int = 0
+
+    # PLAN.md §14: objective-mask snapshot + the OBSERVED logical denominator
+    # mode, so a run cannot claim one objective while normalizing by another.
+    use_prob_mask: bool = True
+    probability_mask_threshold: float = 0.9
+    logical_slot_schema_version: int = 0
+    # "" (not a canonical sparse run) | "segment_slots" |
+    # "response_tokens" | "prob_mask_tokens"
+    observed_logical_denominator: str = ""
 
     # PLAN.md P0.7 replay-cadence snapshot (declared config → observed cap).
     replay_sampling_unit: str = "edge"
@@ -69,6 +120,8 @@ class RunManifest:
     rollout_iteration: int = 0
     global_step: int = 0
     optimizer_steps_last_iteration: int = 0
+    # PLAN.md §8: expectation counts TRAINABLE logical batches only.
+    expected_optimizer_steps_last_iteration: int = 0
     num_optimizer_steps_total: int = 0
 
     # Operational invariants (updated by the trainer at runtime — never
@@ -85,7 +138,18 @@ class RunManifest:
     fresh_iid_row_count_matches_allocated_k: bool = True
     replay_age_uses_rollout_iteration: bool = False
     optimizer_step_accounting_valid: bool = False
+    optimizer_step_accounting_observations: int = 0
+    optimizer_step_accounting_failures: int = 0
+    optimizer_step_accounting_unverifiable: int = 0
+    # PLAN.md §5: what the LAST iteration actually did. A single boolean
+    # cannot distinguish a zero-signal skip from a postponed or empty
+    # iteration, so the status string is authoritative and
+    # ``actor_update_skipped`` is DERIVED from it for compatibility.
+    # Observational: neither gates main-run validity.
+    last_iteration_status: str = ITERATION_STATUS_NOT_STARTED
+    actor_update_skipped: bool = False
     unique_tree_ids_verified: bool = False
+    manifest_resume_provenance_missing: bool = False
 
     # Running counters (updated by the trainer)
     parent_split_count: int = 0
@@ -143,10 +207,14 @@ class RunManifest:
         return asdict(self)
 
     def save(self, path: str | Path) -> None:
-        Path(path).write_text(
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(
             json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        tmp.replace(path)
 
     @classmethod
     def load(cls, path: str | Path) -> "RunManifest":
@@ -159,6 +227,7 @@ class RunManifest:
         cleaned = {k: v for k, v in data.items() if k in known}
         m = cls(**cleaned)
         m.extras = extras
+        m.actor_update_skipped = m.last_iteration_status in ZERO_SIGNAL_SKIP_STATUSES
         return m
 
 
@@ -168,7 +237,9 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
     main run.
 
     A main run is invalid when:
-      * policy_aggregation != global_segment_mean;
+      * policy_aggregation is neither segment_mean nor token_mean
+        (the tree_balanced_segment_mean / vdra_node_balanced /
+        legacy_token_mean ablations never validate as main);
       * no successful outer actor update was observed
         (``global_step < 1``);
       * segment_token_reduction is not exactly ``mean`` or ``sum``;
@@ -192,10 +263,35 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
     accordingly and reported as an ablation.
     """
     failures = []
-    if manifest.policy_aggregation != POLICY_AGGREGATION_SEGMENT_MEAN:
+    if manifest.manifest_resume_provenance_missing:
+        failures.append("manifest_resume_provenance_missing=True")
+    if manifest.policy_aggregation not in (
+        POLICY_AGGREGATION_SEGMENT_MEAN,
+        POLICY_AGGREGATION_TOKEN_MEAN,
+    ):
         failures.append(
-            f"policy_aggregation={manifest.policy_aggregation!r} != {POLICY_AGGREGATION_SEGMENT_MEAN!r}"
+            f"policy_aggregation={manifest.policy_aggregation!r} not in "
+            f"({POLICY_AGGREGATION_SEGMENT_MEAN!r}, "
+            f"{POLICY_AGGREGATION_TOKEN_MEAN!r})"
         )
+    # PLAN.md §14: the OBSERVED logical denominator must match the selected
+    # objective — a masked numerator normalized by the unmasked token count
+    # (or vice versa) silently changes the objective.
+    expected_denominator = {
+        POLICY_AGGREGATION_SEGMENT_MEAN: "segment_slots",
+        POLICY_AGGREGATION_TOKEN_MEAN: (
+            "prob_mask_tokens" if manifest.use_prob_mask else "response_tokens"
+        ),
+    }.get(manifest.policy_aggregation)
+    if expected_denominator is not None:
+        if manifest.observed_logical_denominator != expected_denominator:
+            failures.append(
+                "observed_logical_denominator="
+                f"{manifest.observed_logical_denominator!r} != "
+                f"{expected_denominator!r} for policy_aggregation="
+                f"{manifest.policy_aggregation!r} with use_prob_mask="
+                f"{manifest.use_prob_mask}"
+            )
     # PLAN.md P0.J: canonical replay is edge-level; a complete_tree run is a
     # labeled ablation, never a valid main run.
     if manifest.replay_sampling_unit != "edge":

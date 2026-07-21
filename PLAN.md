@@ -129,87 +129,168 @@ training/num_optimizer_steps_total
 
 Do not rename or repurpose VERL's `global_step` to obtain that plot.
 
-## 1.2 Rollout and replay
+## 1.2 Rollout and replay (2026-07-21 sparse-execution contract)
 
 ```text
 Generate complete stochastic trees
     ↓
 Validate full-tree construction invariants
     ↓
-Convert every realized non-placeholder segment into one replay edge
+Compute rewards/values for ALL realized children; compute the parent
+baseline from the COMPLETE sibling set; compute advantages for all
+children (never after filtering)
     ↓
-Stamp generation_rollout_iteration and unique identities
+Convert every realized non-placeholder segment into ONE LOGICAL SLOT:
+  - advantage != 0  → slot + full trainable payload
+  - advantage == 0  → metadata-only slot (slot identity, tree_id,
+    parent_group_id, question_id, response_token_count,
+    advantage_is_zero=true, trainable_edge_id=null)
     ↓
-Insert edges transactionally
+Stamp generation_rollout_iteration and unique identities (slots)
     ↓
-Expire by rollout_iteration age
+Insert slots transactionally (ledger = all realized slots;
+payload store = nonzero slots only)
     ↓
-Reserve individual edges, capped by question_id
+Expire by rollout_iteration age (slots)
     ↓
-Select at most 512 total edges
+Reserve individual LOGICAL SLOTS, capped by question_id
+    ↓
+Select at most 512 total logical slots
+    ↓
+Partition the 512 reserved slots into logical optimizer batches of
+ppo_mini_batch_size BEFORE tensor filtering; compute the exact
+pre-filter denominators M_B (slot count) and T_B (sum of
+response_token_count over ALL slots in B, zero slots included)
     ↓
 Validate sampled replay rows
     ↓
-Tensorize
+Tensorize ONLY the nonzero trainable payloads; stamp the per-batch
+denominators into DataProto.meta_info; order rows rank-major per
+logical batch and pad each batch's rows to a multiple of the DP size
+with collective-safe dummy rows (zero gradient, counted nowhere)
     ↓
 Run one outer actor update
+  (if EVERY logical batch of the update has only zero-advantage slots,
+   the trainer records an explicit skipped update instead: no
+   update_actor RPC, no global_step, no scheduler.step)
 ```
 
 Canonical defaults:
 
 ```yaml
 replay_buffer:
-  target_edges_per_iteration: 512
+  target_edges_per_iteration: 512       # counts LOGICAL SLOTS (zero + nonzero)
   max_edge_age_iterations: 8
-  max_edges_per_question_per_iteration: auto
-  replay_sampling_unit: edge
-  underfilled_update_policy: postpone_until_divisible
+  max_edges_per_question_per_iteration: auto   # counts logical slots
+  replay_sampling_unit: edge            # slot-level; parent groups MAY split
+  underfilled_update_policy: postpone_until_divisible  # in logical slots
 
 actor_rollout_ref:
   actor:
-    ppo_mini_batch_size: 128
+    ppo_mini_batch_size: 128            # logical slots per optimizer batch
     ppo_epochs: 1
+    # Strict canonical sparse mode requires these to be off (PLAN.md §1.3
+    # auxiliary-objective rule): sparse omission preserves the POLICY-GRADIENT
+    # term exactly, but not a dense entropy/KL objective.
+    entropy_coeff: 0.0
+    use_kl_loss: false
+    kl_loss_coef: 0.0
     policy_loss:
       loss_mode: vdra_segment_mean_ppo
+      policy_aggregation: segment_mean
       segment_token_reduction: mean
+      # Both values are first-class; the threshold is authoritative here and
+      # is propagated to extraction-time active-token counting.
+      use_prob_mask: true
+      probability_mask_threshold: 0.9
 
 tree_policy:
-  policy_aggregation: global_segment_mean
+  policy_aggregation: segment_mean
   segment_token_reduction: mean
+
+gear_tree:
+  only_adv_greater_than_zero: true      # sparse TENSOR EXECUTION only —
+                                        # never removes slots from the
+                                        # objective denominator.
+                                        # NOTE: this field lives under
+                                        # `gear_tree`, NOT `tree_policy`.
 ```
+
+Zero-advantage sparsity is an EXECUTION policy, not an objective change:
+zero slots count toward `target_edges_per_iteration`, per-question caps,
+optimizer-batch divisibility and the `M_B`/`T_B` denominators; they do not
+count toward tensor rows, model forward compute, or nonzero-gradient rows.
 
 Complete-tree replay remains an explicitly labeled ablation only.
 
-## 1.3 Canonical policy objective
+## 1.3 Canonical policy objective (USER DECISION 2026-07-20/21 — paper objective)
 
-For each internal PPO optimizer batch `B`, every retained segment slot `s`
-is weighted by the tree it belongs to:
-
-\[
-L_B^{(r)}
-=
-\sum_{s\in B} w_s\, L_s^{(r)},
-\qquad
-w_s = \frac{1}{N_T \cdot N_{\mathrm{seg}}(T_s)},
-\qquad r\in\{\mathrm{mean},\mathrm{sum}\}.
-\]
-
-`N_T` is the number of unique trees in the ORIGINAL optimizer batch (fixed
-before micro-batch splitting so the weight is split-invariant) and
-`N_seg(T)` is the PRE-FILTER `tree_total_segment_count` of the row's tree.
-Because `N_seg(T)` is the pre-filter count, removing exact-zero-advantage
-rows leaves the loss unchanged:
+The canonical objectives follow the paper's Segment-Level Policy
+Optimization section. `tree_policy.policy_aggregation` (duplicated and
+must-agree with `actor.policy_loss.policy_aggregation`) selects one of:
 
 ```text
-advantages [pos, neg, 0, 0] -> retained [L1, L2]
-L_B = (L1 + L2 + 0 + 0) / 4 = (L1 + L2) / 4.
+token_mean
+    Every original valid token has equal weight.
+segment_mean            (canonical DEFAULT)
+    Every original segment/response slot has equal weight.
+tree_balanced_segment_mean
+    Labeled ABLATION only — every tree has equal total weight; segments
+    averaged within tree (the historical w = 1/(N_T·N_seg) objective).
+legacy_token_mean / vdra_node_balanced
+    Unchanged baseline / ablation overlays.
 ```
 
-The batch-slot mean `L_B = (1/N_B) * sum_s L_s^{(r)}` over retained replay
-slots is a labeled LEGACY ablation
-(`actor.policy_loss.batch_slot_mean_ablation=true`) only — retained-slot
-counts shrink under zero filtering, so it is never the canonical
-denominator.
+For each LOGICAL optimizer batch `B` (formed from reserved slots BEFORE
+zero filtering, §1.2):
+
+```text
+M_B = number of logical segment slots in B (zero slots included)
+T_B = sum of response_token_count over every logical slot in B
+
+segment_mean:  L_B = sum_{u in B, A_u != 0} [token-mean of segment u] / M_B
+token_mean:    L_B = sum_{u in B, A_u != 0} sum_t token_loss(u,t) / T_B
+```
+
+Denominator rules (all violations must fail fast, never fall back):
+
+```text
+- M_B and T_B are stamped into DataProto.meta_info by the trainer
+  (original_logical_segment_count / original_logical_token_count),
+  ONE VALUE PER LOGICAL BATCH — never one value for a whole
+  update_actor call, never reconstructed from retained rows/tokens,
+  never approximated by tree_total_segment_count or parent-group
+  proportional attribution.
+- Every DP rank and every micro-batch of B reuses the same fixed value.
+- Zero slots belong to the logical batch they were RESERVED into —
+  membership is decided before filtering, not attributed afterwards.
+- Distributed scaling: the reducer AVERAGES gradients across DP ranks
+  (measured, docs/h1_fsdp_parity_report.md), so each rank computes
+  local_loss = dp_size * local_numerator / denominator with the ACTUAL
+  data-parallel group size.
+- example: advantages [pos, neg, 0, 0] → tensor rows [L1, L2],
+  M_B = 4, L_B = (L1 + L2) / 4.
+```
+
+All-zero logical batches (valid slots, no trainable payload):
+
+```text
+skip model forward/backward, optimizer.step, and that batch's
+num_optimizer_steps_total contribution; if EVERY batch of the update is
+all-zero, the trainer records an explicit skipped update (no
+update_actor RPC, no global_step increment, no scheduler.step).
+Record vdra/all_zero_logical_batches and
+vdra/skipped_zero_gradient_updates. Never run an AdamW step on a
+mathematically zero update (decoupled weight decay would still move
+parameters).
+```
+
+`segment_mean` must never be described as Dr. GRPO (a fixed
+maximum-length denominator would be a separate `dr_grpo_fixed_length`
+option). The old name `global_segment_mean` refers to the tree-balanced
+ablation ONLY: strict mode rejects it with a rename error; non-strict
+legacy loading maps it to `tree_balanced_segment_mean` with a deprecation
+warning; it NEVER maps to the new uniform `segment_mean`.
 
 The following must not affect canonical policy weight:
 
@@ -221,12 +302,12 @@ branch factor
 replay age
 objective_weights
 segment_objective_weights
+unique-tree count N_T            (tree-balanced ablation only)
+tree_total_segment_count N_seg   (tree-balanced ablation only)
 ```
 
-The canonical weight intentionally DOES depend on the pre-filter tree
-segment count `N_seg(T)` and the batch tree count `N_T`; these must never be
-reconnected to the manifest validity gate. Other tree and queue counts
-remain construction/theory diagnostics.
+Tree and queue counts remain construction/theory diagnostics and must not
+be reconnected to the manifest validity gate.
 
 ---
 
@@ -305,6 +386,14 @@ retain dense actor behavior
 
 No zero shortcut may run before validation.
 
+> SUPERSEDED 2026-07-21 (user decision, §1.2/§1.3): the canonical path is
+> now SPARSE TENSOR EXECUTION over a pre-filter logical-slot ledger. Zero
+> slots are removed from model execution only — never from reservation,
+> caps, divisibility, or the `M_B`/`T_B` denominators — and validation
+> still runs on the reserved slots before tensorization. The old
+> whole-reservation shortcut (which skipped validation and changed the
+> objective) remains forbidden.
+
 ## R6 — Zero-signal internal optimizer batch still steps
 
 This is not a canonical correctness bug. Per-mini-batch zero skipping changes:
@@ -318,6 +407,13 @@ replay row-consumption policy
 ```
 
 It is an optional redesign and must not be implemented without user approval.
+
+> USER APPROVAL GRANTED 2026-07-21 for exactly ONE narrow form (§1.3):
+> a logical batch whose slots ALL have exactly zero advantage skips
+> forward/backward/optimizer.step (no AdamW decay on a mathematically
+> zero update); a fully-zero update becomes an explicit skipped update
+> (no global_step, no scheduler.step). Any broader zero-signal skipping
+> (thresholds, per-micro-batch, partial batches) remains unapproved.
 
 ---
 
@@ -356,11 +452,28 @@ The following are not approved implementation tasks:
 changing scheduler to step per internal optimizer batch
 redefining global_step as optimizer-step count
 changing total_training_steps to optimizer-step units
-skipping individual zero-signal optimizer batches
-adding world-size scaling based only on toy DDP inference
+skipping zero-signal optimizer batches BEYOND the approved all-zero
+  logical-batch skip of §1.3 (2026-07-21)
+adding world-size scaling beyond the approved dp_size factor of §1.3,
+  which is backed by the measured FSDP2 reducer evidence
+  (docs/h1_fsdp_parity_report.md), not by toy DDP inference alone
 ```
 
 They belong in `CODEX_FIX_HARD.md` as discussion-gated proposals.
+
+## 3.3 Hard-stage decisions locked on 2026-07-20/21 (user-approved)
+
+```text
+H1 evidence complete: docs/h1_fsdp_parity_report.md (FSDP2 reducer =
+  average; segment_mean parity; tree_balanced non-parity → ablation).
+Canonical objective: paper token_mean / segment_mean (§1.3);
+  tree_balanced_segment_mean demoted to labeled ablation;
+  batch_slot_mean_ablation flag removed (its math IS segment_mean).
+Sparse-execution contract (§1.2): logical-slot ledger, pre-filter
+  M_B/T_B stamped per logical batch, dummy-row collective safety,
+  all-zero skip policy, strict validation with fail-fast (no retained-row
+  fallback, no proportional attribution, no tree-count approximation).
+```
 
 ---
 
@@ -394,11 +507,13 @@ M5 real Hydra/dataclass validation
 Source: `CODEX_FIX_HARD.md`
 
 ```text
-H1 FSDP/FSDP2 verification: test first, report before changing production
+H1 FSDP/FSDP2 verification: DONE 2026-07-20 (docs/h1_fsdp_parity_report.md)
 H2 scheduler-per-internal-step redesign: not approved
-H3 per-mini-batch zero skip: not approved
+H3 per-mini-batch zero skip: not approved, EXCEPT the all-zero
+   logical-batch skip approved 2026-07-21 (§1.3)
 H4 global-step / total-step unit redesign: prohibited without approval
-H5 distributed scaling modifications: test and discuss before patching
+H5 distributed scaling: dp_size factor of §1.3 approved on measured
+   FSDP2 evidence; anything further requires new discussion
 ```
 
 ---
@@ -456,19 +571,34 @@ discuss the conflict instead of broadening the patch.
 # 7. Definition of done before GPU smoke
 
 ```text
-[ ] global_step increases by one per successful outer actor update
-[ ] total_training_steps remains in the same outer-update unit
-[ ] scheduler remains one step per successful update_actor call
-[ ] num_optimizer_steps_total is separate and observational
-[ ] rollout_iteration is restored and used for replay age
-[ ] canonical all-zero shortcut is disabled or removed
-[ ] replay rows are validated before tensorization
-[ ] validation/tensorization/actor-RPC failures rollback reservations
-[ ] canonical manifest does not depend on objective-weight normalization
-[ ] strict main requires canonical tree/edge identities
-[ ] edge-level replay/caps remain correct
-[ ] stored old log-probs remain in use
-[ ] CPU gate passes
+[x] global_step increases by one per successful outer actor update
+[x] total_training_steps remains in the same outer-update unit
+[x] scheduler remains one step per successful update_actor call
+[x] num_optimizer_steps_total is separate and observational
+[x] rollout_iteration is restored and used for replay age
+[x] canonical all-zero shortcut is disabled or removed
+[x] replay rows are validated before tensorization
+[x] validation/tensorization/actor-RPC failures rollback reservations
+[x] canonical manifest does not depend on objective-weight normalization
+[x] strict main requires canonical tree/edge identities
+[x] edge-level replay/caps remain correct
+[x] stored old log-probs remain in use
+[x] CPU gate passes
+```
+
+Hard-stage additions (§1.2/§1.3, 2026-07-21), all verified on CPU:
+
+```text
+[x] canonical objective = paper segment_mean (default) / token_mean over
+    pre-filter logical M_B / T_B; tree_balanced_segment_mean is ablation
+[x] sparse tensor execution over the logical-slot ledger; advantages from
+    the complete sibling set; zero slots count in reservation/caps/M_B/T_B
+[x] dp_actor loss_scale_factor = dp_size (measured average-reducer
+    compensation); real 2-rank FSDP2 segment_mean parity + no-hang
+[x] all-zero logical batch = explicit skipped update (no global_step, no
+    scheduler.step, no AdamW drift); strict fail-fast on missing denominator
+[x] batch_slot_mean_ablation flag retired; global_segment_mean rename gated
+[x] pre-server sweep clean (docs/pre_server_sweep_report.md)
 ```
 
 Then run a short GPU smoke and report separately:

@@ -173,6 +173,8 @@ def test_update_manifest_from_edges_reports_no_failure_for_valid_group():
     manifest.optimizer_step_accounting_valid = True
     manifest.num_optimizer_steps_total = 4  # diagnostic only
     manifest.global_step = 1  # PLAN.md M4: >=1 successful outer update
+    # PLAN.md §14: trainer stamps the OBSERVED logical denominator mode.
+    manifest.observed_logical_denominator = "segment_slots"
     assert manifest.replay_age_uses_rollout_iteration is True
     assert manifest.unique_tree_ids_verified is True
     assert is_valid_main_run(manifest)
@@ -224,6 +226,8 @@ def test_manifest_persists_across_json_round_trip(tmp_path):
     manifest.optimizer_step_accounting_valid = True
     manifest.num_optimizer_steps_total = 4  # diagnostic only
     manifest.global_step = 1  # PLAN.md M4: >=1 successful outer update
+    # PLAN.md §14: trainer stamps the OBSERVED logical denominator mode.
+    manifest.observed_logical_denominator = "segment_slots"
     path = tmp_path / "vdra_run_manifest.json"
     manifest.save(path)
     from recipe.gear_tree.run_manifest import RunManifest

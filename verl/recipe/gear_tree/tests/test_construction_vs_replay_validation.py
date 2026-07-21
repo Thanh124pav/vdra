@@ -73,7 +73,7 @@ def _full_tree(k: int = 6, realized: int | None = None) -> list[dict]:
 def _manifest():
     return build_run_manifest(
         tree_policy={
-            "policy_aggregation": "global_segment_mean",
+            "policy_aggregation": "segment_mean",
             "segment_token_reduction": "mean",
             "advantage_mode": "spo_local",
         },

@@ -20,6 +20,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
 
+# PLAN.md §1: the SHARED active-token predicate, so a stamped count is
+# verified against exactly the semantics the actor loss will apply.
+from recipe.gear_tree.prob_mask import count_prob_mask_active_tokens
+
 
 _REQUIRED_EDGE_FIELDS = (
     "edge_id",
@@ -31,6 +35,57 @@ _REQUIRED_EDGE_FIELDS = (
     "value",
     "reward",
 )
+
+# PLAN.md §7/§13: TWO independent schema versions with explicit names.
+#
+#   REPLAY_ENVELOPE_SCHEMA_VERSION — the checkpoint envelope (meta file
+#       layout + field names). Unchanged by the objective work.
+#   LOGICAL_RECORD_SCHEMA_VERSION  — the per-record logical-slot layout.
+#       Version 2 added the probability-mask metadata
+#       (``prob_mask_token_count`` + ``probability_mask_threshold``) that
+#       masked ``token_mean`` needs. A version-1 replay cannot serve a masked
+#       run: its zero slots' log-prob payload was intentionally discarded, so
+#       the active-token count can never be recomputed.
+#
+# Checkpoints are written with BOTH the new names and the historical keys
+# (``schema_version`` / ``logical_slot_schema_version``), and reading accepts
+# either, so old checkpoints stay readable under the §13 compatibility rules.
+REPLAY_ENVELOPE_SCHEMA_VERSION = 1
+LOGICAL_RECORD_SCHEMA_VERSION = 2
+
+# Historical alias kept so existing importers keep working.
+LOGICAL_SLOT_SCHEMA_VERSION = LOGICAL_RECORD_SCHEMA_VERSION
+
+# PLAN.md §1.2 (2026-07-21): a metadata-only logical slot for an exact-zero
+# advantage segment. It has no trainable payload but MUST carry enough
+# bookkeeping for reservation, per-question caps, divisibility and the
+# pre-filter M_B / T_B_response / T_B_prob_mask denominators.
+_REQUIRED_SLOT_FIELDS = (
+    "edge_id",
+    "question_id",
+    "tree_id",
+    "parent_group_id",
+    "advantage",
+    "response_token_count",
+    "prob_mask_token_count",
+    "probability_mask_threshold",
+)
+
+_SLOT_FORBIDDEN_PAYLOAD_FIELDS = (
+    "query_token_ids",
+    "response_token_ids",
+    "actor_shifted_log_probs",
+)
+
+
+def is_ledger_slot(edge: Mapping[str, Any]) -> bool:
+    """True for metadata-only zero-advantage logical slots (PLAN.md §1.2).
+
+    A slot is identified by an EXPLICIT ``trainable_edge_id=None`` marker —
+    dense zero-advantage rows (full payload, ``trainable_edge_id`` set to
+    their own id) are ordinary trainable records, never slots.
+    """
+    return "trainable_edge_id" in edge and edge["trainable_edge_id"] is None
 
 
 def compute_max_edges_per_question(
@@ -211,7 +266,20 @@ class GearTreeReplayBuffer:
         max_edges_per_question: Union[int, str, None] = None,
         underfill_policy: str = "use_available",
         sampling_seed: int = 0,
+        # PLAN.md §13: objective-mask identity persisted with the buffer so a
+        # resume can prove the stored zero-slot active counts still apply.
+        use_prob_mask: bool = True,
+        probability_mask_threshold: float = 0.9,
+        # PLAN.md §4: set by the trainer for CANONICAL segment_mean /
+        # token_mean runs. Canonical records must carry the complete
+        # schema-v2 denominator metadata; it is never recomputed silently.
+        require_logical_denominator_metadata: bool = False,
     ) -> None:
+        self.use_prob_mask = bool(use_prob_mask)
+        self.probability_mask_threshold = float(probability_mask_threshold)
+        self.require_logical_denominator_metadata = bool(
+            require_logical_denominator_metadata
+        )
         # PLAN.md P0.2: accept both the new canonical names and the deprecated
         # aliases. Prefer the new name if both are set to a non-default value.
         resolved_target = self._resolve_alias(
@@ -394,6 +462,20 @@ class GearTreeReplayBuffer:
                     "duplicate edge_ids indicate the rollout did not assign a "
                     "unique tree_instance_id (PLAN.md P0.3)."
                 )
+            # PLAN.md §4: the record's active-token count was computed under
+            # the threshold stamped on it. Consuming it under a different
+            # threshold would silently mix objectives, and a zero slot's count
+            # can never be recomputed. Validate at INSERTION, not only at
+            # checkpoint restore.
+            self._validate_record_mask_identity(record)
+            # PLAN.md §1: a trainable edge still carries its payload, so its
+            # stamped counts must agree with it exactly.
+            self.validate_trainable_count_identity(
+                record,
+                require_logical_denominator_metadata=(
+                    self.require_logical_denominator_metadata
+                ),
+            )
             seen_ids.add(edge_id)
             prepared.append(record)
         # All-or-nothing commit.
@@ -771,13 +853,52 @@ class GearTreeReplayBuffer:
         meta_path = target / "gear_tree_replay_buffer_meta.json"
         tmp_edge = edge_path.with_suffix(edge_path.suffix + ".tmp")
         tmp_meta = meta_path.with_suffix(meta_path.suffix + ".tmp")
+        # PLAN.md §4: a checkpoint must not CLAIM logical-record schema v2
+        # while holding trainable records that lack the v2 denominator
+        # fields — the restore side would have nothing to verify. Write the
+        # version the content actually satisfies; a canonical buffer (which
+        # rejects such records at insertion) must always reach v2.
+        record_schema_version = LOGICAL_RECORD_SCHEMA_VERSION
         with tmp_edge.open("w", encoding="utf-8") as handle:
             for edge in self.edges():
+                if not is_ledger_slot(edge):
+                    missing = [
+                        f
+                        for f in (
+                            "response_token_count",
+                            "prob_mask_token_count",
+                            "probability_mask_threshold",
+                        )
+                        if edge.get(f) is None
+                    ]
+                    if missing:
+                        if self.require_logical_denominator_metadata:
+                            raise ValueError(
+                                "refusing to write a logical-record schema "
+                                f"v{LOGICAL_RECORD_SCHEMA_VERSION} replay "
+                                "checkpoint for a CANONICAL run: trainable "
+                                f"edge {edge.get('edge_id')!r} is missing "
+                                f"{missing} (PLAN.md §4)."
+                            )
+                        # Legacy buffer: downgrade the declared record schema
+                        # rather than over-claiming v2.
+                        record_schema_version = 1
                 handle.write(json.dumps(edge, sort_keys=True) + "\n")
         tmp_meta.write_text(
             json.dumps(
                 {
+                    # PLAN.md §7: explicit names, plus the historical keys for
+                    # readers that predate the rename.
+                    "replay_envelope_schema_version": REPLAY_ENVELOPE_SCHEMA_VERSION,
+                    "logical_record_schema_version": record_schema_version,
                     "schema_version": self.schema_version,
+                    # PLAN.md §13: the objective-mask identity the stored zero
+                    # slots' active-token counts were computed under. A zero
+                    # slot's old-log-prob payload is gone, so those counts can
+                    # NEVER be recomputed for a different threshold.
+                    "logical_slot_schema_version": record_schema_version,
+                    "use_prob_mask": self.use_prob_mask,
+                    "probability_mask_threshold": self.probability_mask_threshold,
                     # PLAN.md P0.2 canonical names.
                     "target_edges_per_iteration": self.target_edges_per_iteration,
                     "max_edge_age_iterations": self.max_edge_age_iterations,
@@ -812,9 +933,73 @@ class GearTreeReplayBuffer:
         tmp_meta.replace(meta_path)
 
     @classmethod
-    def load(cls, checkpoint_dir: str | Path) -> "GearTreeReplayBuffer":
+    def load(
+        cls,
+        checkpoint_dir: str | Path,
+        *,
+        expected_use_prob_mask: Optional[bool] = None,
+        expected_probability_mask_threshold: Optional[float] = None,
+        reset_replay_on_objective_mismatch: bool = False,
+        require_logical_denominator_metadata: bool = False,
+    ) -> "GearTreeReplayBuffer":
+        """Restore a replay buffer, verifying objective-mask compatibility.
+
+        PLAN.md §13: stored zero slots are metadata-only — their
+        ``prob_mask_token_count`` was computed at extraction under a specific
+        threshold and can NEVER be recomputed (the old-log-prob payload was
+        intentionally discarded). Restoring such a buffer into a run with a
+        different mask configuration would silently reuse counts from another
+        objective, so it FAILS FAST unless the caller explicitly opts into
+        ``reset_replay_on_objective_mismatch``, which discards the rows
+        instead.
+
+        Passing no ``expected_*`` values skips the check (tooling/read-only
+        inspection); the trainer always passes them.
+        """
         source = Path(checkpoint_dir)
         meta = json.loads((source / "gear_tree_replay_buffer_meta.json").read_text(encoding="utf-8"))
+        saved_mask = meta.get("use_prob_mask")
+        saved_threshold = meta.get("probability_mask_threshold")
+        # PLAN.md §7: prefer the explicit name; fall back to the historical key.
+        saved_slot_schema = int(
+            meta.get(
+                "logical_record_schema_version",
+                meta.get("logical_slot_schema_version", 1),
+            )
+        )
+        objective_mismatch: Optional[str] = None
+        if expected_use_prob_mask is not None:
+            if saved_mask is None or saved_threshold is None:
+                objective_mismatch = (
+                    "replay checkpoint predates the logical-slot mask metadata "
+                    f"(logical_slot_schema_version={saved_slot_schema} < "
+                    f"{LOGICAL_SLOT_SCHEMA_VERSION}); its zero slots carry no "
+                    "verifiable active-token counts"
+                )
+            elif bool(saved_mask) != bool(expected_use_prob_mask):
+                objective_mismatch = (
+                    f"replay was built with use_prob_mask={bool(saved_mask)} "
+                    f"but this run uses {bool(expected_use_prob_mask)}"
+                )
+            elif (
+                expected_probability_mask_threshold is not None
+                and float(saved_threshold) != float(expected_probability_mask_threshold)
+            ):
+                objective_mismatch = (
+                    "replay was built with probability_mask_threshold="
+                    f"{float(saved_threshold)} but this run uses "
+                    f"{float(expected_probability_mask_threshold)}"
+                )
+        if objective_mismatch is not None and not reset_replay_on_objective_mismatch:
+            raise ValueError(
+                f"cannot restore replay: {objective_mismatch}. A zero slot's "
+                "prob_mask_token_count cannot be recomputed because its "
+                "old-log-prob payload was removed at extraction (PLAN.md "
+                "§13). Either resume with the original objective-mask "
+                "configuration, or set "
+                "replay_buffer.reset_replay_on_objective_mismatch=true to "
+                "DISCARD the replay and start collecting under the new one."
+            )
         # PLAN.md P0.2: prefer the new canonical field names when present so
         # that a resume-after-migration reads the new schema first; fall back
         # to the deprecated aliases for older checkpoints.
@@ -837,21 +1022,210 @@ class GearTreeReplayBuffer:
             trees_per_question=int(meta.get("trees_per_question", 1) or 1),
             underfill_policy=meta.get("underfill_policy", "use_available"),
             sampling_seed=meta.get("sampling_seed", 0),
+            use_prob_mask=(
+                bool(expected_use_prob_mask)
+                if expected_use_prob_mask is not None
+                else bool(saved_mask if saved_mask is not None else True)
+            ),
+            probability_mask_threshold=(
+                float(expected_probability_mask_threshold)
+                if expected_probability_mask_threshold is not None
+                else float(saved_threshold if saved_threshold is not None else 0.9)
+            ),
+            # PLAN.md §4: a canonical run must not restore records that lack
+            # the schema-v2 denominator metadata.
+            require_logical_denominator_metadata=(
+                require_logical_denominator_metadata
+            ),
         )
         buffer.metrics = dict(meta.get("metrics", {}))
         buffer._next_reservation_id = int(meta.get("next_reservation_id", 1))
+        if objective_mismatch is not None:
+            # PLAN.md §13: explicit opt-in — DISCARD the incompatible rows
+            # rather than silently reusing counts from another objective.
+            warnings.warn(
+                f"discarding replay rows: {objective_mismatch} "
+                "(reset_replay_on_objective_mismatch=true).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            buffer.metrics["replay_reset_on_objective_mismatch"] = 1
+            return buffer
         edge_file = source / "gear_tree_replay_buffer.jsonl"
         if edge_file.exists():
             for line in edge_file.read_text(encoding="utf-8").splitlines():
                 if not line.strip():
                     continue
                 edge = json.loads(line)
+                # PLAN.md §4: validate EVERY restored record, not just the
+                # checkpoint-level mask metadata — a hand-edited or
+                # partially-migrated row must not slip in.
                 buffer._validate_edge(edge)
+                buffer._validate_record_mask_identity(edge)
+                buffer.validate_trainable_count_identity(
+                    edge,
+                    require_logical_denominator_metadata=(
+                        buffer.require_logical_denominator_metadata
+                    ),
+                )
                 buffer._edges[str(edge["edge_id"])] = edge
         return buffer
 
+    def _validate_record_mask_identity(self, record: Mapping[str, Any]) -> None:
+        """PLAN.md §4: a record's stamped threshold must match this buffer's.
+
+        Both values originate from the same resolved config and are
+        serialized directly, so exact float equality is the right comparison;
+        a tiny tolerance is applied only to absorb JSON round-trip noise.
+        """
+        raw = record.get("probability_mask_threshold")
+        if raw is None:
+            # Records predating the mask metadata carry no verifiable count;
+            # only slots (whose count cannot be recomputed) are required to
+            # stamp it — that is enforced by _validate_edge.
+            return
+        if abs(float(raw) - float(self.probability_mask_threshold)) > 1e-12:
+            raise ValueError(
+                f"replay record {record.get('edge_id')!r} stamps "
+                f"probability_mask_threshold={float(raw)} but this run uses "
+                f"{float(self.probability_mask_threshold)}; its "
+                "prob_mask_token_count was computed under a different "
+                "objective and must not be reused (PLAN.md §4)."
+            )
+
+    @staticmethod
+    def validate_trainable_count_identity(
+        record: Mapping[str, Any],
+        *,
+        require_logical_denominator_metadata: bool = False,
+    ) -> None:
+        """PLAN.md §1/§4: a TRAINABLE edge keeps its payload, so its stamped
+        denominator metadata must agree with that payload exactly.
+
+        ``response_token_count`` must equal the response length, and
+        ``prob_mask_token_count`` must equal the shared predicate's count over
+        the stored old log-probs at the stamped threshold. A drift here would
+        silently corrupt ``T_B_response`` / ``T_B_prob_mask``.
+
+        ``require_logical_denominator_metadata`` is set for CANONICAL
+        (``segment_mean`` / ``token_mean``) runs: all three schema-v2 fields
+        must be present and are never silently recomputed. Legacy /
+        non-canonical paths may run without them (they warn and recompute
+        downstream).
+
+        Metadata-only zero slots are exempt from recomputation: their payload
+        was intentionally discarded — only their stamped schema and ranges
+        are checked (see :meth:`_validate_edge`).
+        """
+        if is_ledger_slot(record):
+            return
+        if require_logical_denominator_metadata:
+            missing = [
+                f
+                for f in (
+                    "response_token_count",
+                    "prob_mask_token_count",
+                    "probability_mask_threshold",
+                )
+                if record.get(f) is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"canonical VDRA requires complete logical-denominator "
+                    f"metadata on every trainable edge; "
+                    f"edge_id={record.get('edge_id')!r} is missing {missing}. "
+                    "Refusing to silently recompute it (PLAN.md §4)."
+                )
+        stamped_resp = record.get("response_token_count")
+        if stamped_resp is None:
+            # Pre-migration record without the counts; range/identity checks
+            # elsewhere still apply.
+            return
+        response_ids = record.get("response_token_ids") or []
+        if int(stamped_resp) != len(response_ids):
+            raise ValueError(
+                f"replay edge {record.get('edge_id')!r} stamps "
+                f"response_token_count={int(stamped_resp)} but carries "
+                f"{len(response_ids)} response tokens; the pre-filter "
+                "denominator would be wrong (PLAN.md §1)."
+            )
+        stamped_mask = record.get("prob_mask_token_count")
+        if stamped_mask is None:
+            return
+        threshold = record.get("probability_mask_threshold")
+        if threshold is None:
+            return
+        log_probs = record.get("actor_shifted_log_probs")
+        if log_probs is None:
+            return
+        recomputed = count_prob_mask_active_tokens(log_probs, float(threshold))
+        if int(stamped_mask) != recomputed:
+            raise ValueError(
+                f"replay edge {record.get('edge_id')!r} stamps "
+                f"prob_mask_token_count={int(stamped_mask)} but its stored "
+                f"old log-probs give {recomputed} active tokens at "
+                f"threshold={float(threshold)}; the masked denominator would "
+                "be wrong (PLAN.md §1)."
+            )
+
     @staticmethod
     def _validate_edge(edge: MutableMapping[str, Any]) -> None:
+        if is_ledger_slot(edge):
+            # PLAN.md §1.2: metadata-only logical slot for an exact-zero
+            # advantage segment. Strict bookkeeping, no trainable payload.
+            missing = [f for f in _REQUIRED_SLOT_FIELDS if f not in edge]
+            if missing:
+                raise ValueError(
+                    f"Replay logical slot is missing required fields: {missing}"
+                )
+            if float(edge["advantage"]) != 0.0:
+                raise ValueError(
+                    "Replay logical slot must carry exactly zero advantage "
+                    f"(PLAN.md §1.2); got {edge['advantage']!r}."
+                )
+            if not bool(edge.get("advantage_is_zero", False)):
+                raise ValueError(
+                    "Replay logical slot must stamp advantage_is_zero=True "
+                    "(PLAN.md §1.2)."
+                )
+            if edge.get("trainable_edge_id", "missing") is not None:
+                raise ValueError(
+                    "Replay logical slot must set trainable_edge_id=None "
+                    "(PLAN.md §4)."
+                )
+            resp = int(edge.get("response_token_count", 0) or 0)
+            if resp <= 0:
+                raise ValueError(
+                    "Replay logical slot must record its positive pre-filter "
+                    "response_token_count — T_B_response cannot be "
+                    "reconstructed otherwise (PLAN.md §1.2/§4)."
+                )
+            # PLAN.md §4: the masked denominator can never be recomputed for a
+            # zero slot (its old-log-prob payload is gone), so the count must
+            # be stamped and consistent.
+            mask_count = int(edge.get("prob_mask_token_count", -1))
+            if not (0 <= mask_count <= resp):
+                raise ValueError(
+                    "Replay logical slot requires 0 <= prob_mask_token_count "
+                    f"<= response_token_count; got {mask_count} vs {resp} "
+                    "(PLAN.md §4)."
+                )
+            thr = edge.get("probability_mask_threshold")
+            if thr is None or not (0.0 < float(thr) <= 1.0):
+                raise ValueError(
+                    "Replay logical slot must stamp the "
+                    "probability_mask_threshold its prob_mask_token_count was "
+                    f"computed under (0 < t <= 1); got {thr!r} (PLAN.md §4)."
+                )
+            payload = [
+                f for f in _SLOT_FORBIDDEN_PAYLOAD_FIELDS if edge.get(f)
+            ]
+            if payload:
+                raise ValueError(
+                    "Replay logical slot must be metadata-only; found "
+                    f"trainable payload fields {payload} (PLAN.md §1.2)."
+                )
+            return
         missing = [field for field in _REQUIRED_EDGE_FIELDS if field not in edge]
         if missing:
             raise ValueError(f"Replay edge is missing required fields: {missing}")
@@ -863,6 +1237,23 @@ class GearTreeReplayBuffer:
             raise ValueError(
                 "Replay edge actor_shifted_log_probs must align one-to-one with response_token_ids"
             )
+        # PLAN.md §4: when the record carries the logical-slot counts, they
+        # must be internally consistent (trainable rows keep their payload, so
+        # the mask count stays derivable — but a stamped value must be sane).
+        if "response_token_count" in edge:
+            resp = int(edge.get("response_token_count") or 0)
+            if resp <= 0:
+                raise ValueError(
+                    "Replay edge response_token_count must be > 0 (PLAN.md §4)."
+                )
+            if "prob_mask_token_count" in edge:
+                mask_count = int(edge.get("prob_mask_token_count") or 0)
+                if not (0 <= mask_count <= resp):
+                    raise ValueError(
+                        "Replay edge requires 0 <= prob_mask_token_count <= "
+                        f"response_token_count; got {mask_count} vs {resp} "
+                        "(PLAN.md §4)."
+                    )
 
 
 def _assert_complete_parent_groups(edges: Iterable[Mapping[str, Any]]) -> None:

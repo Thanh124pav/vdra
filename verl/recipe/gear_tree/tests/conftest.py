@@ -1,6 +1,13 @@
-"""Test-environment compatibility shims for optional dependency drift."""
+"""Test-environment compatibility shims for optional dependency drift.
 
-import transformers
+The shims themselves live in ``_test_shims.py`` so that ``mp.spawn`` worker
+modules (which re-import outside pytest and never run this conftest) can
+install the exact same shims before touching the verl import chain.
+"""
 
-if not hasattr(transformers, "AutoModelForVision2Seq"):
-    transformers.AutoModelForVision2Seq = object
+try:  # namespace-package import under PYTHONPATH=verl
+    from recipe.gear_tree.tests import _test_shims
+except ImportError:  # flat rootdir-relative import
+    import _test_shims
+
+_test_shims.install()

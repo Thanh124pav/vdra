@@ -46,10 +46,27 @@ gear_tree:
   # TreeRL-style discount (only used by treerl_style_ablation).
   treerl_gamma: 0.9
 
-  # Stage 1 zero-filter contract: despite the legacy name, true removes
-  # only exact-zero advantages after all realized non-pruned segments have
-  # been counted; positive and negative advantages are retained.
+  # Sparse-execution contract (PLAN.md §1.2): despite the legacy name, true
+  # removes exact-zero advantages from TENSOR EXECUTION only, after all
+  # realized non-pruned segments have been counted. Those segments still
+  # enter replay as metadata-only logical slots and still count in the
+  # M_B / T_B denominators; positive and negative advantages are retained.
   only_adv_greater_than_zero: true
+
+  # PLAN.md §2 anti-livelock guards. A nonprogress iteration is one that
+  # does not advance global_step: zero-signal skip, postponed reservation, or
+  # empty reservation. Without this guard such runs can live-lock.
+  #
+  #   max_consecutive_nonprogress_iterations: abort after this many
+  #       consecutive nonprogress iterations. null or <= 0 disables the guard.
+  #   max_consecutive_skipped_updates: deprecated one-release alias for the
+  #       field above; setting both to different values is rejected.
+  #   max_rollout_iterations: stop the run after this many rollout
+  #       iterations even if global_step never reached total_training_steps.
+  #       null or <= 0 disables the guard.
+  max_consecutive_nonprogress_iterations: 50
+  max_consecutive_skipped_updates: null
+  max_rollout_iterations: null
 
   replay_buffer:
     enabled: true
@@ -61,6 +78,15 @@ gear_tree:
     underfilled_update_policy: postpone_until_divisible
     sampling_seed: 0
     checkpoint: true
+
+    # PLAN.md §13: what to do when a restored replay was built under a
+    # DIFFERENT objective-mask configuration (use_prob_mask /
+    # probability_mask_threshold). A zero slot's prob_mask_token_count was
+    # computed at extraction and can never be recomputed, because its
+    # old-log-prob payload was intentionally discarded.
+    #   false — fail fast on the mismatch (canonical/default);
+    #   true  — DISCARD the incompatible replay rows and restart collection.
+    reset_replay_on_objective_mismatch: false
 
   # GEAR-VinePPO: K MC rollouts per cut-point for value estimation (0 = off,
   # use SPO/TreeRL/TreePO tree values instead).
@@ -231,17 +257,25 @@ tree_policy:
   # Values: spo_local | configured_ablation.
   advantage_mode: spo_local
 
-  # policy_aggregation selects the actor loss reduction. Main VDRA is
-  # `global_segment_mean` (PLAN.md P0.1): segment contributions use the
-  # canonical 1/(N_T * N_seg(T)) objective. Tree/queue count tensors remain
-  # diagnostics and validation inputs until the Medium manifest cleanup.
+  # policy_aggregation selects the actor loss reduction (PLAN.md §1.3,
+  # user decision 2026-07-21 — the paper objective).
   #
   # Values:
-  #   * global_segment_mean  — canonical main-run (PLAN.md P0.1).
+  #   * segment_mean         — canonical DEFAULT: every original logical
+  #                             segment slot has equal weight 1/M_B
+  #                             (pre-filter logical-batch slot count).
+  #   * token_mean           — canonical option: every original valid token
+  #                             has equal weight 1/T_B (pre-filter
+  #                             logical-batch token count).
+  #   * tree_balanced_segment_mean — labeled ABLATION: the historical
+  #                             1/(N_T * N_seg(T)) tree-balanced objective
+  #                             (formerly named `global_segment_mean`; the
+  #                             old name fails fast in strict mode).
   #   * vdra_node_balanced   — legacy parent-balanced ablation. Do NOT use
   #                             for main runs; kept for controlled ablations.
-  #   * legacy_token_mean    — SPO baseline / ablation.
-  policy_aggregation: global_segment_mean
+  #   * legacy_token_mean    — SPO baseline / ablation (verl-native
+  #                             token-mean; NOT the paper token_mean).
+  policy_aggregation: segment_mean
 
   # PLAN.md P0.1: within-segment token reduction. Must be exactly `mean` or
   # `sum`. `mean` is the canonical/default main setting; `sum` is a supported
@@ -304,12 +338,22 @@ actor_rollout_ref:
       # in sync with `tree_policy.segment_token_reduction`.
       segment_token_reduction: mean
 
-      # Canonical normalization is the tree segment mean
-      # w_s = 1 / (N_T * N_seg(T)) with the PRE-FILTER
-      # tree_total_segment_count, so removing exact-zero-advantage rows
-      # leaves the loss unchanged. `true` selects the historical batch-slot
-      # mean over retained replay slots — a labeled LEGACY ablation only.
-      batch_slot_mean_ablation: false
+      # PLAN.md §1.3: the same aggregation must be visible on
+      # `actor.policy_loss` because the loss reads it via `config`
+      # (ActorConfig). Keep it in sync with `tree_policy.policy_aggregation`.
+      # Canonical: uniform segment mean over the PRE-FILTER logical-batch
+      # slot count M_B (zero-advantage slots stay in the denominator even
+      # though they carry no tensor rows — sparse execution, PLAN.md §1.2).
+      policy_aggregation: segment_mean
+
+      # PLAN.md §1: treetune-style probability mask. BOTH values are
+      # first-class (strict mode never forces one). A response token is
+      # active iff exp(old_log_prob) < probability_mask_threshold (STRICT
+      # `<`). This is the AUTHORITATIVE threshold: the trainer propagates it
+      # to rollout extraction so the stamped active-token counts and the
+      # actor-side mask can never use different semantics.
+      use_prob_mask: true
+      probability_mask_threshold: 0.9
 
     # No KL-in-loss by default (matches tree-family configs). KL coef = 0.
     use_kl_loss: false

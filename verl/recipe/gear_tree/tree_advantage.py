@@ -14,6 +14,11 @@ from typing import Any, Iterable
 import torch
 
 from recipe.gear_tree.gear_core.tree_update_modes import compute_tree_update_values
+# PLAN.md §1/§3: extraction-time active-token counting shares the actor's
+# probability-mask predicate so the two can never drift apart. The helper
+# lives in its own dependency-light module so extraction does not pull in the
+# actor/loss registration import chain.
+from recipe.gear_tree.prob_mask import count_prob_mask_active_tokens
 
 
 def _bok(value: float, bok: int = 4) -> float:
@@ -28,6 +33,43 @@ def _node_reward_std(node: dict[str, Any]) -> float:
     return float(node.get("reward_std", 0.0) or 0.0)
 
 
+# PLAN.md §1.2 (2026-07-21): fields a metadata-only logical slot carries.
+# Deliberately EXCLUDES the trainable payload (query/response token ids,
+# actor_shifted_log_probs, texts, instance) — a zero slot is bookkeeping for
+# reservation, caps and the M_B/T_B denominators, never a training row.
+_LOGICAL_SLOT_FIELDS = (
+    "question_id",
+    "policy_snapshot_id",
+    "tree_id",
+    "tree_instance_id",
+    "parent_group_id",
+    "parent_segment_id",
+    "child_segment_id",
+    "child_index",
+    "allocated_k",
+    "sample_multiplicity",
+    "queue_flush_id",
+    "advantage",
+    "value",
+    "reward",
+    "leaf",
+    "pruned",
+    # PLAN.md §3: denominator bookkeeping computed BEFORE the payload is
+    # stripped — a zero slot's active-token count can never be recomputed.
+    "response_token_count",
+    "prob_mask_token_count",
+    "probability_mask_threshold",
+    "advantage_is_zero",
+)
+
+
+def _zero_slot_from_edge(edge: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a fully built zero-advantage edge to its logical-slot record."""
+    slot = {key: edge[key] for key in _LOGICAL_SLOT_FIELDS if key in edge}
+    slot["trainable_edge_id"] = None
+    return slot
+
+
 def extract_edges_from_tree(
     tree: dict[str, Any],
     *,
@@ -37,6 +79,8 @@ def extract_edges_from_tree(
     treepo_global_weight: float = 0.5,
     treerl_gamma: float = 0.9,
     emit_pruned_edges: bool = False,
+    emit_zero_slots: bool = False,
+    probability_mask_threshold: float = 0.9,
     strict_fresh_iid: bool = False,
     collect_construction_summaries: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -52,12 +96,30 @@ def extract_edges_from_tree(
     placeholder rows must NOT enter replay; ``emit_pruned_edges`` defaults to
     ``False`` and is only for diagnostic dumps.
 
+    ``probability_mask_threshold`` (PLAN.md §1/§3) is the AUTHORITATIVE
+    threshold propagated from ``actor.policy_loss.probability_mask_threshold``.
+    Active-token counting shares
+    :func:`recipe.gear_tree.policy_loss.count_prob_mask_active_tokens` with the
+    actor mask, so the two can never use different semantics.
+
+    ``emit_zero_slots`` (PLAN.md §1.2 sparse-execution contract, 2026-07-21):
+    when true together with ``only_adv_greater_than_zero``, an exact-zero
+    advantage child is not dropped — it becomes a metadata-only LOGICAL SLOT
+    (``trainable_edge_id=None``, ``advantage_is_zero=True``, its
+    ``response_token_count``, and the full grouping identity, but no
+    token/log-prob payload). Slots travel to replay so reservation, caps,
+    divisibility and the ``M_B``/``T_B`` denominators count them; only
+    trainable rows are ever tensorized. Every emitted record additionally
+    stamps ``response_token_count`` and ``advantage_is_zero`` so downstream
+    denominator bookkeeping never re-derives them.
+
     ``collect_construction_summaries``: when a list is passed, the per-tree
     construction summary (pre-filter counts and per-parent
     ``realized``/``allocated_k``/``retained`` facts) is appended to it even
-    when every edge of the tree is zero-filtered away. This is the only
-    channel that preserves construction facts for a parent/tree whose every
-    child has exactly zero advantage — such rows never enter replay.
+    when every edge of the tree has exactly zero advantage. Exact-zero
+    children enter replay as metadata-only logical slots; they produce no
+    trainable tensor rows, but they do count toward reservation, per-question
+    caps and the M_B / T_B denominators.
 
     ``strict_fresh_iid`` enforces the fresh_iid invariants right at edge
     extraction:
@@ -279,11 +341,41 @@ def extract_edges_from_tree(
                 # legacy fixture is used; prefer the max we saw.
                 if int(allocated_k) > slot["allocated_k"]:
                     slot["allocated_k"] = int(allocated_k)
+            # PLAN.md §3: denominator bookkeeping stamped on EVERY emitted
+            # record (trainable rows AND metadata-only zero slots) while the
+            # old log-probs are still available, so M_B / T_B_response /
+            # T_B_prob_mask never need re-derivation downstream.
+            _resp_ids = edge.get("response_token_ids") or []
+            _old_lps = edge.get("actor_shifted_log_probs")
+            if not is_pruned:
+                if _old_lps is None:
+                    raise ValueError(
+                        "cannot stamp logical-slot active-token counts: edge "
+                        f"{child_segment_id!r} has no actor_shifted_log_probs "
+                        "(PLAN.md §3)."
+                    )
+                if len(_old_lps) != len(_resp_ids):
+                    raise ValueError(
+                        "cannot stamp logical-slot active-token counts: edge "
+                        f"{child_segment_id!r} has {len(_old_lps)} old "
+                        f"log-probs for {len(_resp_ids)} response tokens "
+                        "(PLAN.md §3)."
+                    )
+            edge["response_token_count"] = int(len(_resp_ids))
+            edge["prob_mask_token_count"] = (
+                count_prob_mask_active_tokens(_old_lps, probability_mask_threshold)
+                if _old_lps is not None
+                else 0
+            )
+            edge["probability_mask_threshold"] = float(probability_mask_threshold)
+            edge["advantage_is_zero"] = bool(advantage == 0)
             # Stage 1: the zero filter uses the EXACT scalar that
             # token_fields_for_edges broadcasts into the policy `advantages`
             # tensor (edge["advantage"]), never diagnostic pav_advantage.
             # Despite the legacy flag name, true keeps positive and negative
-            # advantages and removes only exact-zero rows.
+            # advantages and removes only exact-zero rows from TENSOR
+            # EXECUTION; with emit_zero_slots the slot itself survives as a
+            # metadata-only ledger record (PLAN.md §1.2).
             if (not is_pruned or emit_pruned_edges) and (
                 not only_adv_greater_than_zero or advantage != 0
             ):
@@ -294,6 +386,13 @@ def extract_edges_from_tree(
                     queue_to_parent_group_counts.setdefault(
                         queue_flush_id, set()
                     ).add(str(parent_group_id))
+            elif (
+                emit_zero_slots
+                and only_adv_greater_than_zero
+                and not is_pruned
+                and advantage == 0
+            ):
+                edges.append(_zero_slot_from_edge(edge))
 
         for child in node.get("children", []):
             visit(child, node)
@@ -305,8 +404,14 @@ def extract_edges_from_tree(
     # without another tree walk. ``tree_total_segment_count`` is the pre-filter
     # realized non-pruned segment count; queue_released_segment_count[q] is the
     # matching pre-filter queue count for logging / theoretical validation.
+    # PLAN.md §1.2: metadata-only ledger slots are counted separately —
+    # ``retained_edge_count`` keeps its historical meaning (trainable rows).
     retained_by_parent: dict[str, int] = {}
+    ledger_slot_count = 0
     for edge in edges:
+        if "trainable_edge_id" in edge and edge["trainable_edge_id"] is None:
+            ledger_slot_count += 1
+            continue
         pgid = str(edge.get("parent_group_id", ""))
         retained_by_parent[pgid] = retained_by_parent.get(pgid, 0) + 1
     tree_summary = {
@@ -317,16 +422,20 @@ def extract_edges_from_tree(
         "expanded_parent_group_count": len(expanded_parent_group_ids),
         "trainable_child_count": int(trainable_child_count),
         "tree_total_segment_count": int(tree_total_segment_count),
-        "retained_edge_count": len(edges),
+        "retained_edge_count": len(edges) - ledger_slot_count,
+        "ledger_slot_count": int(ledger_slot_count),
         "queue_to_parent_group_counts": {
             str(k): len(v) for k, v in queue_to_parent_group_counts.items()
         },
         "queue_released_segment_count": {
             str(k): int(v) for k, v in queue_released_segment_count.items()
         },
-        # Per-parent PRE-FILTER construction facts. This is the only record
-        # that survives for a parent whose every child was zero-filtered
-        # (retained == 0): such parents have no rows in ``edges`` at all.
+        # Per-parent PRE-FILTER construction facts. Under sparse execution
+        # (``emit_zero_slots``) a parent whose every child had exactly zero
+        # advantage still contributes metadata-only LOGICAL SLOTS to
+        # ``edges`` — it just contributes no TRAINABLE rows. These summary
+        # counts remain the authoritative construction record either way, and
+        # are the only record when zero slots are not emitted at all.
         "parent_construction": {
             pgid: {
                 "realized": int(slot["realized"]),

@@ -101,6 +101,8 @@ def test_clean_synthetic_update_produces_valid_manifest_mean():
     manifest.optimizer_step_accounting_valid = True
     manifest.num_optimizer_steps_total = 4  # diagnostic only
     manifest.global_step = 1  # PLAN.md M4: >=1 successful outer update
+    # PLAN.md §14: trainer stamps the OBSERVED logical denominator mode.
+    manifest.observed_logical_denominator = "segment_slots"
     assert validate_main_run(manifest) is None
 
 
@@ -118,6 +120,8 @@ def test_clean_synthetic_update_produces_valid_manifest_sum():
     manifest.optimizer_step_accounting_valid = True
     manifest.num_optimizer_steps_total = 4  # diagnostic only
     manifest.global_step = 1  # PLAN.md M4: >=1 successful outer update
+    # PLAN.md §14: trainer stamps the OBSERVED logical denominator mode.
+    manifest.observed_logical_denominator = "segment_slots"
     assert manifest.segment_token_reduction == SEGMENT_TOKEN_REDUCTION_SUM
     assert validate_main_run(manifest) is None
 
@@ -135,6 +139,8 @@ def test_later_failure_keeps_run_invalid():
     manifest.optimizer_step_accounting_valid = True
     manifest.num_optimizer_steps_total = 4  # diagnostic only
     manifest.global_step = 1  # PLAN.md M4: >=1 successful outer update
+    # PLAN.md §14: trainer stamps the OBSERVED logical denominator mode.
+    manifest.observed_logical_denominator = "segment_slots"
     assert validate_main_run(manifest) is None
 
     # Second batch — inject a broken parent group so group-integrity fails.
@@ -160,6 +166,8 @@ def test_manifest_save_load_preserves_all_fields(tmp_path):
     manifest.optimizer_step_accounting_valid = True
     manifest.num_optimizer_steps_total = 4  # diagnostic only
     manifest.global_step = 1  # PLAN.md M4: >=1 successful outer update
+    # PLAN.md §14: trainer stamps the OBSERVED logical denominator mode.
+    manifest.observed_logical_denominator = "segment_slots"
 
     p = tmp_path / "manifest.json"
     manifest.save(p)
@@ -215,6 +223,8 @@ class TestObservedFactsP0J:
         manifest.optimizer_step_accounting_valid = True
         manifest.num_optimizer_steps_total = 4
         manifest.global_step = 1
+        # PLAN.md §14: trainer stamps the OBSERVED logical denominator mode.
+        manifest.observed_logical_denominator = "segment_slots"
         assert validate_main_run(manifest) is None
         manifest.replay_sampling_unit = "complete_tree"
         reason = validate_main_run(manifest)

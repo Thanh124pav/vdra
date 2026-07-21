@@ -18,7 +18,11 @@ from recipe.gear_tree.replay_buffer import GearTreeReplayBuffer
 from recipe.gear_tree.trainer_state import (
     TRAINER_STATE_FILENAME,
     GearTreeTrainerState,
+    GearTreeLiveState,
+    live_state_path,
+    load_live_state,
     load_trainer_state,
+    save_live_state,
     save_trainer_state,
     trainer_state_path,
 )
@@ -46,6 +50,8 @@ class TestStateRoundTrip:
             successful_actor_updates=97,
             postponed_updates=2,
             failed_updates=1,
+            skipped_zero_gradient_updates=4,
+            consecutive_nonprogress_iterations=49,
         )
         save_trainer_state(tmp_path, state)
         loaded = load_trainer_state(tmp_path)
@@ -53,6 +59,8 @@ class TestStateRoundTrip:
         assert loaded.global_step == 400
         assert loaded.rollout_iteration == 100
         assert loaded.num_optimizer_steps_total == 400
+        assert loaded.skipped_zero_gradient_updates == 4
+        assert loaded.consecutive_nonprogress_iterations == 49
 
     def test_m1_counter_units_survive_resume(self, tmp_path):
         """PLAN.md M1 completion table: five successful outer updates that
@@ -88,6 +96,30 @@ class TestStateRoundTrip:
         loaded = load_trainer_state(tmp_path)
         assert loaded is not None
         assert loaded.global_step == 12
+
+    def test_legacy_state_missing_new_counters_defaults_to_zero(self, tmp_path):
+        trainer_state_path(tmp_path).write_text(
+            json.dumps({"global_step": 8, "rollout_iteration": 9})
+        )
+        loaded = load_trainer_state(tmp_path)
+        assert loaded is not None
+        assert loaded.global_step == 8
+        assert loaded.rollout_iteration == 9
+        assert loaded.skipped_zero_gradient_updates == 0
+        assert loaded.consecutive_nonprogress_iterations == 0
+
+    def test_resume_preserves_nonprogress_counter(self, tmp_path):
+        save_trainer_state(
+            tmp_path,
+            GearTreeTrainerState(
+                global_step=12,
+                rollout_iteration=50,
+                consecutive_nonprogress_iterations=49,
+            ),
+        )
+        loaded = load_trainer_state(tmp_path)
+        assert loaded is not None
+        assert loaded.consecutive_nonprogress_iterations == 49
 
 
 class TestRestoredReplayAges:
@@ -170,3 +202,55 @@ class TestTrainerWiring:
         assert "_legacy_checkpoint_without_state" in source
         # Legacy path resets replay instead of restoring it.
         assert "buffer/legacy_checkpoint_reset" in source
+
+
+class TestLiveStateRoundTrip:
+    def test_live_state_round_trips_operational_counters(self, tmp_path):
+        state = GearTreeLiveState(
+            global_step=0,
+            rollout_iteration=50,
+            num_optimizer_steps_total=7,
+            successful_actor_updates=0,
+            postponed_updates=3,
+            failed_updates=2,
+            skipped_zero_gradient_updates=5,
+            consecutive_nonprogress_iterations=49,
+            last_iteration_status="postponed",
+            group_integrity_failures=1,
+            segment_count_failures=2,
+            replay_batch_failures=3,
+            parent_split_count=4,
+            tree_split_count=5,
+            optimizer_step_accounting_observations=6,
+            optimizer_step_accounting_failures=7,
+            optimizer_step_accounting_unverifiable=8,
+            segment_count_invariants_passed=True,
+            stored_old_log_probs_used=True,
+            rollout_scorer_weights_verified=True,
+            no_truncation=True,
+            replay_age_uses_rollout_iteration=True,
+            unique_tree_ids_verified=True,
+        )
+        save_live_state(tmp_path, state)
+        loaded = load_live_state(tmp_path)
+        assert loaded == state
+        assert loaded.group_integrity_failures == 1
+        assert loaded.optimizer_step_accounting_unverifiable == 8
+        assert loaded.unique_tree_ids_verified is True
+        assert live_state_path(tmp_path).name == "gear_tree_live_state.json"
+
+    def test_missing_live_state_returns_none(self, tmp_path):
+        assert load_live_state(tmp_path) is None
+
+    def test_global_step_zero_state_round_trips(self, tmp_path):
+        state = GearTreeTrainerState(
+            global_step=0,
+            rollout_iteration=50,
+            consecutive_nonprogress_iterations=49,
+        )
+        save_trainer_state(tmp_path / "global_step_0", state)
+        loaded = load_trainer_state(tmp_path / "global_step_0")
+        assert loaded is not None
+        assert loaded.global_step == 0
+        assert loaded.rollout_iteration == 50
+        assert loaded.consecutive_nonprogress_iterations == 49
