@@ -140,6 +140,7 @@ class RunManifest:
     optimizer_step_accounting_valid: bool = False
     optimizer_step_accounting_observations: int = 0
     optimizer_step_accounting_failures: int = 0
+    optimizer_step_accounting_unverifiable: int = 0
     # PLAN.md §5: what the LAST iteration actually did. A single boolean
     # cannot distinguish a zero-signal skip from a postponed or empty
     # iteration, so the status string is authoritative and

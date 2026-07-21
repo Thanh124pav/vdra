@@ -216,10 +216,27 @@ class TestLiveStateRoundTrip:
             skipped_zero_gradient_updates=5,
             consecutive_nonprogress_iterations=49,
             last_iteration_status="postponed",
+            group_integrity_failures=1,
+            segment_count_failures=2,
+            replay_batch_failures=3,
+            parent_split_count=4,
+            tree_split_count=5,
+            optimizer_step_accounting_observations=6,
+            optimizer_step_accounting_failures=7,
+            optimizer_step_accounting_unverifiable=8,
+            segment_count_invariants_passed=True,
+            stored_old_log_probs_used=True,
+            rollout_scorer_weights_verified=True,
+            no_truncation=True,
+            replay_age_uses_rollout_iteration=True,
+            unique_tree_ids_verified=True,
         )
         save_live_state(tmp_path, state)
         loaded = load_live_state(tmp_path)
         assert loaded == state
+        assert loaded.group_integrity_failures == 1
+        assert loaded.optimizer_step_accounting_unverifiable == 8
+        assert loaded.unique_tree_ids_verified is True
         assert live_state_path(tmp_path).name == "gear_tree_live_state.json"
 
     def test_missing_live_state_returns_none(self, tmp_path):

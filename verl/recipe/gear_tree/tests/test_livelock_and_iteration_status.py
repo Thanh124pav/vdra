@@ -39,6 +39,12 @@ from recipe.gear_tree.config_validation import (  # noqa: E402
 )
 from recipe.gear_tree.gear_ray_trainer import RayGearTreeTrainer  # noqa: E402
 from recipe.gear_tree.replay_buffer import GearTreeReplayBuffer  # noqa: E402
+from recipe.gear_tree.trainer_state import (  # noqa: E402
+    GearTreeLiveState,
+    GearTreeTrainerState,
+    save_live_state,
+    save_trainer_state,
+)
 from recipe.gear_tree.run_manifest import (  # noqa: E402
     ITERATION_STATUS_ACTOR_FAILED,
     ITERATION_STATUS_ALL_ZERO_SKIPPED,
@@ -127,6 +133,53 @@ def _trainer(tmp_path, *, max_skips=50, max_iters=None, use_new_limit=False):
     return obj
 
 
+
+def _write_checkpoint_bundle(
+    trainer,
+    ckpt,
+    *,
+    manifest=None,
+    write_state=True,
+    write_manifest=True,
+    write_replay=True,
+    write_marker=True,
+):
+    ckpt.mkdir(parents=True, exist_ok=True)
+    if write_state:
+        save_trainer_state(
+            ckpt,
+            GearTreeTrainerState(
+                global_step=int(getattr(trainer, "global_steps", 0)),
+                rollout_iteration=int(getattr(trainer, "rollout_iteration", 0)),
+                num_optimizer_steps_total=int(
+                    getattr(trainer, "num_optimizer_steps_total", 0)
+                ),
+                successful_actor_updates=int(
+                    getattr(trainer, "successful_actor_updates", 0)
+                ),
+                postponed_updates=int(getattr(trainer, "postponed_updates", 0)),
+                failed_updates=int(getattr(trainer, "failed_updates", 0)),
+                skipped_zero_gradient_updates=int(
+                    getattr(trainer, "skipped_zero_gradient_updates", 0)
+                ),
+                consecutive_nonprogress_iterations=int(
+                    getattr(trainer, "consecutive_nonprogress_iterations", 0)
+                ),
+            ),
+        )
+    if manifest is None:
+        manifest = trainer._build_run_manifest()
+    if write_manifest:
+        manifest.save(ckpt / "vdra_run_manifest.json")
+    if write_replay:
+        if not hasattr(trainer, "replay_buffer") or trainer.replay_buffer is None:
+            trainer.replay_buffer = trainer._new_replay_buffer()
+        trainer._write_replay_buffer_checkpoint(ckpt)
+    if write_marker:
+        trainer._write_checkpoint_complete_marker(ckpt)
+    return manifest
+
+
 class TestIterationStatus:
     """Required test 10 + 12."""
 
@@ -209,7 +262,7 @@ class TestManifestResumeLifecycle:
         manifest.segment_count_invariants_passed = False
         manifest.optimizer_step_accounting_valid = False
         manifest.unique_tree_ids_verified = True
-        manifest.save(ckpt / "vdra_run_manifest.json")
+        _write_checkpoint_bundle(trainer, ckpt, manifest=manifest)
 
         loaded = trainer._load_or_build_run_manifest()
         assert loaded.group_integrity_failures == 5
@@ -234,7 +287,7 @@ class TestManifestResumeLifecycle:
         manifest.global_step = 3
         manifest.num_optimizer_steps_total = 0
         manifest.probability_mask_threshold = 0.75
-        manifest.save(ckpt / "vdra_run_manifest.json")
+        _write_checkpoint_bundle(trainer, ckpt, manifest=manifest)
 
         with pytest.raises(ValueError, match="probability_mask_threshold"):
             trainer._load_or_build_run_manifest()
@@ -261,7 +314,7 @@ class TestManifestResumeLifecycle:
         checkpoint_manifest.rollout_iteration = 4
         checkpoint_manifest.num_optimizer_steps_total = 8
         checkpoint_manifest.group_integrity_failures = 1
-        checkpoint_manifest.save(ckpt / "vdra_run_manifest.json")
+        _write_checkpoint_bundle(trainer, ckpt, manifest=checkpoint_manifest)
 
         root_manifest = trainer._build_run_manifest()
         root_manifest.global_step = 999
@@ -288,7 +341,7 @@ class TestManifestResumeLifecycle:
         manifest.global_step = 3
         manifest.rollout_iteration = 3
         manifest.num_optimizer_steps_total = 8
-        manifest.save(ckpt / "vdra_run_manifest.json")
+        _write_checkpoint_bundle(trainer, ckpt, manifest=manifest)
         with pytest.raises(ValueError, match="counter mismatch"):
             trainer._load_or_build_run_manifest()
 
@@ -309,6 +362,63 @@ class TestManifestResumeLifecycle:
         manifest = trainer._load_or_build_run_manifest()
         assert manifest.manifest_resume_provenance_missing is True
         assert validate_main_run(manifest) is not None
+
+    def test_complete_checkpoint_bundle_is_accepted(self, tmp_path):
+        trainer = _trainer(tmp_path)
+        trainer.replay_buffer = trainer._new_replay_buffer()
+        ckpt = tmp_path / "global_step_0"
+        _write_checkpoint_bundle(trainer, ckpt)
+        trainer._validate_vdra_checkpoint_bundle_for_resume(ckpt)
+
+    def test_checkpoint_bundle_missing_replay_is_rejected(self, tmp_path):
+        trainer = _trainer(tmp_path)
+        trainer.replay_buffer = trainer._new_replay_buffer()
+        ckpt = tmp_path / "global_step_0"
+        _write_checkpoint_bundle(trainer, ckpt, write_replay=False)
+        with pytest.raises(FileNotFoundError, match="gear_tree_replay_buffer"):
+            trainer._validate_vdra_checkpoint_bundle_for_resume(ckpt)
+
+    def test_checkpoint_bundle_missing_manifest_is_rejected(self, tmp_path):
+        trainer = _trainer(tmp_path)
+        trainer.replay_buffer = trainer._new_replay_buffer()
+        ckpt = tmp_path / "global_step_0"
+        _write_checkpoint_bundle(trainer, ckpt, write_manifest=False)
+        with pytest.raises(FileNotFoundError, match="vdra_run_manifest"):
+            trainer._validate_vdra_checkpoint_bundle_for_resume(ckpt)
+
+    def test_checkpoint_bundle_missing_marker_is_rejected(self, tmp_path):
+        trainer = _trainer(tmp_path)
+        trainer.replay_buffer = trainer._new_replay_buffer()
+        ckpt = tmp_path / "global_step_0"
+        _write_checkpoint_bundle(trainer, ckpt, write_marker=False)
+        with pytest.raises(FileNotFoundError, match="VDRA_CHECKPOINT_COMPLETE"):
+            trainer._validate_vdra_checkpoint_bundle_for_resume(ckpt)
+
+    def test_checkpoint_completion_marker_is_written_last(self, tmp_path, monkeypatch):
+        from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
+        trainer = _trainer(tmp_path)
+        trainer.replay_buffer = trainer._new_replay_buffer()
+        trainer.run_manifest = trainer._build_run_manifest()
+        events = []
+        monkeypatch.setattr(
+            RayPPOTrainer, "_save_checkpoint", lambda self: events.append("base")
+        )
+        monkeypatch.setattr(
+            trainer, "_save_manifest", lambda *_args, **_kwargs: events.append("manifest")
+        )
+        monkeypatch.setattr(
+            trainer,
+            "_write_replay_buffer_checkpoint",
+            lambda _ckpt: events.append("replay"),
+        )
+        monkeypatch.setattr(
+            trainer,
+            "_write_checkpoint_complete_marker",
+            lambda _ckpt: events.append("marker"),
+        )
+        trainer._save_vdra_checkpoint_bundle()
+        assert events == ["base", "manifest", "replay", "marker"]
 
 
 class TestLivelockGuards:
@@ -741,51 +851,46 @@ class TestCanonicalRejectsAuxiliaryLosses:
 
 
 class TestLiveStateResume:
-    def _prep_resume(self, tmp_path, monkeypatch, *, live_global_step=0, live_rollout=50):
-        from recipe.gear_tree.trainer_state import (
-            GearTreeLiveState,
-            GearTreeTrainerState,
-            save_live_state,
-            save_trainer_state,
-        )
+    def _prep_resume(
+        self,
+        tmp_path,
+        monkeypatch,
+        *,
+        checkpoint_global_step=0,
+        live_global_step=0,
+        live_rollout=50,
+        live_fields=None,
+    ):
         from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
         trainer = _trainer(tmp_path)
         trainer.config.trainer.resume_mode = "resume_path"
-        trainer.config.trainer.resume_from_path = str(tmp_path / "global_step_0")
-        trainer.config.trainer.default_hdfs_dir = None
-        trainer.global_steps = 0
-        trainer.replay_buffer = trainer._new_replay_buffer()
-        ckpt = tmp_path / "global_step_0"
-        ckpt.mkdir()
-        save_trainer_state(
-            ckpt,
-            GearTreeTrainerState(
-                global_step=0,
-                rollout_iteration=0,
-                num_optimizer_steps_total=0,
-                consecutive_nonprogress_iterations=0,
-            ),
+        trainer.config.trainer.resume_from_path = str(
+            tmp_path / f"global_step_{checkpoint_global_step}"
         )
+        trainer.config.trainer.default_hdfs_dir = None
+        trainer.global_steps = checkpoint_global_step
+        trainer.replay_buffer = trainer._new_replay_buffer()
+        ckpt = tmp_path / f"global_step_{checkpoint_global_step}"
         manifest = trainer._build_run_manifest()
-        manifest.global_step = 0
+        manifest.global_step = checkpoint_global_step
         manifest.rollout_iteration = 0
         manifest.num_optimizer_steps_total = 0
-        manifest.save(ckpt / "vdra_run_manifest.json")
-        save_live_state(
-            tmp_path,
-            GearTreeLiveState(
-                global_step=live_global_step,
-                rollout_iteration=live_rollout,
-                num_optimizer_steps_total=0,
-                successful_actor_updates=0,
-                postponed_updates=7,
-                failed_updates=0,
-                skipped_zero_gradient_updates=0,
-                consecutive_nonprogress_iterations=49,
-                last_iteration_status=ITERATION_STATUS_POSTPONED,
-            ),
+        _write_checkpoint_bundle(trainer, ckpt, manifest=manifest)
+        payload = dict(
+            global_step=live_global_step,
+            rollout_iteration=live_rollout,
+            num_optimizer_steps_total=0,
+            successful_actor_updates=0,
+            postponed_updates=7,
+            failed_updates=0,
+            skipped_zero_gradient_updates=0,
+            consecutive_nonprogress_iterations=49,
+            last_iteration_status=ITERATION_STATUS_POSTPONED,
         )
+        if live_fields:
+            payload.update(live_fields)
+        save_live_state(tmp_path, GearTreeLiveState(**payload))
         monkeypatch.setattr(RayPPOTrainer, "_load_checkpoint", lambda self: 0)
         return trainer
 
@@ -799,19 +904,63 @@ class TestLiveStateResume:
         assert trainer.consecutive_nonprogress_iterations == 49
         assert trainer.postponed_updates == 7
         assert trainer.run_manifest.last_iteration_status == ITERATION_STATUS_POSTPONED
+        assert trainer._live_state_resume_metrics["vdra/live_state_merged"] == 1.0
 
-    def test_live_state_with_different_global_step_is_rejected(self, tmp_path, monkeypatch):
+    def test_live_state_ahead_of_checkpoint_is_ignored(self, tmp_path, monkeypatch):
         trainer = self._prep_resume(tmp_path, monkeypatch, live_global_step=1)
-        with pytest.raises(ValueError, match="gear_tree_live_state.json global_step"):
-            trainer._load_checkpoint()
-
-    def test_stale_live_state_rollout_is_ignored(self, tmp_path, monkeypatch):
-        trainer = self._prep_resume(tmp_path, monkeypatch, live_rollout=-1)
         trainer._load_checkpoint()
         trainer.run_manifest = trainer._load_or_build_run_manifest()
         trainer._merge_pending_live_state()
         assert trainer.rollout_iteration == 0
         assert trainer.consecutive_nonprogress_iterations == 0
+        assert trainer.postponed_updates == 0
+        assert (
+            trainer._live_state_resume_metrics[
+                "vdra/live_state_ahead_of_checkpoint"
+            ]
+            == 1.0
+        )
+
+    def test_stale_live_state_global_step_is_ignored(self, tmp_path, monkeypatch):
+        trainer = self._prep_resume(
+            tmp_path,
+            monkeypatch,
+            checkpoint_global_step=1,
+            live_global_step=0,
+            live_rollout=50,
+        )
+        trainer._load_checkpoint()
+        trainer.run_manifest = trainer._load_or_build_run_manifest()
+        trainer._merge_pending_live_state()
+        assert trainer.rollout_iteration == 0
+        assert trainer.consecutive_nonprogress_iterations == 0
+        assert trainer.postponed_updates == 0
+        assert trainer._live_state_resume_metrics["vdra/live_state_stale"] == 1.0
+
+    def test_live_state_merges_post_checkpoint_failure_provenance(self, tmp_path, monkeypatch):
+        trainer = self._prep_resume(
+            tmp_path,
+            monkeypatch,
+            live_fields={"group_integrity_failures": 1},
+        )
+        trainer._load_checkpoint()
+        trainer.run_manifest = trainer._load_or_build_run_manifest()
+        assert trainer.run_manifest.group_integrity_failures == 0
+        trainer._merge_pending_live_state()
+        assert trainer.run_manifest.group_integrity_failures == 1
+        assert validate_main_run(trainer.run_manifest) is not None
+
+    def test_live_state_preserves_optimizer_unverifiable_after_resume(self, tmp_path, monkeypatch):
+        trainer = self._prep_resume(
+            tmp_path,
+            monkeypatch,
+            live_fields={"optimizer_step_accounting_unverifiable": 1},
+        )
+        trainer._load_checkpoint()
+        trainer.run_manifest = trainer._load_or_build_run_manifest()
+        trainer._merge_pending_live_state()
+        assert trainer.run_manifest.optimizer_step_accounting_unverifiable == 1
+        assert trainer.run_manifest.optimizer_step_accounting_valid is False
 
 
 class TestNonprogressHelper:

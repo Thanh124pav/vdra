@@ -52,6 +52,20 @@ class GearTreeLiveState:
     skipped_zero_gradient_updates: int = 0
     consecutive_nonprogress_iterations: int = 0
     last_iteration_status: str = "not_started"
+    group_integrity_failures: int = 0
+    segment_count_failures: int = 0
+    replay_batch_failures: int = 0
+    parent_split_count: int = 0
+    tree_split_count: int = 0
+    optimizer_step_accounting_observations: int = 0
+    optimizer_step_accounting_failures: int = 0
+    optimizer_step_accounting_unverifiable: int = 0
+    segment_count_invariants_passed: bool = False
+    stored_old_log_probs_used: bool = False
+    rollout_scorer_weights_verified: bool = False
+    no_truncation: bool = False
+    replay_age_uses_rollout_iteration: bool = False
+    unique_tree_ids_verified: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -161,12 +175,31 @@ def load_live_state(
         return None
     data = json.loads(path.read_text(encoding="utf-8"))
     known = {f for f in GearTreeLiveState.__dataclass_fields__}
+    provenance_bool_fields = (
+        "segment_count_invariants_passed",
+        "stored_old_log_probs_used",
+        "rollout_scorer_weights_verified",
+        "no_truncation",
+        "replay_age_uses_rollout_iteration",
+        "unique_tree_ids_verified",
+    )
+    provenance_booleans_present = all(
+        field in data for field in provenance_bool_fields
+    )
     cleaned = {}
     for key, value in data.items():
         if key not in known:
             continue
         if key == "last_iteration_status":
             cleaned[key] = str(value)
+        elif key in provenance_bool_fields:
+            cleaned[key] = bool(value)
         else:
             cleaned[key] = int(value)
-    return GearTreeLiveState(**cleaned)
+    state = GearTreeLiveState(**cleaned)
+    setattr(
+        state,
+        "_provenance_booleans_present",
+        provenance_booleans_present,
+    )
+    return state

@@ -76,6 +76,8 @@ from recipe.gear_tree.trainer_state import (
 
 
 class RayGearTreeTrainer(RayPPOTrainer):
+    VDRA_CHECKPOINT_COMPLETE = "VDRA_CHECKPOINT_COMPLETE"
+
     def _gear_tree_config(self) -> dict:
         """Resolve the top-level ``gear_tree`` block to a plain dict + demos_dir."""
         from omegaconf import OmegaConf
@@ -217,8 +219,35 @@ class RayGearTreeTrainer(RayPPOTrainer):
 
     # --- PLAN.md P0.E: counter state must survive checkpoint/resume ------- #
 
-    def _save_checkpoint(self):
-        """Base checkpoint plus VDRA checkpoint-scoped state files."""
+    def _checkpoint_complete_marker_path(self, checkpoint_dir: str | Path) -> Path:
+        return Path(checkpoint_dir) / self.VDRA_CHECKPOINT_COMPLETE
+
+    def _write_checkpoint_complete_marker(self, checkpoint_dir: str | Path) -> None:
+        marker = self._checkpoint_complete_marker_path(checkpoint_dir)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        tmp = marker.with_suffix(".tmp")
+        tmp.write_text("complete\n", encoding="utf-8")
+        tmp.replace(marker)
+
+    def _write_replay_buffer_checkpoint(self, checkpoint_dir: str | Path) -> None:
+        if not hasattr(self, "replay_buffer") or self.replay_buffer is None:
+            raise FileNotFoundError("VDRA checkpoint bundle requires replay buffer")
+        self.replay_buffer.save(checkpoint_dir)
+        meta_path = Path(checkpoint_dir) / "gear_tree_replay_buffer_meta.json"
+        if meta_path.exists():
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+            data["segment_length"] = int(
+                self._gear_tree_config().get("segment_length", 0) or 0
+            )
+            tmp = meta_path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(data, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            tmp.replace(meta_path)
+
+    def _save_vdra_checkpoint_bundle(self) -> None:
+        """Save model state plus all VDRA files, then mark complete last."""
         super()._save_checkpoint()
         ckpt_dir = self._checkpoint_dir_for_step(self.global_steps)
         save_trainer_state(
@@ -242,8 +271,40 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 ),
             ),
         )
-        if getattr(self, "run_manifest", None) is not None:
-            self._save_manifest(self.run_manifest, path=self._checkpoint_manifest_path(ckpt_dir))
+        if getattr(self, "run_manifest", None) is None:
+            raise FileNotFoundError("VDRA checkpoint bundle requires run manifest")
+        self._save_manifest(
+            self.run_manifest, path=self._checkpoint_manifest_path(ckpt_dir)
+        )
+        self._write_replay_buffer_checkpoint(ckpt_dir)
+        self._write_checkpoint_complete_marker(ckpt_dir)
+
+    def _save_checkpoint(self):
+        """Compatibility wrapper: save a complete VDRA checkpoint bundle."""
+        self._save_vdra_checkpoint_bundle()
+
+    def _validate_vdra_checkpoint_bundle_for_resume(self, checkpoint_dir: str | Path) -> None:
+        ckpt_dir = Path(checkpoint_dir)
+        marker = self._checkpoint_complete_marker_path(ckpt_dir)
+        if not marker.exists():
+            if self._is_canonical_aggregation():
+                raise FileNotFoundError(
+                    f"canonical VDRA resume requires {marker}; checkpoint "
+                    "bundle is incomplete"
+                )
+            return
+        required = (
+            trainer_state_path(ckpt_dir),
+            Path(self._checkpoint_manifest_path(ckpt_dir)),
+            ckpt_dir / "gear_tree_replay_buffer.jsonl",
+            ckpt_dir / "gear_tree_replay_buffer_meta.json",
+        )
+        missing = [str(path) for path in required if not path.exists()]
+        if missing:
+            raise FileNotFoundError(
+                "VDRA checkpoint bundle marker exists but required files are "
+                f"missing: {missing}"
+            )
 
     def _load_checkpoint(self):
         """Restore base checkpoint plus VDRA counter state.
@@ -254,7 +315,12 @@ class RayGearTreeTrainer(RayPPOTrainer):
         """
         self._restored_checkpoint_dir = self._resolve_resume_checkpoint_dir()
         self._pending_live_state = None
+        self._live_state_resume_metrics: Dict[str, float] = {}
         self._legacy_checkpoint_without_state = False
+        if self._is_resuming_from_checkpoint():
+            self._validate_vdra_checkpoint_bundle_for_resume(
+                self._restored_checkpoint_dir
+            )
         ret = super()._load_checkpoint()
         if not self._is_resuming_from_checkpoint():
             return ret
@@ -290,14 +356,15 @@ class RayGearTreeTrainer(RayPPOTrainer):
 
         live = load_live_state(self.config.trainer.default_local_dir)
         if live is not None:
-            if int(live.global_step) != int(state.global_step):
-                raise ValueError(
-                    "gear_tree_live_state.json global_step="
-                    f"{live.global_step} does not match restored checkpoint "
-                    f"global_step={state.global_step}"
-                )
-            if int(live.rollout_iteration) >= int(state.rollout_iteration):
+            if int(live.global_step) == int(state.global_step):
                 self._pending_live_state = live
+                self._live_state_resume_metrics["vdra/live_state_merged"] = 1.0
+            elif int(live.global_step) > int(state.global_step):
+                self._live_state_resume_metrics[
+                    "vdra/live_state_ahead_of_checkpoint"
+                ] = 1.0
+            else:
+                self._live_state_resume_metrics["vdra/live_state_stale"] = 1.0
         return ret
 
     def _restore_or_init_replay_buffer(self) -> Dict[str, Any]:
@@ -327,6 +394,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
             self.replay_buffer = self._new_replay_buffer()
             metrics["buffer/reset_on_resume"] = 1.0
             metrics["buffer/legacy_checkpoint_reset"] = 1.0
+            metrics.update(getattr(self, "_live_state_resume_metrics", {}))
             self.replay_buffer_resume_metrics = metrics
             return metrics
 
@@ -354,6 +422,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
         else:
             self.replay_buffer = self._new_replay_buffer()
             metrics["buffer/reset_on_resume"] = 1.0
+        metrics.update(getattr(self, "_live_state_resume_metrics", {}))
         self.replay_buffer_resume_metrics = metrics
         return metrics
 
@@ -711,7 +780,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
         if not replay_cfg.get("checkpoint", True) or not hasattr(self, "replay_buffer"):
             return {"buffer/checkpoint_saved": 0.0}
         ckpt_dir = self._checkpoint_dir_for_step(self.global_steps)
-        self.replay_buffer.save(ckpt_dir)
+        self._write_replay_buffer_checkpoint(ckpt_dir)
         return {"buffer/checkpoint_saved": 1.0}
 
     # --- PLAN.md P0.N8: run-manifest lifecycle --------------------------- #
@@ -762,9 +831,21 @@ class RayGearTreeTrainer(RayPPOTrainer):
             )
         return manifest
 
-    def _validate_resumed_manifest_config(self, manifest: RunManifest) -> None:
-        """Fail fast if a checkpoint manifest belongs to another resolved config."""
+    def _current_manifest_config_for_validation(self) -> RunManifest:
         current = self._build_run_manifest()
+        # Resolve the cap from the current config, never from the restored
+        # replay buffer metadata.
+        fresh_buffer = self._new_replay_buffer()
+        current.resolved_max_edges_per_question_per_iteration = int(
+            fresh_buffer.resolved_max_edges_per_question_per_iteration
+        )
+        return current
+
+    def _validate_resumed_manifest_config(
+        self, manifest: RunManifest, *, checkpoint_dir: str | Path | None = None
+    ) -> None:
+        """Fail fast if a checkpoint manifest belongs to another resolved config."""
+        current = self._current_manifest_config_for_validation()
         fields = (
             "policy_aggregation",
             "segment_token_reduction",
@@ -800,6 +881,51 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     f"resolves to {new!r}. Refusing to reset historical "
                     "manifest counters/invariants (PLAN.md §1)."
                 )
+        if checkpoint_dir is not None:
+            self._validate_replay_metadata_matches_current_config(
+                checkpoint_dir, current
+            )
+
+    def _validate_replay_metadata_matches_current_config(
+        self, checkpoint_dir: str | Path, current: RunManifest
+    ) -> None:
+        meta_path = Path(checkpoint_dir) / "gear_tree_replay_buffer_meta.json"
+        if not meta_path.exists():
+            if self._is_canonical_aggregation():
+                raise FileNotFoundError(
+                    f"canonical VDRA resume requires replay metadata {meta_path}"
+                )
+            return
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        checks = {
+            "tree_shape": list(current.tree_shape),
+            "trees_per_question": int(current.trees_per_question),
+            "resolved_max_edges_per_question_per_iteration": int(
+                current.resolved_max_edges_per_question_per_iteration
+            ),
+            "target_edges_per_iteration": int(current.target_edges_per_iteration),
+            "max_edge_age_iterations": int(current.max_edge_age_iterations),
+            "replay_sampling_unit": str(current.replay_sampling_unit),
+            "segment_length": int(current.segment_length),
+        }
+        for field, expected in checks.items():
+            if field not in meta:
+                raise ValueError(
+                    f"replay metadata is missing {field}; refusing resume"
+                )
+            old = meta[field]
+            if isinstance(expected, list):
+                old_norm = [int(x) for x in old]
+            elif isinstance(expected, int):
+                old_norm = int(old)
+            else:
+                old_norm = str(old)
+            if old_norm != expected:
+                raise ValueError(
+                    "replay metadata config mismatch for "
+                    f"{field}: checkpoint has {old!r}, current config "
+                    f"resolves to {expected!r}"
+                )
 
     def _checkpoint_manifest_path(self, checkpoint_dir: str | Path) -> str:
         return os.path.join(str(checkpoint_dir), "vdra_run_manifest.json")
@@ -829,7 +955,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
             path = self._checkpoint_manifest_path(ckpt_dir)
             if os.path.exists(path):
                 manifest = RunManifest.load(path)
-                self._validate_resumed_manifest_config(manifest)
+                self._validate_resumed_manifest_config(
+                    manifest, checkpoint_dir=ckpt_dir
+                )
                 self._assert_resumed_manifest_counters(manifest)
                 return manifest
             if self._is_canonical_aggregation():
@@ -868,6 +996,48 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     ITERATION_STATUS_NOT_STARTED,
                 )
             ),
+            group_integrity_failures=int(
+                getattr(getattr(self, "run_manifest", None), "group_integrity_failures", 0)
+            ),
+            segment_count_failures=int(
+                getattr(getattr(self, "run_manifest", None), "segment_count_failures", 0)
+            ),
+            replay_batch_failures=int(
+                getattr(getattr(self, "run_manifest", None), "replay_batch_failures", 0)
+            ),
+            parent_split_count=int(
+                getattr(getattr(self, "run_manifest", None), "parent_split_count", 0)
+            ),
+            tree_split_count=int(
+                getattr(getattr(self, "run_manifest", None), "tree_split_count", 0)
+            ),
+            optimizer_step_accounting_observations=int(
+                getattr(getattr(self, "run_manifest", None), "optimizer_step_accounting_observations", 0)
+            ),
+            optimizer_step_accounting_failures=int(
+                getattr(getattr(self, "run_manifest", None), "optimizer_step_accounting_failures", 0)
+            ),
+            optimizer_step_accounting_unverifiable=int(
+                getattr(getattr(self, "run_manifest", None), "optimizer_step_accounting_unverifiable", 0)
+            ),
+            segment_count_invariants_passed=bool(
+                getattr(getattr(self, "run_manifest", None), "segment_count_invariants_passed", False)
+            ),
+            stored_old_log_probs_used=bool(
+                getattr(getattr(self, "run_manifest", None), "stored_old_log_probs_used", False)
+            ),
+            rollout_scorer_weights_verified=bool(
+                getattr(getattr(self, "run_manifest", None), "rollout_scorer_weights_verified", False)
+            ),
+            no_truncation=bool(
+                getattr(getattr(self, "run_manifest", None), "no_truncation", False)
+            ),
+            replay_age_uses_rollout_iteration=bool(
+                getattr(getattr(self, "run_manifest", None), "replay_age_uses_rollout_iteration", False)
+            ),
+            unique_tree_ids_verified=bool(
+                getattr(getattr(self, "run_manifest", None), "unique_tree_ids_verified", False)
+            ),
         )
 
     def _save_live_state_best_effort(self, metrics: Dict[str, Any]) -> None:
@@ -878,6 +1048,37 @@ class RayGearTreeTrainer(RayPPOTrainer):
         except Exception as exc:
             metrics["vdra/live_state_save_failed"] = 1.0
             _LOGGER.warning("Failed to persist the VDRA live state: %s", exc)
+
+    def _merge_live_manifest_provenance(self, live: GearTreeLiveState) -> None:
+        m = self.run_manifest
+        for field in (
+            "group_integrity_failures",
+            "segment_count_failures",
+            "replay_batch_failures",
+            "parent_split_count",
+            "tree_split_count",
+            "optimizer_step_accounting_observations",
+            "optimizer_step_accounting_failures",
+            "optimizer_step_accounting_unverifiable",
+        ):
+            setattr(m, field, max(int(getattr(m, field)), int(getattr(live, field))))
+        if bool(getattr(live, "_provenance_booleans_present", True)):
+            for field in (
+                "segment_count_invariants_passed",
+                "stored_old_log_probs_used",
+                "rollout_scorer_weights_verified",
+                "no_truncation",
+                "replay_age_uses_rollout_iteration",
+                "unique_tree_ids_verified",
+            ):
+                setattr(
+                    m, field, bool(getattr(m, field)) and bool(getattr(live, field))
+                )
+        m.optimizer_step_accounting_valid = (
+            int(m.optimizer_step_accounting_observations) > 0
+            and int(m.optimizer_step_accounting_failures) == 0
+            and int(m.optimizer_step_accounting_unverifiable) == 0
+        )
 
     def _merge_pending_live_state(self) -> None:
         live = getattr(self, "_pending_live_state", None)
@@ -894,6 +1095,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
         self._set_nonprogress_counter(live.consecutive_nonprogress_iterations)
         if str(live.last_iteration_status) in VALID_ITERATION_STATUSES:
             self._set_iteration_status(str(live.last_iteration_status))
+        self._merge_live_manifest_provenance(live)
         self._stamp_manifest_iteration_state()
         self._pending_live_state = None
 
@@ -959,6 +1161,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
             m.optimizer_step_accounting_valid = (
                 m.optimizer_step_accounting_observations > 0
                 and m.optimizer_step_accounting_failures == 0
+                and m.optimizer_step_accounting_unverifiable == 0
             )
         elif m.optimizer_step_accounting_observations == 0:
             m.optimizer_step_accounting_valid = False
@@ -1246,6 +1449,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
         # mismatch marks ``optimizer_step_accounting_valid`` invalid but never
         # crashes a run whose actor already updated the model.
         if not metrics_parse_ok:
+            self.run_manifest.optimizer_step_accounting_unverifiable += 1
             self.run_manifest.optimizer_step_accounting_valid = False
             return
         # PLAN.md §8: ONE authoritative expectation. On the canonical sparse
@@ -1336,13 +1540,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
         self._save_manifest_best_effort(metrics)
         self._save_live_state_best_effort(metrics)
         try:
-            self._save_checkpoint()
+            self._save_vdra_checkpoint_bundle()
         except Exception as exc:
             _LOGGER.warning("could not persist a checkpoint before abort: %s", exc)
-        try:
-            self._maybe_save_replay_buffer()
-        except Exception as exc:
-            _LOGGER.warning("could not persist the replay buffer before abort: %s", exc)
         replay_buffer = getattr(self, "replay_buffer", None)
         buffer_size = len(replay_buffer) if replay_buffer is not None else 0
         raise RuntimeError(
@@ -1877,9 +2077,14 @@ class RayGearTreeTrainer(RayPPOTrainer):
                         freq=save_freq,
                     )
                     if save_freq > 0 and (save_crossed > 0 or is_last_step):
-                        self._save_checkpoint()
-                        replay_metrics = self._maybe_save_replay_buffer()
-                        logger.log(data=replay_metrics, step=self.global_steps)
+                        self._save_vdra_checkpoint_bundle()
+                        logger.log(
+                            data={
+                                "buffer/checkpoint_saved": 1.0,
+                                "vdra/checkpoint_complete": 1.0,
+                            },
+                            step=self.global_steps,
+                        )
 
                     if is_last_step:
                         return
@@ -1895,7 +2100,6 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     self._save_manifest_best_effort(metrics)
                     self._save_live_state_best_effort(metrics)
                     raise
-        self._save_checkpoint()
-        self._maybe_save_replay_buffer()
+        self._save_vdra_checkpoint_bundle()
         final_metrics: Dict[str, Any] = {}
         self._save_live_state_best_effort(final_metrics)

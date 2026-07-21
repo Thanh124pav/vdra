@@ -279,6 +279,7 @@ class TestFinalizeSuccessfulActorUpdate:
         assert trainer.successful_actor_updates == 1
         assert trainer.num_optimizer_steps_total == 2
         assert trainer.run_manifest.optimizer_step_accounting_valid is True
+        assert trainer.run_manifest.optimizer_step_accounting_unverifiable == 0
         assert "vdra/actor_metrics_parse_failed" not in metrics
 
     def test_missing_metrics_key_still_commits_and_counts(self):
@@ -295,6 +296,7 @@ class TestFinalizeSuccessfulActorUpdate:
         assert trainer.num_optimizer_steps_total == 0
         # Accounting invalid + diagnostic logged; no rollback.
         assert trainer.run_manifest.optimizer_step_accounting_valid is False
+        assert trainer.run_manifest.optimizer_step_accounting_unverifiable == 1
         assert metrics["vdra/actor_metrics_parse_failed"] == 1.0
 
     def test_malformed_metrics_value_still_commits_and_counts(self):
@@ -308,6 +310,7 @@ class TestFinalizeSuccessfulActorUpdate:
         assert trainer.successful_actor_updates == 1
         assert trainer.num_optimizer_steps_total == 0
         assert trainer.run_manifest.optimizer_step_accounting_valid is False
+        assert trainer.run_manifest.optimizer_step_accounting_unverifiable == 1
         assert metrics["vdra/actor_metrics_parse_failed"] == 1.0
 
     def test_missing_meta_info_attr_still_commits(self):
@@ -318,7 +321,48 @@ class TestFinalizeSuccessfulActorUpdate:
         assert trainer.global_steps == 1
         assert trainer.successful_actor_updates == 1
         assert trainer.run_manifest.optimizer_step_accounting_valid is False
+        assert trainer.run_manifest.optimizer_step_accounting_unverifiable == 1
         assert metrics["vdra/actor_metrics_parse_failed"] == 1.0
+
+    def test_unverifiable_optimizer_accounting_never_heals(self):
+        trainer, buffer, reservation, sampled = _trainer_with_reservation()
+        self._finalize(
+            trainer,
+            buffer,
+            reservation,
+            sampled,
+            SimpleNamespace(meta_info={"something_else": 1}),
+        )
+        assert trainer.run_manifest.optimizer_step_accounting_observations == 0
+        assert trainer.run_manifest.optimizer_step_accounting_unverifiable == 1
+        assert trainer.run_manifest.optimizer_step_accounting_valid is False
+
+        buffer2 = GearTreeReplayBuffer(
+            target_edges_per_iteration=512,
+            max_edge_age_iterations=8,
+            max_edges_per_question_per_iteration=32,
+            sampling_seed=0,
+        )
+        buffer2.add(
+            [_edge("e2"), _edge("e3")],
+            generation_rollout_iteration=1,
+            policy_snapshot_id="global_step:1",
+        )
+        reservation2 = buffer2.reserve_for_update(current_rollout_iteration=1)
+        sampled2 = [dict(edge) for edge in reservation2.edges]
+        self._finalize(
+            trainer,
+            buffer2,
+            reservation2,
+            sampled2,
+            SimpleNamespace(
+                meta_info={"metrics": {"actor/num_optimizer_steps": [2]}}
+            ),
+        )
+        assert trainer.run_manifest.optimizer_step_accounting_observations == 1
+        assert trainer.run_manifest.optimizer_step_accounting_failures == 0
+        assert trainer.run_manifest.optimizer_step_accounting_unverifiable == 1
+        assert trainer.run_manifest.optimizer_step_accounting_valid is False
 
     def test_optimizer_accounting_failure_never_heals(self):
         trainer, buffer, reservation, sampled = _trainer_with_reservation()
