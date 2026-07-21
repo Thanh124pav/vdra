@@ -18,6 +18,7 @@ Required tests 1-12 of the remaining-fixes spec:
 from __future__ import annotations
 
 import inspect
+import json
 
 import pytest
 
@@ -49,6 +50,7 @@ from recipe.gear_tree.run_manifest import (  # noqa: E402
     ITERATION_STATUS_UPDATED,
     ITERATION_STATUS_ZERO_ACTIVE_SKIPPED,
     RunManifest,
+    validate_main_run,
 )
 
 try:
@@ -187,8 +189,16 @@ class TestManifestResumeLifecycle:
 
     def test_resume_loads_existing_manifest_and_preserves_history(self, tmp_path):
         trainer = _trainer(tmp_path)
+        trainer.replay_buffer = trainer._new_replay_buffer()
         trainer.global_steps = 3
+        trainer.rollout_iteration = 4
+        trainer.num_optimizer_steps_total = 99
+        ckpt = tmp_path / "global_step_3"
+        ckpt.mkdir()
+        trainer._restored_checkpoint_dir = str(ckpt)
         manifest = trainer._build_run_manifest()
+        manifest.global_step = 3
+        manifest.rollout_iteration = 4
         manifest.group_integrity_failures = 5
         manifest.segment_count_failures = 2
         manifest.replay_batch_failures = 1
@@ -199,7 +209,7 @@ class TestManifestResumeLifecycle:
         manifest.segment_count_invariants_passed = False
         manifest.optimizer_step_accounting_valid = False
         manifest.unique_tree_ids_verified = True
-        manifest.save(trainer._manifest_path())
+        manifest.save(ckpt / "vdra_run_manifest.json")
 
         loaded = trainer._load_or_build_run_manifest()
         assert loaded.group_integrity_failures == 5
@@ -215,10 +225,16 @@ class TestManifestResumeLifecycle:
 
     def test_resume_manifest_config_mismatch_fails_fast(self, tmp_path):
         trainer = _trainer(tmp_path)
+        trainer.replay_buffer = trainer._new_replay_buffer()
         trainer.global_steps = 3
+        ckpt = tmp_path / "global_step_3"
+        ckpt.mkdir()
+        trainer._restored_checkpoint_dir = str(ckpt)
         manifest = trainer._build_run_manifest()
+        manifest.global_step = 3
+        manifest.num_optimizer_steps_total = 0
         manifest.probability_mask_threshold = 0.75
-        manifest.save(trainer._manifest_path())
+        manifest.save(ckpt / "vdra_run_manifest.json")
 
         with pytest.raises(ValueError, match="probability_mask_threshold"):
             trainer._load_or_build_run_manifest()
@@ -229,6 +245,70 @@ class TestManifestResumeLifecycle:
         manifest = trainer._load_or_build_run_manifest()
         assert isinstance(manifest, RunManifest)
         assert manifest.group_integrity_failures == 0
+
+    def test_resume_loads_checkpoint_manifest_not_newer_root(self, tmp_path):
+        trainer = _trainer(tmp_path)
+        trainer.replay_buffer = trainer._new_replay_buffer()
+        trainer.global_steps = 3
+        trainer.rollout_iteration = 4
+        trainer.num_optimizer_steps_total = 8
+        ckpt = tmp_path / "global_step_3"
+        ckpt.mkdir()
+        trainer._restored_checkpoint_dir = str(ckpt)
+
+        checkpoint_manifest = trainer._build_run_manifest()
+        checkpoint_manifest.global_step = 3
+        checkpoint_manifest.rollout_iteration = 4
+        checkpoint_manifest.num_optimizer_steps_total = 8
+        checkpoint_manifest.group_integrity_failures = 1
+        checkpoint_manifest.save(ckpt / "vdra_run_manifest.json")
+
+        root_manifest = trainer._build_run_manifest()
+        root_manifest.global_step = 999
+        root_manifest.rollout_iteration = 999
+        root_manifest.num_optimizer_steps_total = 999
+        root_manifest.group_integrity_failures = 77
+        root_manifest.save(trainer._manifest_path())
+
+        loaded = trainer._load_or_build_run_manifest()
+        assert loaded.global_step == 3
+        assert loaded.rollout_iteration == 4
+        assert loaded.group_integrity_failures == 1
+
+    def test_resume_manifest_counter_mismatch_fails_fast(self, tmp_path):
+        trainer = _trainer(tmp_path)
+        trainer.replay_buffer = trainer._new_replay_buffer()
+        trainer.global_steps = 3
+        trainer.rollout_iteration = 4
+        trainer.num_optimizer_steps_total = 8
+        ckpt = tmp_path / "global_step_3"
+        ckpt.mkdir()
+        trainer._restored_checkpoint_dir = str(ckpt)
+        manifest = trainer._build_run_manifest()
+        manifest.global_step = 3
+        manifest.rollout_iteration = 3
+        manifest.num_optimizer_steps_total = 8
+        manifest.save(ckpt / "vdra_run_manifest.json")
+        with pytest.raises(ValueError, match="counter mismatch"):
+            trainer._load_or_build_run_manifest()
+
+    def test_canonical_resume_without_checkpoint_manifest_fails(self, tmp_path):
+        trainer = _trainer(tmp_path)
+        trainer.replay_buffer = trainer._new_replay_buffer()
+        trainer._restored_checkpoint_dir = str(tmp_path / "global_step_0")
+        with pytest.raises(FileNotFoundError, match="checkpoint-scoped"):
+            trainer._load_or_build_run_manifest()
+
+    def test_noncanonical_missing_manifest_marks_provenance_missing(self, tmp_path):
+        trainer = _trainer(tmp_path)
+        trainer.config.actor_rollout_ref.actor.policy_loss[
+            "policy_aggregation"
+        ] = "tree_balanced_segment_mean"
+        trainer.replay_buffer = trainer._new_replay_buffer()
+        trainer._restored_checkpoint_dir = str(tmp_path / "global_step_0")
+        manifest = trainer._load_or_build_run_manifest()
+        assert manifest.manifest_resume_provenance_missing is True
+        assert validate_main_run(manifest) is not None
 
 
 class TestLivelockGuards:
@@ -375,26 +455,27 @@ class TestSkipPathIoRobustness:
     branch is only reachable inside ``fit()``."""
 
     def _skip_branch_source(self) -> str:
-        import inspect
-
         src = inspect.getsource(RayGearTreeTrainer.fit)
         start = src.index("if edge_batch is None:")
         end = src.index("actor_updated = True", start)
         return src[start:end]
 
+    def _nonprogress_helper_source(self) -> str:
+        return inspect.getsource(RayGearTreeTrainer._record_nonprogress_iteration)
+
     def test_manifest_write_failure_is_caught(self):
         """Required test 1: the reservation is already committed, so a
         manifest I/O failure must not crash training."""
-        branch = self._skip_branch_source()
-        assert "self._save_manifest_best_effort(metrics)" in branch
+        helper = self._nonprogress_helper_source()
+        assert "self._save_manifest_best_effort(metrics)" in helper
         assert "vdra/manifest_save_failed" in inspect.getsource(
             RayGearTreeTrainer._save_manifest_best_effort
         )
 
     def test_timing_write_failure_is_caught(self):
         """Required test 2."""
-        branch = self._skip_branch_source()
-        assert "self._append_timing_row(timing_path, skip_timing, metrics)" in branch
+        helper = self._nonprogress_helper_source()
+        assert "self._append_timing_row(timing_path, row, metrics)" in helper
         assert "vdra/timing_write_failed" in inspect.getsource(
             RayGearTreeTrainer._append_timing_row
         )
@@ -402,6 +483,7 @@ class TestSkipPathIoRobustness:
     def test_skip_timing_carries_cumulative_and_wall_clock(self):
         """Required test 11."""
         branch = self._skip_branch_source()
+        helper = self._nonprogress_helper_source()
         for key in (
             "timing/train_total_seconds",
             "timing/cumulative_train_seconds",
@@ -412,9 +494,9 @@ class TestSkipPathIoRobustness:
             "training/consecutive_skipped_updates",
             "last_iteration_status",
         ):
-            assert key in branch, key
+            assert key in branch or key in helper, key
         # Generation time is folded into the running total.
-        assert "cum_train += t_gen" in branch
+        assert "updated_cum_train" in helper
 
 
     def test_fit_failure_wrapper_sets_and_persists_failed_before_actor(self):
@@ -426,15 +508,16 @@ class TestSkipPathIoRobustness:
 
     def test_skip_timing_reports_zero_steps_and_unchanged_global_step(self):
         branch = self._skip_branch_source()
-        assert '"training/expected_optimizer_steps": 0.0' in branch
-        assert '"training/optimizer_steps_this_iteration": 0.0' in branch
+        helper = self._nonprogress_helper_source()
+        assert '"training/expected_optimizer_steps": 0.0' in helper
+        assert '"training/optimizer_steps_this_iteration": 0.0' in helper
         # The skip branch must never touch global_step.
         assert "self.global_steps +=" not in branch
 
     def test_livelock_guard_runs_after_state_is_persisted(self):
-        branch = self._skip_branch_source()
-        guard_at = branch.index("_enforce_livelock_guards")
-        manifest_at = branch.index("self._save_manifest_best_effort(metrics)")
+        helper = self._nonprogress_helper_source()
+        guard_at = helper.index("_enforce_livelock_guards")
+        manifest_at = helper.index("self._save_manifest_best_effort(metrics)")
         assert manifest_at < guard_at, (
             "the guard must abort only AFTER the manifest was persisted"
         )
@@ -655,3 +738,121 @@ class TestCanonicalRejectsAuxiliaryLosses:
             )
             is None
         )
+
+
+class TestLiveStateResume:
+    def _prep_resume(self, tmp_path, monkeypatch, *, live_global_step=0, live_rollout=50):
+        from recipe.gear_tree.trainer_state import (
+            GearTreeLiveState,
+            GearTreeTrainerState,
+            save_live_state,
+            save_trainer_state,
+        )
+        from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
+        trainer = _trainer(tmp_path)
+        trainer.config.trainer.resume_mode = "resume_path"
+        trainer.config.trainer.resume_from_path = str(tmp_path / "global_step_0")
+        trainer.config.trainer.default_hdfs_dir = None
+        trainer.global_steps = 0
+        trainer.replay_buffer = trainer._new_replay_buffer()
+        ckpt = tmp_path / "global_step_0"
+        ckpt.mkdir()
+        save_trainer_state(
+            ckpt,
+            GearTreeTrainerState(
+                global_step=0,
+                rollout_iteration=0,
+                num_optimizer_steps_total=0,
+                consecutive_nonprogress_iterations=0,
+            ),
+        )
+        manifest = trainer._build_run_manifest()
+        manifest.global_step = 0
+        manifest.rollout_iteration = 0
+        manifest.num_optimizer_steps_total = 0
+        manifest.save(ckpt / "vdra_run_manifest.json")
+        save_live_state(
+            tmp_path,
+            GearTreeLiveState(
+                global_step=live_global_step,
+                rollout_iteration=live_rollout,
+                num_optimizer_steps_total=0,
+                successful_actor_updates=0,
+                postponed_updates=7,
+                failed_updates=0,
+                skipped_zero_gradient_updates=0,
+                consecutive_nonprogress_iterations=49,
+                last_iteration_status=ITERATION_STATUS_POSTPONED,
+            ),
+        )
+        monkeypatch.setattr(RayPPOTrainer, "_load_checkpoint", lambda self: 0)
+        return trainer
+
+    def test_global_step_zero_live_state_preserves_nonprogress_after_restart(self, tmp_path, monkeypatch):
+        trainer = self._prep_resume(tmp_path, monkeypatch)
+        trainer._load_checkpoint()
+        trainer.run_manifest = trainer._load_or_build_run_manifest()
+        trainer._merge_pending_live_state()
+        assert trainer.global_steps == 0
+        assert trainer.rollout_iteration == 50
+        assert trainer.consecutive_nonprogress_iterations == 49
+        assert trainer.postponed_updates == 7
+        assert trainer.run_manifest.last_iteration_status == ITERATION_STATUS_POSTPONED
+
+    def test_live_state_with_different_global_step_is_rejected(self, tmp_path, monkeypatch):
+        trainer = self._prep_resume(tmp_path, monkeypatch, live_global_step=1)
+        with pytest.raises(ValueError, match="gear_tree_live_state.json global_step"):
+            trainer._load_checkpoint()
+
+    def test_stale_live_state_rollout_is_ignored(self, tmp_path, monkeypatch):
+        trainer = self._prep_resume(tmp_path, monkeypatch, live_rollout=-1)
+        trainer._load_checkpoint()
+        trainer.run_manifest = trainer._load_or_build_run_manifest()
+        trainer._merge_pending_live_state()
+        assert trainer.rollout_iteration == 0
+        assert trainer.consecutive_nonprogress_iterations == 0
+
+
+class TestNonprogressHelper:
+    def test_no_sample_writes_timing_manifest_and_live_state(self, tmp_path):
+        trainer = _trainer(tmp_path)
+        trainer.replay_buffer = trainer._new_replay_buffer()
+        trainer._expected_optimizer_steps = None
+        metrics = {}
+        timing_path = str(tmp_path / "training_timing.jsonl")
+        out = trainer._record_nonprogress_iteration(
+            status=ITERATION_STATUS_NO_SAMPLE,
+            timing_path=timing_path,
+            t_gen=1.25,
+            sample_stats={"buffer/selected_edges": 0},
+            metrics=metrics,
+            loop_start=0.0,
+            cumulative_train_seconds=2.0,
+        )
+        assert out == pytest.approx(3.25)
+        row = json.loads((tmp_path / "training_timing.jsonl").read_text().splitlines()[-1])
+        assert row["last_iteration_status"] == ITERATION_STATUS_NO_SAMPLE
+        assert row["actor_update_skipped"] is False
+        assert row["timing/update_seconds"] == 0.0
+        assert row["training/expected_optimizer_steps"] == 0.0
+        assert (tmp_path / "vdra_run_manifest.json").exists()
+        assert (tmp_path / "gear_tree_live_state.json").exists()
+
+    def test_zero_signal_status_sets_actor_update_skipped_only_for_zero_skip(self, tmp_path):
+        trainer = _trainer(tmp_path)
+        trainer.replay_buffer = trainer._new_replay_buffer()
+        metrics = {}
+        trainer.skipped_zero_gradient_updates = 1
+        trainer._record_nonprogress_iteration(
+            status=ITERATION_STATUS_ALL_ZERO_SKIPPED,
+            timing_path=str(tmp_path / "training_timing.jsonl"),
+            t_gen=0.5,
+            sample_stats={"buffer/selected_edges": 4},
+            metrics=metrics,
+            loop_start=0.0,
+            cumulative_train_seconds=0.0,
+        )
+        assert trainer.run_manifest.actor_update_skipped is True
+        row = json.loads((tmp_path / "training_timing.jsonl").read_text().splitlines()[-1])
+        assert row["actor_update_skipped"] is True

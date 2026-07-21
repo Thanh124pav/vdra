@@ -24,6 +24,7 @@ _LOGGER = logging.getLogger(__name__)
 from verl import DataProto
 from verl.trainer.ppo.metric_utils import reduce_metrics
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 
 from recipe.gear_tree.config_validation import validate_policy_loss_consistency
 from recipe.gear_tree.context_contract import (
@@ -49,6 +50,7 @@ from recipe.gear_tree.run_manifest import (
     ITERATION_STATUS_FAILED_BEFORE_ACTOR,
     ITERATION_STATUS_MIXED_ZERO_SIGNAL_SKIPPED,
     ITERATION_STATUS_NO_SAMPLE,
+    ITERATION_STATUS_NOT_STARTED,
     ITERATION_STATUS_POSTPONED,
     ITERATION_STATUS_RUNNING,
     ITERATION_STATUS_UPDATED,
@@ -61,11 +63,15 @@ from recipe.gear_tree.run_manifest import (
     validate_main_run,
 )
 from recipe.gear_tree.trainer_state import (
+    GearTreeLiveState,
     GearTreeTrainerState,
     advance_past_thresholds,
     initial_next_threshold,
+    load_live_state,
     load_trainer_state,
+    save_live_state,
     save_trainer_state,
+    trainer_state_path,
 )
 
 
@@ -187,19 +193,36 @@ class RayGearTreeTrainer(RayPPOTrainer):
     def _checkpoint_dir_for_step(self, step: int) -> str:
         return os.path.join(self.config.trainer.default_local_dir, f"global_step_{int(step)}")
 
+    def _resolve_resume_checkpoint_dir(self) -> Optional[str]:
+        """Return the checkpoint folder VERL will restore, if any."""
+        trainer_cfg = self.config.trainer
+        if trainer_cfg.resume_mode == "disable":
+            return None
+        if trainer_cfg.default_hdfs_dir is not None:
+            return None
+        if trainer_cfg.resume_mode == "resume_path":
+            path = trainer_cfg.resume_from_path
+            if not isinstance(path, str) or "global_step_" not in path:
+                return None
+            if not os.path.isabs(path):
+                path = os.path.join(os.getcwd(), path)
+            return path
+        checkpoint_folder = trainer_cfg.default_local_dir
+        if not os.path.isabs(checkpoint_folder):
+            checkpoint_folder = os.path.join(os.getcwd(), checkpoint_folder)
+        return find_latest_ckpt_path(checkpoint_folder)
+
+    def _is_resuming_from_checkpoint(self) -> bool:
+        return bool(getattr(self, "_restored_checkpoint_dir", None))
+
     # --- PLAN.md P0.E: counter state must survive checkpoint/resume ------- #
 
     def _save_checkpoint(self):
-        """Base checkpoint plus the VDRA counter state file.
-
-        The base trainer restores only ``global_steps`` from the folder
-        name; ``gear_tree_trainer_state.json`` carries the remaining
-        counters (most importantly ``rollout_iteration``, which drives
-        replay ages).
-        """
+        """Base checkpoint plus VDRA checkpoint-scoped state files."""
         super()._save_checkpoint()
+        ckpt_dir = self._checkpoint_dir_for_step(self.global_steps)
         save_trainer_state(
-            self._checkpoint_dir_for_step(self.global_steps),
+            ckpt_dir,
             GearTreeTrainerState(
                 global_step=int(self.global_steps),
                 rollout_iteration=int(getattr(self, "rollout_iteration", 0)),
@@ -219,56 +242,62 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 ),
             ),
         )
+        if getattr(self, "run_manifest", None) is not None:
+            self._save_manifest(self.run_manifest, path=self._checkpoint_manifest_path(ckpt_dir))
 
     def _load_checkpoint(self):
-        """Restore ``global_steps`` (base) plus the VDRA counter state.
+        """Restore base checkpoint plus VDRA counter state.
 
-        A checkpoint without the state file is a LEGACY checkpoint: replay
-        restore is disabled for it (PLAN.md P0.E option A) because restored
-        edges would carry generation iterations far above the reset
-        ``rollout_iteration`` and get negative, never-expiring ages.
+        Resume detection is path-based, not ``global_steps > 0``, so a
+        canonical ``global_step_0`` checkpoint can restore trainer state,
+        replay, and its checkpoint-scoped manifest.
         """
-        ret = super()._load_checkpoint()
+        self._restored_checkpoint_dir = self._resolve_resume_checkpoint_dir()
+        self._pending_live_state = None
         self._legacy_checkpoint_without_state = False
-        if int(getattr(self, "global_steps", 0) or 0) > 0:
-            state = load_trainer_state(
-                self._checkpoint_dir_for_step(self.global_steps)
+        ret = super()._load_checkpoint()
+        if not self._is_resuming_from_checkpoint():
+            return ret
+
+        ckpt_dir = Path(self._restored_checkpoint_dir)
+        state = load_trainer_state(ckpt_dir)
+        if state is None:
+            self._legacy_checkpoint_without_state = True
+            print(
+                "WARNING (PLAN.md P0.E): checkpoint "
+                f"{ckpt_dir.name} has no gear_tree_trainer_state.json "
+                "(legacy checkpoint). The replay buffer will be RESET and "
+                "rollout_iteration restarts at 0 so replay ages can never "
+                "go negative."
             )
-            if state is None:
-                self._legacy_checkpoint_without_state = True
-                print(
-                    "WARNING (PLAN.md P0.E): checkpoint "
-                    f"global_step_{self.global_steps} has no "
-                    "gear_tree_trainer_state.json (legacy checkpoint). "
-                    "The replay buffer will be RESET and rollout_iteration "
-                    "restarts at 0 so replay ages can never go negative."
+            return ret
+
+        if int(state.global_step) != int(self.global_steps):
+            raise ValueError(
+                "gear_tree_trainer_state.json global_step="
+                f"{state.global_step} does not match checkpoint folder "
+                f"global_step_{self.global_steps}"
+            )
+        self.rollout_iteration = int(state.rollout_iteration)
+        self.num_optimizer_steps_total = int(state.num_optimizer_steps_total)
+        self.successful_actor_updates = int(state.successful_actor_updates)
+        self.postponed_updates = int(state.postponed_updates)
+        self.failed_updates = int(state.failed_updates)
+        self.skipped_zero_gradient_updates = int(
+            state.skipped_zero_gradient_updates
+        )
+        self._set_nonprogress_counter(state.consecutive_nonprogress_iterations)
+
+        live = load_live_state(self.config.trainer.default_local_dir)
+        if live is not None:
+            if int(live.global_step) != int(state.global_step):
+                raise ValueError(
+                    "gear_tree_live_state.json global_step="
+                    f"{live.global_step} does not match restored checkpoint "
+                    f"global_step={state.global_step}"
                 )
-            else:
-                if int(state.global_step) != int(self.global_steps):
-                    raise ValueError(
-                        "gear_tree_trainer_state.json global_step="
-                        f"{state.global_step} does not match checkpoint "
-                        f"folder global_step_{self.global_steps}"
-                    )
-                self.rollout_iteration = int(state.rollout_iteration)
-                self.num_optimizer_steps_total = int(
-                    state.num_optimizer_steps_total
-                )
-                self.successful_actor_updates = int(
-                    state.successful_actor_updates
-                )
-                self.postponed_updates = int(state.postponed_updates)
-                self.failed_updates = int(state.failed_updates)
-                self.skipped_zero_gradient_updates = int(
-                    state.skipped_zero_gradient_updates
-                )
-                self.consecutive_nonprogress_iterations = int(
-                    state.consecutive_nonprogress_iterations
-                )
-                # One-release compatibility alias for older tests/callers.
-                self.consecutive_skipped_updates = int(
-                    self.consecutive_nonprogress_iterations
-                )
+            if int(live.rollout_iteration) >= int(state.rollout_iteration):
+                self._pending_live_state = live
         return ret
 
     def _restore_or_init_replay_buffer(self) -> Dict[str, Any]:
@@ -278,7 +307,16 @@ class RayGearTreeTrainer(RayPPOTrainer):
             "buffer/reset_on_resume": 0.0,
             "buffer/legacy_checkpoint_reset": 0.0,
         }
-        if int(getattr(self, "global_steps", 0) or 0) <= 0:
+        ckpt_dir = Path(
+            getattr(self, "_restored_checkpoint_dir", None)
+            or self._checkpoint_dir_for_step(self.global_steps)
+        )
+        should_restore = (
+            self._is_resuming_from_checkpoint()
+            or int(getattr(self, "global_steps", 0) or 0) > 0
+            or trainer_state_path(ckpt_dir).exists()
+        )
+        if not should_restore:
             self.replay_buffer = self._new_replay_buffer()
             return metrics
 
@@ -292,7 +330,6 @@ class RayGearTreeTrainer(RayPPOTrainer):
             self.replay_buffer_resume_metrics = metrics
             return metrics
 
-        ckpt_dir = Path(self._checkpoint_dir_for_step(self.global_steps))
         meta_path = ckpt_dir / "gear_tree_replay_buffer_meta.json"
         if replay_cfg.get("checkpoint", True) and meta_path.exists():
             # PLAN.md §13: a restored zero slot's active-token count was
@@ -684,9 +721,10 @@ class RayGearTreeTrainer(RayPPOTrainer):
         stamp the config-derived replay/optimizer knobs so ``validate_main_run``
         can compare against observed runtime values later.
         """
+        gt = self._gear_tree_config()
         manifest = build_run_manifest(
             tree_policy=(self.config.get("tree_policy") or {}),
-            gear_tree_cfg=self._gear_tree_config(),
+            gear_tree_cfg=gt,
             actor_loss_mode=str(
                 self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
             ),
@@ -714,6 +752,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
             _pl.get("probability_mask_threshold", 0.9)
         )
         manifest.logical_slot_schema_version = LOGICAL_SLOT_SCHEMA_VERSION
+        manifest.tree_shape = [int(x) for x in (gt.get("tree_shape") or [])]
+        manifest.trees_per_question = int(self._resolve_trees_per_question())
+        manifest.segment_length = int(gt.get("segment_length", 0) or 0)
         # The resolved auto cap is populated once the replay buffer is built.
         if hasattr(self, "replay_buffer") and self.replay_buffer is not None:
             manifest.resolved_max_edges_per_question_per_iteration = int(
@@ -733,9 +774,13 @@ class RayGearTreeTrainer(RayPPOTrainer):
             "logical_slot_schema_version",
             "replay_sampling_unit",
             "target_edges_per_iteration",
+            "resolved_max_edges_per_question_per_iteration",
             "max_edge_age_iterations",
             "ppo_mini_batch_size",
             "ppo_epochs",
+            "tree_shape",
+            "trees_per_question",
+            "segment_length",
         )
         for field in fields:
             old = getattr(manifest, field)
@@ -756,13 +801,101 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     "manifest counters/invariants (PLAN.md §1)."
                 )
 
+    def _checkpoint_manifest_path(self, checkpoint_dir: str | Path) -> str:
+        return os.path.join(str(checkpoint_dir), "vdra_run_manifest.json")
+
+    def _assert_resumed_manifest_counters(self, manifest: RunManifest) -> None:
+        expected = {
+            "global_step": int(self.global_steps),
+            "rollout_iteration": int(self.rollout_iteration),
+            "num_optimizer_steps_total": int(self.num_optimizer_steps_total),
+        }
+        actual = {
+            "global_step": int(manifest.global_step),
+            "rollout_iteration": int(manifest.rollout_iteration),
+            "num_optimizer_steps_total": int(manifest.num_optimizer_steps_total),
+        }
+        for key, value in expected.items():
+            if int(actual[key]) != int(value):
+                raise ValueError(
+                    "resumed VDRA manifest counter mismatch for "
+                    f"{key}: checkpoint manifest has {actual[key]!r}, "
+                    f"trainer state has {value!r}"
+                )
+
     def _load_or_build_run_manifest(self) -> RunManifest:
-        path = self._manifest_path()
-        if int(getattr(self, "global_steps", 0) or 0) > 0 and os.path.exists(path):
-            manifest = RunManifest.load(path)
-            self._validate_resumed_manifest_config(manifest)
+        if self._is_resuming_from_checkpoint():
+            ckpt_dir = Path(self._restored_checkpoint_dir)
+            path = self._checkpoint_manifest_path(ckpt_dir)
+            if os.path.exists(path):
+                manifest = RunManifest.load(path)
+                self._validate_resumed_manifest_config(manifest)
+                self._assert_resumed_manifest_counters(manifest)
+                return manifest
+            if self._is_canonical_aggregation():
+                raise FileNotFoundError(
+                    "canonical VDRA resume requires checkpoint-scoped "
+                    f"manifest {path}; refusing to rebuild from the live root "
+                    "manifest (PLAN.md final resume fixes)."
+                )
+            manifest = self._build_run_manifest()
+            manifest.manifest_resume_provenance_missing = True
             return manifest
         return self._build_run_manifest()
+
+    def _current_live_state(self) -> GearTreeLiveState:
+        return GearTreeLiveState(
+            global_step=int(getattr(self, "global_steps", 0)),
+            rollout_iteration=int(getattr(self, "rollout_iteration", 0)),
+            num_optimizer_steps_total=int(
+                getattr(self, "num_optimizer_steps_total", 0)
+            ),
+            successful_actor_updates=int(
+                getattr(self, "successful_actor_updates", 0)
+            ),
+            postponed_updates=int(getattr(self, "postponed_updates", 0)),
+            failed_updates=int(getattr(self, "failed_updates", 0)),
+            skipped_zero_gradient_updates=int(
+                getattr(self, "skipped_zero_gradient_updates", 0)
+            ),
+            consecutive_nonprogress_iterations=int(
+                getattr(self, "consecutive_nonprogress_iterations", 0)
+            ),
+            last_iteration_status=str(
+                getattr(
+                    getattr(self, "run_manifest", None),
+                    "last_iteration_status",
+                    ITERATION_STATUS_NOT_STARTED,
+                )
+            ),
+        )
+
+    def _save_live_state_best_effort(self, metrics: Dict[str, Any]) -> None:
+        try:
+            save_live_state(
+                self.config.trainer.default_local_dir, self._current_live_state()
+            )
+        except Exception as exc:
+            metrics["vdra/live_state_save_failed"] = 1.0
+            _LOGGER.warning("Failed to persist the VDRA live state: %s", exc)
+
+    def _merge_pending_live_state(self) -> None:
+        live = getattr(self, "_pending_live_state", None)
+        if live is None:
+            return
+        self.rollout_iteration = int(live.rollout_iteration)
+        self.num_optimizer_steps_total = int(live.num_optimizer_steps_total)
+        self.successful_actor_updates = int(live.successful_actor_updates)
+        self.postponed_updates = int(live.postponed_updates)
+        self.failed_updates = int(live.failed_updates)
+        self.skipped_zero_gradient_updates = int(
+            live.skipped_zero_gradient_updates
+        )
+        self._set_nonprogress_counter(live.consecutive_nonprogress_iterations)
+        if str(live.last_iteration_status) in VALID_ITERATION_STATUSES:
+            self._set_iteration_status(str(live.last_iteration_status))
+        self._stamp_manifest_iteration_state()
+        self._pending_live_state = None
 
     def _save_manifest_best_effort(self, metrics: Dict[str, Any]) -> None:
         try:
@@ -790,19 +923,12 @@ class RayGearTreeTrainer(RayPPOTrainer):
         selected_edges: int,
         sample_stats: Dict[str, Any],
         actual_optimizer_steps: int,
+        record_optimizer_observation: bool = True,
     ) -> None:
-        """PLAN.md P0.7: stamp per-iteration observed facts on the manifest.
-
-        The trainer calls this after a successful actor update so the
-        manifest tracks live counters (``rollout_iteration``, ``global_step``,
-        ``optimizer_steps_last_iteration``) and replay diagnostics
-        (observed edge-age histogram, per-question cap max, etc.).
-        """
+        """Stamp per-iteration observed facts on the manifest."""
         m = self.run_manifest
-        m.rollout_iteration = int(self.rollout_iteration)
-        m.global_step = int(self.global_steps)
+        self._stamp_manifest_iteration_state()
         m.optimizer_steps_last_iteration = int(actual_optimizer_steps)
-        m.num_optimizer_steps_total = int(self.num_optimizer_steps_total)
         m.selected_edges_last_iteration = int(selected_edges)
         m.unique_questions_last_iteration = int(
             sample_stats.get("buffer/unique_questions", 0) or 0
@@ -821,32 +947,48 @@ class RayGearTreeTrainer(RayPPOTrainer):
             m.edge_age_histogram_last_iteration = {
                 int(k): int(v) for k, v in hist.items()
             }
-        if hasattr(self, "replay_buffer") and self.replay_buffer is not None:
-            m.resolved_max_edges_per_question_per_iteration = int(
-                self.replay_buffer.resolved_max_edges_per_question_per_iteration
-            )
-        # PLAN.md P0.7 / §8: `optimizer_step_accounting_valid` iff the observed
-        # step count equals the expected count for this iteration. On the
-        # canonical sparse path the expectation counts only TRAINABLE logical
-        # batches — a batch skipped for all_zero_advantage or zero_active_tokens
-        # must NOT mark a valid mixed update as accounting-invalid.
         expected = self._resolve_expected_optimizer_steps(int(selected_edges))
         if expected is None:
-            # No well-defined expectation (legacy path, indivisible count):
-            # leave the diagnostic untouched rather than inventing one.
             return
         expected = int(expected)
         m.expected_optimizer_steps_last_iteration = expected
-        m.optimizer_step_accounting_valid = int(actual_optimizer_steps) == expected
+        if record_optimizer_observation:
+            m.optimizer_step_accounting_observations += 1
+            if int(actual_optimizer_steps) != expected:
+                m.optimizer_step_accounting_failures += 1
+            m.optimizer_step_accounting_valid = (
+                m.optimizer_step_accounting_observations > 0
+                and m.optimizer_step_accounting_failures == 0
+            )
+        elif m.optimizer_step_accounting_observations == 0:
+            m.optimizer_step_accounting_valid = False
 
     def _manifest_path(self) -> str:
         return os.path.join(
             self.config.trainer.default_local_dir, "vdra_run_manifest.json"
         )
 
-    def _save_manifest(self, manifest: RunManifest) -> None:
-        os.makedirs(self.config.trainer.default_local_dir, exist_ok=True)
-        manifest.save(self._manifest_path())
+    def _stamp_manifest_iteration_state(self) -> None:
+        if getattr(self, "run_manifest", None) is None:
+            return
+        self.run_manifest.rollout_iteration = int(getattr(self, "rollout_iteration", 0))
+        self.run_manifest.global_step = int(getattr(self, "global_steps", 0))
+        self.run_manifest.num_optimizer_steps_total = int(
+            getattr(self, "num_optimizer_steps_total", 0)
+        )
+        if hasattr(self, "replay_buffer") and self.replay_buffer is not None:
+            self.run_manifest.resolved_max_edges_per_question_per_iteration = int(
+                self.replay_buffer.resolved_max_edges_per_question_per_iteration
+            )
+
+    def _save_manifest(
+        self, manifest: RunManifest, *, path: str | Path | None = None
+    ) -> None:
+        if manifest is self.run_manifest:
+            self._stamp_manifest_iteration_state()
+        target = Path(path) if path is not None else Path(self._manifest_path())
+        target.parent.mkdir(parents=True, exist_ok=True)
+        manifest.save(target)
 
     def _update_manifest_from_generated_edges(
         self,
@@ -1097,6 +1239,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
             selected_edges=len(sampled_edges),
             sample_stats=sample_stats,
             actual_optimizer_steps=int(n_optim_steps),
+            record_optimizer_observation=metrics_parse_ok,
         )
         # PLAN.md M2/M4: the internal optimizer-step count is a DIAGNOSTIC,
         # not the outer training unit. A parse failure or a count/expected
@@ -1191,6 +1334,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
         if limit <= 0 or current < limit:
             return
         self._save_manifest_best_effort(metrics)
+        self._save_live_state_best_effort(metrics)
         try:
             self._save_checkpoint()
         except Exception as exc:
@@ -1237,6 +1381,92 @@ class RayGearTreeTrainer(RayPPOTrainer):
         metrics["training/max_rollout_iterations"] = float(
             int(raw_iters) if raw_iters is not None else 0
         )
+
+    def _record_nonprogress_iteration(
+        self,
+        *,
+        status: str,
+        timing_path: str,
+        t_gen: float,
+        sample_stats: Mapping[str, Any],
+        metrics: Dict[str, Any],
+        loop_start: float,
+        cumulative_train_seconds: float,
+    ) -> float:
+        """Record a no-progress iteration with one shared code path."""
+        self._set_iteration_status(status)
+        self._increment_nonprogress_counter()
+        updated_cum_train = float(cumulative_train_seconds) + float(t_gen)
+        selected_edges = int(
+            sample_stats.get(
+                "buffer/selected_edges",
+                sample_stats.get("selected_edges", sample_stats.get("selected_count", 0)),
+            )
+            or 0
+        )
+        self.optimizer_steps_this_iteration = 0
+        self._expected_optimizer_steps = 0
+        self._record_iteration_on_manifest(
+            selected_edges=selected_edges,
+            sample_stats=dict(sample_stats),
+            actual_optimizer_steps=0,
+            record_optimizer_observation=False,
+        )
+        replay_buffer = getattr(self, "replay_buffer", None)
+        buffer_size = len(replay_buffer) if replay_buffer is not None else 0
+        actor_update_skipped = status in ZERO_SIGNAL_SKIP_STATUSES
+        row = {
+            "step": int(self.global_steps),
+            "rollout_iteration": int(self.rollout_iteration),
+            "last_iteration_status": status,
+            "actor_update_skipped": actor_update_skipped,
+            "timing/generation_seconds": float(t_gen),
+            "timing/update_seconds": 0.0,
+            "timing/train_total_seconds": float(t_gen),
+            "timing/cumulative_train_seconds": updated_cum_train,
+            "timing/wall_seconds": time.time() - loop_start,
+            "training/global_step": float(self.global_steps),
+            "training/expected_optimizer_steps": 0.0,
+            "training/optimizer_steps_this_iteration": 0.0,
+            "training/num_optimizer_steps_total": float(
+                self.num_optimizer_steps_total
+            ),
+            "training/successful_actor_updates": float(
+                self.successful_actor_updates
+            ),
+            "training/postponed_updates": float(self.postponed_updates),
+            "training/failed_updates": float(self.failed_updates),
+            "training/skipped_zero_gradient_updates": float(
+                self.skipped_zero_gradient_updates
+            ),
+            "training/consecutive_nonprogress_iterations": float(
+                self.consecutive_nonprogress_iterations
+            ),
+            "training/consecutive_skipped_updates": float(
+                self.consecutive_nonprogress_iterations
+            ),
+            "buffer/size_after": float(buffer_size),
+            "buffer/selected_edges": float(selected_edges),
+        }
+        if "buffer/mean_edge_age" in sample_stats:
+            row["train/mean_edge_age"] = float(
+                sample_stats.get("buffer/mean_edge_age", 0.0) or 0.0
+            )
+        if "buffer/max_edge_age" in sample_stats:
+            row["train/max_edge_age"] = float(
+                sample_stats.get("buffer/max_edge_age", 0) or 0
+            )
+        metrics.update(row)
+        metrics["training/last_iteration_status"] = status
+        metrics["vdra/skipped_zero_gradient_updates"] = float(
+            self.skipped_zero_gradient_updates
+        )
+        self._append_timing_row(timing_path, row, metrics)
+        self._save_manifest_best_effort(metrics)
+        self._save_live_state_best_effort(metrics)
+        self._log_livelock_counters(metrics)
+        self._enforce_livelock_guards(metrics)
+        return updated_cum_train
 
     def _rollout_iteration_budget_exhausted(self) -> bool:
         """PLAN.md §2: stop after ``max_rollout_iterations`` even when
@@ -1304,6 +1534,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
         # PLAN.md P0.N8: preserve a checkpoint manifest on resume so failure
         # counters and invariant verdicts cannot be reset by rebuilding it.
         self.run_manifest = self._load_or_build_run_manifest()
+        self._merge_pending_live_state()
         manifest_strict = bool(
             (self.config.get("tree_policy") or {}).get(
                 "strict_group_integrity", False
@@ -1423,16 +1654,18 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     )
                     metrics["training/successful_actor_updates"] = float(self.successful_actor_updates)
                     if not sampled_edges:
-                        # PLAN.md §3/§5: an empty reservation is nonprogress and
-                        # must not reset the guard counter.
-                        self._increment_nonprogress_counter()
-                        metrics["training/last_iteration_status"] = (
-                            self._set_iteration_status(ITERATION_STATUS_NO_SAMPLE)
+                        stats = dict(sample_stats)
+                        stats["buffer/selected_edges"] = 0
+                        cum_train = self._record_nonprogress_iteration(
+                            status=ITERATION_STATUS_NO_SAMPLE,
+                            timing_path=timing_path,
+                            t_gen=t_gen,
+                            sample_stats=stats,
+                            metrics=metrics,
+                            loop_start=loop_start,
+                            cumulative_train_seconds=cum_train,
                         )
-                        self._log_livelock_counters(metrics)
-                        self._save_manifest_best_effort(metrics)
                         logger.log(data=metrics, step=self.global_steps)
-                        self._enforce_livelock_guards(metrics)
                         continue
                     if self._should_postpone_sampled_update(sampled_edges):
                         replay_buffer.rollback(reservation)
@@ -1440,16 +1673,18 @@ class RayGearTreeTrainer(RayPPOTrainer):
                         metrics["buffer/postponed_update"] = 1.0
                         metrics["training/postponed_updates"] = float(self.postponed_updates)
                         metrics["buffer/size_after"] = float(len(replay_buffer))
-                        # PLAN.md §3/§5: a postponed iteration is nonprogress and
-                        # must not reset the guard counter.
-                        self._increment_nonprogress_counter()
-                        metrics["training/last_iteration_status"] = (
-                            self._set_iteration_status(ITERATION_STATUS_POSTPONED)
+                        stats = dict(sample_stats)
+                        stats["buffer/selected_edges"] = len(sampled_edges)
+                        cum_train = self._record_nonprogress_iteration(
+                            status=ITERATION_STATUS_POSTPONED,
+                            timing_path=timing_path,
+                            t_gen=t_gen,
+                            sample_stats=stats,
+                            metrics=metrics,
+                            loop_start=loop_start,
+                            cumulative_train_seconds=cum_train,
                         )
-                        self._log_livelock_counters(metrics)
-                        self._save_manifest_best_effort(metrics)
                         logger.log(data=metrics, step=self.global_steps)
-                        self._enforce_livelock_guards(metrics)
                         continue
 
                     # PLAN.md M2: validation, tensorization, and the actor RPC run
@@ -1466,9 +1701,8 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     )
                     if edge_batch is None:
                         # PLAN.md §1.3: explicit skipped update (all-zero
-                        # reservation). Consume the reservation (the zero signal
-                        # was processed), record the skip, and move on — no
-                        # global_step, no scheduler.step, no actor RPC.
+                        # reservation). Consume the reservation before
+                        # recording the nonprogress iteration.
                         removed = replay_buffer.commit(reservation)
                         metrics["buffer/removed_edges"] = float(len(removed))
                         metrics["buffer/size_after"] = float(len(replay_buffer))
@@ -1476,98 +1710,19 @@ class RayGearTreeTrainer(RayPPOTrainer):
                         metrics["vdra/skipped_zero_gradient_updates"] = float(
                             self.skipped_zero_gradient_updates
                         )
-                        # PLAN.md §6: a fully skipped iteration is a real, visible
-                        # event — write its timing row and persist the manifest so
-                        # it is auditable, with expected == actual == 0 optimizer
-                        # steps and the outer counters untouched.
-                        skip_ages = [
-                            self.rollout_iteration
-                            - int(
-                                edge.get(
-                                    "generation_rollout_iteration",
-                                    edge.get("generation_step", self.rollout_iteration),
-                                )
-                            )
-                            for edge in sampled_edges
-                        ]
-                        # PLAN.md §5: classify WHY every logical batch skipped.
-                        skip_status = self._set_iteration_status(
-                            self._zero_signal_skip_status(metrics)
+                        skip_status = self._zero_signal_skip_status(metrics)
+                        stats = dict(sample_stats)
+                        stats["buffer/selected_edges"] = len(sampled_edges)
+                        cum_train = self._record_nonprogress_iteration(
+                            status=skip_status,
+                            timing_path=timing_path,
+                            t_gen=t_gen,
+                            sample_stats=stats,
+                            metrics=metrics,
+                            loop_start=loop_start,
+                            cumulative_train_seconds=cum_train,
                         )
-                        # PLAN.md §3: zero-signal skip is a nonprogress iteration.
-                        self._increment_nonprogress_counter()
-                        # PLAN.md §6: a skipped iteration still consumed
-                        # generation time, so it contributes to the totals.
-                        cum_train += t_gen
-                        skip_timing = {
-                            "step": self.global_steps,
-                            "rollout_iteration": self.rollout_iteration,
-                            "actor_update_skipped": True,
-                            "last_iteration_status": skip_status,
-                            "timing/generation_seconds": t_gen,
-                            "timing/update_seconds": 0.0,
-                            "timing/train_total_seconds": t_gen,
-                            "timing/cumulative_train_seconds": cum_train,
-                            "timing/wall_seconds": time.time() - loop_start,
-                            "train/logical_slots": float(len(sampled_edges)),
-                            "train/trainable_tensor_rows": 0.0,
-                            "train/dummy_rows": 0.0,
-                            "train/real_response_tokens": 0.0,
-                            "train/mean_edge_age": float(
-                                sum(skip_ages) / len(skip_ages) if skip_ages else 0.0
-                            ),
-                            "train/max_edge_age": float(max(skip_ages) if skip_ages else 0),
-                            "training/rollout_iteration": float(self.rollout_iteration),
-                            "training/global_step": float(self.global_steps),
-                            "training/expected_optimizer_steps": 0.0,
-                            "training/optimizer_steps_this_iteration": 0.0,
-                            "training/num_optimizer_steps_total": float(
-                                self.num_optimizer_steps_total
-                            ),
-                            "training/successful_actor_updates": float(
-                                self.successful_actor_updates
-                            ),
-                            "training/postponed_updates": float(self.postponed_updates),
-                            "training/failed_updates": float(self.failed_updates),
-                            "training/consecutive_nonprogress_iterations": float(
-                                self.consecutive_nonprogress_iterations
-                            ),
-                            "training/consecutive_skipped_updates": float(
-                                self.consecutive_nonprogress_iterations
-                            ),
-                            "vdra/skipped_zero_gradient_updates": float(
-                                self.skipped_zero_gradient_updates
-                            ),
-                            "vdra/all_zero_advantage_logical_batches": float(
-                                metrics.get(
-                                    "vdra/all_zero_advantage_logical_batches", 0.0
-                                )
-                            ),
-                            "vdra/zero_active_token_logical_batches": float(
-                                metrics.get(
-                                    "vdra/zero_active_token_logical_batches", 0.0
-                                )
-                            ),
-                        }
-                        # PLAN.md §4: the reservation is ALREADY committed, so a
-                        # bookkeeping I/O failure must never crash training.
-                        self._append_timing_row(timing_path, skip_timing, metrics)
-                        metrics.update(skip_timing)
-                        # Observed facts for a skipped update: zero steps expected
-                        # and zero performed, so the accounting stays valid.
-                        self.optimizer_steps_this_iteration = 0
-                        self._expected_optimizer_steps = 0
-                        self._record_iteration_on_manifest(
-                            selected_edges=len(sampled_edges),
-                            sample_stats=sample_stats,
-                            actual_optimizer_steps=0,
-                        )
-                        self._save_manifest_best_effort(metrics)
-                        self._log_livelock_counters(metrics)
                         logger.log(data=metrics, step=self.global_steps)
-                        # PLAN.md §2: abort a live-locked run (skips never advance
-                        # global_step) AFTER the state above has been persisted.
-                        self._enforce_livelock_guards(metrics)
                         continue
                     actor_updated = True
                     # PLAN.md M2 (item 3): commit + outer counters are secured
@@ -1688,6 +1843,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     # a killed run still leaves a snapshot on disk. Overwrites in
                     # place — the manifest is small and monotonic per step.
                     self._save_manifest_best_effort(metrics)
+                    self._save_live_state_best_effort(metrics)
                     # Report the manifest verdict as a boolean metric so runs can
                     # be filtered by validity at analysis time.
                     metrics["vdra/manifest_valid_main_run"] = float(
@@ -1737,6 +1893,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
                             ITERATION_STATUS_FAILED_BEFORE_ACTOR
                         )
                     self._save_manifest_best_effort(metrics)
+                    self._save_live_state_best_effort(metrics)
                     raise
         self._save_checkpoint()
         self._maybe_save_replay_buffer()
+        final_metrics: Dict[str, Any] = {}
+        self._save_live_state_best_effort(final_metrics)

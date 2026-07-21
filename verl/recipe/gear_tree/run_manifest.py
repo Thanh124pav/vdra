@@ -95,6 +95,9 @@ class RunManifest:
     segment_token_reduction: str = SEGMENT_TOKEN_REDUCTION_MEAN
     advantage_mode: str = ADVANTAGE_MODE_ABLATION
     segment_definition: str = SEGMENT_DEFINITION_FIXED
+    tree_shape: list[int] = field(default_factory=list)
+    trees_per_question: int = 1
+    segment_length: int = 0
 
     # PLAN.md §14: objective-mask snapshot + the OBSERVED logical denominator
     # mode, so a run cannot claim one objective while normalizing by another.
@@ -135,6 +138,8 @@ class RunManifest:
     fresh_iid_row_count_matches_allocated_k: bool = True
     replay_age_uses_rollout_iteration: bool = False
     optimizer_step_accounting_valid: bool = False
+    optimizer_step_accounting_observations: int = 0
+    optimizer_step_accounting_failures: int = 0
     # PLAN.md §5: what the LAST iteration actually did. A single boolean
     # cannot distinguish a zero-signal skip from a postponed or empty
     # iteration, so the status string is authoritative and
@@ -143,6 +148,7 @@ class RunManifest:
     last_iteration_status: str = ITERATION_STATUS_NOT_STARTED
     actor_update_skipped: bool = False
     unique_tree_ids_verified: bool = False
+    manifest_resume_provenance_missing: bool = False
 
     # Running counters (updated by the trainer)
     parent_split_count: int = 0
@@ -200,10 +206,14 @@ class RunManifest:
         return asdict(self)
 
     def save(self, path: str | Path) -> None:
-        Path(path).write_text(
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(
             json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        tmp.replace(path)
 
     @classmethod
     def load(cls, path: str | Path) -> "RunManifest":
@@ -252,6 +262,8 @@ def validate_main_run(manifest: RunManifest) -> Optional[str]:
     accordingly and reported as an ablation.
     """
     failures = []
+    if manifest.manifest_resume_provenance_missing:
+        failures.append("manifest_resume_provenance_missing=True")
     if manifest.policy_aggregation not in (
         POLICY_AGGREGATION_SEGMENT_MEAN,
         POLICY_AGGREGATION_TOKEN_MEAN,

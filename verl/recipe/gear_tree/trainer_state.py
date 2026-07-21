@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 TRAINER_STATE_FILENAME = "gear_tree_trainer_state.json"
+LIVE_STATE_FILENAME = "gear_tree_live_state.json"
 
 
 @dataclass
@@ -38,8 +39,30 @@ class GearTreeTrainerState:
         return asdict(self)
 
 
+@dataclass
+class GearTreeLiveState:
+    """Crash-durable operational counters written between checkpoints."""
+
+    global_step: int = 0
+    rollout_iteration: int = 0
+    num_optimizer_steps_total: int = 0
+    successful_actor_updates: int = 0
+    postponed_updates: int = 0
+    failed_updates: int = 0
+    skipped_zero_gradient_updates: int = 0
+    consecutive_nonprogress_iterations: int = 0
+    last_iteration_status: str = "not_started"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
 def trainer_state_path(checkpoint_dir: str | Path) -> Path:
     return Path(checkpoint_dir) / TRAINER_STATE_FILENAME
+
+
+def live_state_path(default_local_dir: str | Path) -> Path:
+    return Path(default_local_dir) / LIVE_STATE_FILENAME
 
 
 def save_trainer_state(
@@ -47,6 +70,21 @@ def save_trainer_state(
 ) -> Path:
     """Write the counter state atomically into the checkpoint directory."""
     path = trainer_state_path(checkpoint_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(state.to_dict(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+    return path
+
+
+def save_live_state(
+    default_local_dir: str | Path, state: GearTreeLiveState
+) -> Path:
+    """Write the crash-durable live state atomically."""
+    path = live_state_path(default_local_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(
@@ -112,3 +150,23 @@ def load_trainer_state(
     known = {f for f in GearTreeTrainerState.__dataclass_fields__}
     cleaned = {k: int(v) for k, v in data.items() if k in known}
     return GearTreeTrainerState(**cleaned)
+
+
+def load_live_state(
+    default_local_dir: str | Path,
+) -> Optional[GearTreeLiveState]:
+    """Read the crash-durable live state, if present."""
+    path = live_state_path(default_local_dir)
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    known = {f for f in GearTreeLiveState.__dataclass_fields__}
+    cleaned = {}
+    for key, value in data.items():
+        if key not in known:
+            continue
+        if key == "last_iteration_status":
+            cleaned[key] = str(value)
+        else:
+            cleaned[key] = int(value)
+    return GearTreeLiveState(**cleaned)
