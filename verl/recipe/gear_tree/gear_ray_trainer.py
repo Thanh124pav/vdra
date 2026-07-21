@@ -248,8 +248,11 @@ class RayGearTreeTrainer(RayPPOTrainer):
 
     def _save_vdra_checkpoint_bundle(self) -> None:
         """Save model state plus all VDRA files, then mark complete last."""
+        ckpt_dir = Path(self._checkpoint_dir_for_step(self.global_steps))
+        marker = self._checkpoint_complete_marker_path(ckpt_dir)
+        if marker.exists():
+            marker.unlink()
         super()._save_checkpoint()
-        ckpt_dir = self._checkpoint_dir_for_step(self.global_steps)
         save_trainer_state(
             ckpt_dir,
             GearTreeTrainerState(
@@ -357,8 +360,13 @@ class RayGearTreeTrainer(RayPPOTrainer):
         live = load_live_state(self.config.trainer.default_local_dir)
         if live is not None:
             if int(live.global_step) == int(state.global_step):
-                self._pending_live_state = live
-                self._live_state_resume_metrics["vdra/live_state_merged"] = 1.0
+                if int(live.rollout_iteration) >= int(state.rollout_iteration):
+                    self._pending_live_state = live
+                    self._live_state_resume_metrics["vdra/live_state_merged"] = 1.0
+                else:
+                    self._live_state_resume_metrics[
+                        "vdra/live_state_stale_rollout"
+                    ] = 1.0
             elif int(live.global_step) > int(state.global_step):
                 self._live_state_resume_metrics[
                     "vdra/live_state_ahead_of_checkpoint"

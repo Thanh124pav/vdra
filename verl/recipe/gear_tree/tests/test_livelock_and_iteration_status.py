@@ -394,7 +394,79 @@ class TestManifestResumeLifecycle:
         with pytest.raises(FileNotFoundError, match="VDRA_CHECKPOINT_COMPLETE"):
             trainer._validate_vdra_checkpoint_bundle_for_resume(ckpt)
 
+    def _bundle_trainer(self, tmp_path, monkeypatch):
+        from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
+        trainer = _trainer(tmp_path)
+        trainer.replay_buffer = trainer._new_replay_buffer()
+        trainer.run_manifest = trainer._build_run_manifest()
+        monkeypatch.setattr(RayPPOTrainer, "_save_checkpoint", lambda self: None)
+        return trainer
+
+    def test_old_checkpoint_marker_is_removed_before_overwrite(self, tmp_path, monkeypatch):
+        from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
+        trainer = _trainer(tmp_path)
+        trainer.replay_buffer = trainer._new_replay_buffer()
+        trainer.run_manifest = trainer._build_run_manifest()
+        ckpt = tmp_path / "global_step_0"
+        ckpt.mkdir()
+        marker = trainer._checkpoint_complete_marker_path(ckpt)
+        marker.write_text("old\n", encoding="utf-8")
+
+        def _base_save(self):
+            assert not marker.exists()
+
+        monkeypatch.setattr(RayPPOTrainer, "_save_checkpoint", _base_save)
+        trainer._save_vdra_checkpoint_bundle()
+        assert marker.exists()
+
+    def test_failure_while_saving_trainer_state_leaves_no_marker(self, tmp_path, monkeypatch):
+        import recipe.gear_tree.gear_ray_trainer as trainer_mod
+
+        trainer = self._bundle_trainer(tmp_path, monkeypatch)
+        marker = trainer._checkpoint_complete_marker_path(tmp_path / "global_step_0")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("old\n", encoding="utf-8")
+
+        def _boom(*_args, **_kwargs):
+            raise OSError("state write failed")
+
+        monkeypatch.setattr(trainer_mod, "save_trainer_state", _boom)
+        with pytest.raises(OSError, match="state write failed"):
+            trainer._save_vdra_checkpoint_bundle()
+        assert not marker.exists()
+
+    def test_failure_while_saving_manifest_leaves_no_marker(self, tmp_path, monkeypatch):
+        trainer = self._bundle_trainer(tmp_path, monkeypatch)
+        marker = trainer._checkpoint_complete_marker_path(tmp_path / "global_step_0")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("old\n", encoding="utf-8")
+
+        def _boom(*_args, **_kwargs):
+            raise OSError("manifest write failed")
+
+        monkeypatch.setattr(trainer, "_save_manifest", _boom)
+        with pytest.raises(OSError, match="manifest write failed"):
+            trainer._save_vdra_checkpoint_bundle()
+        assert not marker.exists()
+
+    def test_failure_while_saving_replay_leaves_no_marker(self, tmp_path, monkeypatch):
+        trainer = self._bundle_trainer(tmp_path, monkeypatch)
+        marker = trainer._checkpoint_complete_marker_path(tmp_path / "global_step_0")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("old\n", encoding="utf-8")
+
+        def _boom(*_args, **_kwargs):
+            raise OSError("replay write failed")
+
+        monkeypatch.setattr(trainer, "_write_replay_buffer_checkpoint", _boom)
+        with pytest.raises(OSError, match="replay write failed"):
+            trainer._save_vdra_checkpoint_bundle()
+        assert not marker.exists()
+
     def test_checkpoint_completion_marker_is_written_last(self, tmp_path, monkeypatch):
+        import recipe.gear_tree.gear_ray_trainer as trainer_mod
         from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
         trainer = _trainer(tmp_path)
@@ -403,6 +475,11 @@ class TestManifestResumeLifecycle:
         events = []
         monkeypatch.setattr(
             RayPPOTrainer, "_save_checkpoint", lambda self: events.append("base")
+        )
+        monkeypatch.setattr(
+            trainer_mod,
+            "save_trainer_state",
+            lambda *_args, **_kwargs: events.append("state"),
         )
         monkeypatch.setattr(
             trainer, "_save_manifest", lambda *_args, **_kwargs: events.append("manifest")
@@ -418,7 +495,7 @@ class TestManifestResumeLifecycle:
             lambda _ckpt: events.append("marker"),
         )
         trainer._save_vdra_checkpoint_bundle()
-        assert events == ["base", "manifest", "replay", "marker"]
+        assert events == ["base", "state", "manifest", "replay", "marker"]
 
 
 class TestLivelockGuards:
@@ -857,9 +934,11 @@ class TestLiveStateResume:
         monkeypatch,
         *,
         checkpoint_global_step=0,
+        checkpoint_rollout=0,
         live_global_step=0,
         live_rollout=50,
         live_fields=None,
+        manifest_fields=None,
     ):
         from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
@@ -870,12 +949,16 @@ class TestLiveStateResume:
         )
         trainer.config.trainer.default_hdfs_dir = None
         trainer.global_steps = checkpoint_global_step
+        trainer.rollout_iteration = checkpoint_rollout
         trainer.replay_buffer = trainer._new_replay_buffer()
         ckpt = tmp_path / f"global_step_{checkpoint_global_step}"
         manifest = trainer._build_run_manifest()
         manifest.global_step = checkpoint_global_step
-        manifest.rollout_iteration = 0
+        manifest.rollout_iteration = checkpoint_rollout
         manifest.num_optimizer_steps_total = 0
+        if manifest_fields:
+            for key, value in manifest_fields.items():
+                setattr(manifest, key, value)
         _write_checkpoint_bundle(trainer, ckpt, manifest=manifest)
         payload = dict(
             global_step=live_global_step,
@@ -894,13 +977,26 @@ class TestLiveStateResume:
         monkeypatch.setattr(RayPPOTrainer, "_load_checkpoint", lambda self: 0)
         return trainer
 
-    def test_global_step_zero_live_state_preserves_nonprogress_after_restart(self, tmp_path, monkeypatch):
+    def test_same_global_step_newer_rollout_live_state_is_merged(self, tmp_path, monkeypatch):
         trainer = self._prep_resume(tmp_path, monkeypatch)
         trainer._load_checkpoint()
         trainer.run_manifest = trainer._load_or_build_run_manifest()
         trainer._merge_pending_live_state()
         assert trainer.global_steps == 0
         assert trainer.rollout_iteration == 50
+        assert trainer.consecutive_nonprogress_iterations == 49
+        assert trainer.postponed_updates == 7
+        assert trainer.run_manifest.last_iteration_status == ITERATION_STATUS_POSTPONED
+        assert trainer._live_state_resume_metrics["vdra/live_state_merged"] == 1.0
+
+    def test_same_global_step_equal_rollout_live_state_is_merged(self, tmp_path, monkeypatch):
+        trainer = self._prep_resume(
+            tmp_path, monkeypatch, checkpoint_rollout=7, live_rollout=7
+        )
+        trainer._load_checkpoint()
+        trainer.run_manifest = trainer._load_or_build_run_manifest()
+        trainer._merge_pending_live_state()
+        assert trainer.rollout_iteration == 7
         assert trainer.consecutive_nonprogress_iterations == 49
         assert trainer.postponed_updates == 7
         assert trainer.run_manifest.last_iteration_status == ITERATION_STATUS_POSTPONED
@@ -936,6 +1032,73 @@ class TestLiveStateResume:
         assert trainer.consecutive_nonprogress_iterations == 0
         assert trainer.postponed_updates == 0
         assert trainer._live_state_resume_metrics["vdra/live_state_stale"] == 1.0
+
+    def test_same_global_step_older_rollout_live_state_is_ignored(self, tmp_path, monkeypatch):
+        trainer = self._prep_resume(
+            tmp_path,
+            monkeypatch,
+            checkpoint_rollout=10,
+            live_rollout=9,
+        )
+        trainer._load_checkpoint()
+        trainer.run_manifest = trainer._load_or_build_run_manifest()
+        trainer._merge_pending_live_state()
+        assert trainer.rollout_iteration == 10
+        assert trainer.consecutive_nonprogress_iterations == 0
+        assert trainer.postponed_updates == 0
+        assert (
+            trainer._live_state_resume_metrics["vdra/live_state_stale_rollout"]
+            == 1.0
+        )
+
+    def test_older_rollout_live_state_does_not_reduce_replay_age(self, tmp_path, monkeypatch):
+        trainer = self._prep_resume(
+            tmp_path,
+            monkeypatch,
+            checkpoint_rollout=10,
+            live_rollout=9,
+        )
+        trainer.replay_buffer.add(
+            [_trainable_edge("age")],
+            generation_rollout_iteration=8,
+            policy_snapshot_id="snap",
+        )
+        trainer._load_checkpoint()
+        trainer.run_manifest = trainer._load_or_build_run_manifest()
+        trainer._merge_pending_live_state()
+        ages = [
+            trainer.rollout_iteration - int(edge["generation_rollout_iteration"])
+            for edge in trainer.replay_buffer.edges()
+        ]
+        assert ages == [10]
+        assert all(age >= 0 for age in ages)
+
+    def test_older_rollout_live_state_does_not_overwrite_manifest_status(self, tmp_path, monkeypatch):
+        trainer = self._prep_resume(
+            tmp_path,
+            monkeypatch,
+            checkpoint_rollout=10,
+            live_rollout=9,
+            manifest_fields={"last_iteration_status": ITERATION_STATUS_UPDATED},
+        )
+        trainer._load_checkpoint()
+        trainer.run_manifest = trainer._load_or_build_run_manifest()
+        trainer._merge_pending_live_state()
+        assert trainer.run_manifest.last_iteration_status == ITERATION_STATUS_UPDATED
+
+    def test_older_rollout_live_state_does_not_overwrite_failure_counters(self, tmp_path, monkeypatch):
+        trainer = self._prep_resume(
+            tmp_path,
+            monkeypatch,
+            checkpoint_rollout=10,
+            live_rollout=9,
+            live_fields={"group_integrity_failures": 1},
+            manifest_fields={"group_integrity_failures": 3},
+        )
+        trainer._load_checkpoint()
+        trainer.run_manifest = trainer._load_or_build_run_manifest()
+        trainer._merge_pending_live_state()
+        assert trainer.run_manifest.group_integrity_failures == 3
 
     def test_live_state_merges_post_checkpoint_failure_provenance(self, tmp_path, monkeypatch):
         trainer = self._prep_resume(
