@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 import numpy as np
+import torch
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -103,6 +104,12 @@ class RayGearTreeTrainer(RayPPOTrainer):
             "replay_sampling_unit": raw.get("replay_sampling_unit", "edge"),
             "underfill_policy": raw.get("underfill_policy", "use_available"),
             "sampling_seed": raw.get("sampling_seed", 0),
+            # PLAN.md §13: false (default) = fail fast on a replay
+            # objective-mask mismatch; true = DISCARD the incompatible rows
+            # and restart replay collection under the new objective.
+            "reset_replay_on_objective_mismatch": bool(
+                raw.get("reset_replay_on_objective_mismatch", False)
+            ),
             "checkpoint": raw.get("checkpoint", True),
             "underfilled_update_policy": raw.get(
                 "underfilled_update_policy", "postpone_until_divisible"
@@ -719,15 +726,11 @@ class RayGearTreeTrainer(RayPPOTrainer):
         # canonical sparse path the expectation counts only TRAINABLE logical
         # batches — a batch skipped for all_zero_advantage or zero_active_tokens
         # must NOT mark a valid mixed update as accounting-invalid.
-        ppo_mini = int(
-            self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size", 1)
-        )
-        ppo_epochs = int(
-            self.config.actor_rollout_ref.actor.get("ppo_epochs", 1)
-        )
-        expected = getattr(self, "_expected_optimizer_steps", None)
+        expected = self._resolve_expected_optimizer_steps(int(selected_edges))
         if expected is None:
-            expected = (int(selected_edges) // max(ppo_mini, 1)) * max(ppo_epochs, 1)
+            # No well-defined expectation (legacy path, indivisible count):
+            # leave the diagnostic untouched rather than inventing one.
+            return
         expected = int(expected)
         m.expected_optimizer_steps_last_iteration = expected
         m.optimizer_step_accounting_valid = int(actual_optimizer_steps) == expected
@@ -975,29 +978,47 @@ class RayGearTreeTrainer(RayPPOTrainer):
         if not metrics_parse_ok:
             self.run_manifest.optimizer_step_accounting_valid = False
             return
+        # PLAN.md §8: ONE authoritative expectation. On the canonical sparse
+        # path it counts only TRAINABLE logical batches (a batch skipped for
+        # all_zero_advantage or zero_active_tokens legitimately performs no
+        # optimizer step); the selected-slot formula would over-count and mark
+        # a valid mixed update as an accounting mismatch.
+        expected_steps = self._resolve_expected_optimizer_steps(len(sampled_edges))
+        if expected_steps is None:
+            return
+        metrics["training/expected_optimizer_steps"] = float(expected_steps)
+        if int(n_optim_steps) != expected_steps:
+            self.run_manifest.optimizer_step_accounting_valid = False
+            metrics["vdra/optimizer_step_accounting_mismatch"] = 1.0
+            _LOGGER.warning(
+                "actor performed %d optimizer steps but %d were expected "
+                "(trainable logical batches x ppo_epochs); marking "
+                "optimizer-step accounting invalid (diagnostic).",
+                int(n_optim_steps),
+                expected_steps,
+            )
+
+    def _resolve_expected_optimizer_steps(self, selected_count: int):
+        """Authoritative expected internal optimizer-step count (PLAN.md §8).
+
+        Canonical sparse path: ``trainable_logical_batches * ppo_epochs``,
+        stamped by ``_edges_to_update_batch`` from the logical-batch statuses.
+        Non-canonical paths keep the legacy selected-slot formula, which can
+        never override the canonical value. Returns ``None`` when no
+        expectation is well defined (legacy path with an indivisible count).
+        """
+        canonical = getattr(self, "_expected_optimizer_steps", None)
+        if canonical is not None:
+            return int(canonical)
         ppo_mini = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
         ppo_epochs = int(self.config.actor_rollout_ref.actor.get("ppo_epochs", 1))
-        if len(sampled_edges) % ppo_mini == 0:
-            expected_steps = expected_optimizer_steps(
-                selected_count=len(sampled_edges),
-                ppo_mini_batch_size=ppo_mini,
-                ppo_epochs=ppo_epochs,
-            )
-            metrics["training/optimizer_steps_expected"] = float(expected_steps)
-            if int(n_optim_steps) != expected_steps:
-                self.run_manifest.optimizer_step_accounting_valid = False
-                metrics["vdra/optimizer_step_accounting_mismatch"] = 1.0
-                _LOGGER.warning(
-                    "actor performed %d optimizer steps but %d were expected "
-                    "for %d selected edges / ppo_mini_batch_size=%d, "
-                    "ppo_epochs=%d; marking optimizer-step accounting invalid "
-                    "(diagnostic).",
-                    int(n_optim_steps),
-                    expected_steps,
-                    len(sampled_edges),
-                    ppo_mini,
-                    ppo_epochs,
-                )
+        if int(selected_count) % max(ppo_mini, 1) != 0:
+            return None
+        return expected_optimizer_steps(
+            selected_count=int(selected_count),
+            ppo_mini_batch_size=ppo_mini,
+            ppo_epochs=ppo_epochs,
+        )
 
     def fit(self):
         from omegaconf import OmegaConf
@@ -1070,6 +1091,10 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 # postponed / failed iterations do not carry the previous
                 # iteration's count forward.
                 self.optimizer_steps_this_iteration = 0
+                # PLAN.md §8: the canonical expectation is stamped freshly by
+                # _edges_to_update_batch each iteration; clear it so a stale
+                # value can never be attributed to a later update.
+                self._expected_optimizer_steps = None
                 # PLAN.md P0.E: pre-update value for threshold crossing and
                 # unambiguous before/after logging.
                 global_step_before_update = int(self.global_steps)
@@ -1177,7 +1202,22 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     sample_stats,
                     metrics,
                 )
-                response_tokens = edge_batch.batch["response_mask"].sum().item()
+                # PLAN.md §5/§9: dummy rows are collective-safety padding and
+                # count in NO objective, replay, or diagnostic metric. Report
+                # the REAL (non-dummy) row and token counts explicitly.
+                _is_dummy = edge_batch.batch.get("is_dummy")
+                if _is_dummy is None:
+                    real_row_mask = torch.ones(
+                        len(edge_batch), dtype=torch.bool
+                    )
+                    dummy_rows = 0
+                else:
+                    real_row_mask = ~_is_dummy.bool()
+                    dummy_rows = int(_is_dummy.sum())
+                trainable_tensor_rows = int(real_row_mask.sum())
+                real_response_tokens = int(
+                    edge_batch.batch["response_mask"][real_row_mask].sum()
+                )
                 # PLAN.md P0.2: age uses rollout_iteration (never global_step).
                 ages = [
                     self.rollout_iteration
@@ -1192,10 +1232,10 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     for edge in sampled_edges
                 ]
                 cum_train += t_gen + t_update
-                expected_optim_steps = int(
+                # PLAN.md §8: the SAME authoritative expectation the manifest
+                # uses — never the selected-slot formula on the sparse path.
+                expected_optim_steps = self._resolve_expected_optimizer_steps(
                     len(sampled_edges)
-                    // int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
-                    * int(self.config.actor_rollout_ref.actor.get("ppo_epochs", 1))
                 )
                 timing = {
                     "step": self.global_steps,
@@ -1205,8 +1245,16 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     "timing/train_total_seconds": t_gen + t_update,
                     "timing/cumulative_train_seconds": cum_train,
                     "timing/wall_seconds": time.time() - loop_start,
-                    "train/num_edges": float(len(edge_batch)),
-                    "train/num_response_tokens": float(response_tokens),
+                    # PLAN.md §5: explicit, dummy-free accounting. The tensor
+                    # batch includes dummy padding and EXCLUDES zero logical
+                    # slots, so its raw length is not an edge count.
+                    "train/logical_slots": float(len(sampled_edges)),
+                    "train/trainable_tensor_rows": float(trainable_tensor_rows),
+                    "train/dummy_rows": float(dummy_rows),
+                    "train/real_response_tokens": float(real_response_tokens),
+                    # Legacy key, explicitly labeled as the raw tensor-row
+                    # count (dummy rows included) for dashboard continuity.
+                    "train/tensor_rows_including_dummy": float(len(edge_batch)),
                     "train/unique_questions": float(len({edge.get("question_id") for edge in sampled_edges})),
                     "train/mean_edge_age": float(sum(ages) / len(ages) if ages else 0.0),
                     "train/max_edge_age": float(max(ages) if ages else 0),
@@ -1225,8 +1273,19 @@ class RayGearTreeTrainer(RayPPOTrainer):
                         self.num_optimizer_steps_total
                     ),
                     "training/selected_edges_this_iteration": float(len(sampled_edges)),
-                    "training/expected_optimizer_steps_from_selected_edges": float(
+                    # PLAN.md §8: expected steps no longer depend only on the
+                    # selected slot count — skipped logical batches perform no
+                    # optimizer step.
+                    "training/expected_optimizer_steps": float(
                         expected_optim_steps
+                        if expected_optim_steps is not None
+                        else -1
+                    ),
+                    "vdra/all_zero_advantage_logical_batches": float(
+                        metrics.get("vdra/all_zero_advantage_logical_batches", 0.0)
+                    ),
+                    "vdra/zero_active_token_logical_batches": float(
+                        metrics.get("vdra/zero_active_token_logical_batches", 0.0)
                     ),
                     "training/successful_actor_updates": float(self.successful_actor_updates),
                     "training/postponed_updates": float(self.postponed_updates),

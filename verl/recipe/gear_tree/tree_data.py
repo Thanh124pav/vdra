@@ -87,7 +87,11 @@ def group_tensors_for_edges(edges: Sequence[Dict[str, Any]]) -> Dict[str, torch.
 
 
 def compute_segment_objective_weights(edges: Sequence[Dict[str, Any]]) -> List[float]:
-    """PLAN.md P0.4: precompute the segment-average weight for every row.
+    """Precompute the TREE-BALANCED weight for every row (PLAN.md P0.4).
+
+    This is the ``tree_balanced_segment_mean`` ABLATION weight, NOT a
+    canonical objective: ``segment_mean`` / ``token_mean`` use the
+    trainer-stamped logical denominators ``M_B`` / ``T_B`` instead.
 
     For every retained segment ``s`` in tree ``T`` in a batch of ``N_T`` trees::
 
@@ -1170,9 +1174,10 @@ def _right_pad(ids: Sequence[int], length: int, pad_id: int) -> List[int]:
 
 
 # PLAN.md P0.C: loss modes whose actor loss consumes precomputed float
-# objective-weight tensors. The canonical ``vdra_segment_mean_ppo`` path uses
-# the segment objective 1/(N_T * N_seg(T)); node-balanced weights are only for
-# the explicit ablation below.
+# objective-weight tensors. The canonical ``vdra_segment_mean_ppo`` path
+# (segment_mean / token_mean) needs NONE: it uses the trainer-stamped logical
+# batch denominators M_B / T_B. Node-balanced weights are only for the
+# explicit ablation below.
 _LOSS_MODES_WITH_OBJECTIVE_WEIGHTS = ("vdra_node_balanced_ppo",)
 
 
@@ -1194,13 +1199,15 @@ def edges_to_dataproto(
     Non-tensor fields: ``uid`` (per source question, for grouping/logging),
     ``question_id``, ``reward_model``, ``extra_info``.
 
-    PLAN.md P0.C: ``loss_mode`` selects which float weight tensors are
-    attached. The canonical ``vdra_segment_mean_ppo`` mode attaches NO
-    ``objective_weights`` / ``segment_objective_weights`` here: its actor
-    loss computes the segment objective 1/(N_T * N_seg(T)) directly from the
-    row metadata. Only the explicit ``vdra_node_balanced_ppo`` ablation still
-    receives its precomputed weights. Integer group/identity tensors are
-    attached unconditionally for diagnostics and validation.
+    PLAN.md P0.C/§1.3: ``loss_mode`` selects which float weight tensors are
+    attached. The canonical ``vdra_segment_mean_ppo`` path attaches NO
+    tree-balanced objective weights: ``segment_mean`` / ``token_mean`` use
+    the trainer-stamped logical batch denominators ``M_B`` / ``T_B``. The
+    formula ``1/(N_T * N_seg(T))`` belongs only to the
+    ``tree_balanced_segment_mean`` ablation. Only the explicit
+    ``vdra_node_balanced_ppo`` ablation still receives its precomputed
+    weights. Integer group/identity tensors are attached unconditionally for
+    diagnostics and validation.
     """
     if not edges:
         raise ValueError("edges_to_dataproto received an empty edge list")
@@ -1417,6 +1424,20 @@ def build_logical_update_batch(
                 f"{slot.get('edge_id')!r}."
             )
         resp = int(raw_resp)
+        # PLAN.md §4: second line of defence for direct/test callers that
+        # bypass replay insertion — a stamped count from another threshold
+        # must never be consumed under this one.
+        raw_thr = slot.get("probability_mask_threshold")
+        if raw_thr is not None and abs(
+            float(raw_thr) - float(probability_mask_threshold)
+        ) > 1e-12:
+            raise ValueError(
+                f"logical record {slot.get('edge_id')!r} stamps "
+                f"probability_mask_threshold={float(raw_thr)} but this batch "
+                f"is being built with {float(probability_mask_threshold)}; "
+                "its prob_mask_token_count was computed under a different "
+                "objective and must not be reused (PLAN.md §4)."
+            )
         raw_mask = slot.get("prob_mask_token_count")
         if raw_mask is None and not is_ledger_slot(slot):
             # A trainable row still carries its log-probs, so the count is

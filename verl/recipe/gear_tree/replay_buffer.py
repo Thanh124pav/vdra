@@ -32,12 +32,25 @@ _REQUIRED_EDGE_FIELDS = (
     "reward",
 )
 
-# PLAN.md §13: logical-slot schema version. Bumped to 2 when zero slots
-# gained the probability-mask metadata (prob_mask_token_count +
-# probability_mask_threshold) required by masked token_mean; a version-1
-# replay cannot serve a masked run because its zero slots' log-prob payload
-# was intentionally discarded and the count cannot be recomputed.
-LOGICAL_SLOT_SCHEMA_VERSION = 2
+# PLAN.md §7/§13: TWO independent schema versions with explicit names.
+#
+#   REPLAY_ENVELOPE_SCHEMA_VERSION — the checkpoint envelope (meta file
+#       layout + field names). Unchanged by the objective work.
+#   LOGICAL_RECORD_SCHEMA_VERSION  — the per-record logical-slot layout.
+#       Version 2 added the probability-mask metadata
+#       (``prob_mask_token_count`` + ``probability_mask_threshold``) that
+#       masked ``token_mean`` needs. A version-1 replay cannot serve a masked
+#       run: its zero slots' log-prob payload was intentionally discarded, so
+#       the active-token count can never be recomputed.
+#
+# Checkpoints are written with BOTH the new names and the historical keys
+# (``schema_version`` / ``logical_slot_schema_version``), and reading accepts
+# either, so old checkpoints stay readable under the §13 compatibility rules.
+REPLAY_ENVELOPE_SCHEMA_VERSION = 1
+LOGICAL_RECORD_SCHEMA_VERSION = 2
+
+# Historical alias kept so existing importers keep working.
+LOGICAL_SLOT_SCHEMA_VERSION = LOGICAL_RECORD_SCHEMA_VERSION
 
 # PLAN.md §1.2 (2026-07-21): a metadata-only logical slot for an exact-zero
 # advantage segment. It has no trainable payload but MUST carry enough
@@ -438,6 +451,12 @@ class GearTreeReplayBuffer:
                     "duplicate edge_ids indicate the rollout did not assign a "
                     "unique tree_instance_id (PLAN.md P0.3)."
                 )
+            # PLAN.md §4: the record's active-token count was computed under
+            # the threshold stamped on it. Consuming it under a different
+            # threshold would silently mix objectives, and a zero slot's count
+            # can never be recomputed. Validate at INSERTION, not only at
+            # checkpoint restore.
+            self._validate_record_mask_identity(record)
             seen_ids.add(edge_id)
             prepared.append(record)
         # All-or-nothing commit.
@@ -821,12 +840,16 @@ class GearTreeReplayBuffer:
         tmp_meta.write_text(
             json.dumps(
                 {
+                    # PLAN.md §7: explicit names, plus the historical keys for
+                    # readers that predate the rename.
+                    "replay_envelope_schema_version": REPLAY_ENVELOPE_SCHEMA_VERSION,
+                    "logical_record_schema_version": LOGICAL_RECORD_SCHEMA_VERSION,
                     "schema_version": self.schema_version,
                     # PLAN.md §13: the objective-mask identity the stored zero
                     # slots' active-token counts were computed under. A zero
                     # slot's old-log-prob payload is gone, so those counts can
                     # NEVER be recomputed for a different threshold.
-                    "logical_slot_schema_version": LOGICAL_SLOT_SCHEMA_VERSION,
+                    "logical_slot_schema_version": LOGICAL_RECORD_SCHEMA_VERSION,
                     "use_prob_mask": self.use_prob_mask,
                     "probability_mask_threshold": self.probability_mask_threshold,
                     # PLAN.md P0.2 canonical names.
@@ -889,7 +912,13 @@ class GearTreeReplayBuffer:
         meta = json.loads((source / "gear_tree_replay_buffer_meta.json").read_text(encoding="utf-8"))
         saved_mask = meta.get("use_prob_mask")
         saved_threshold = meta.get("probability_mask_threshold")
-        saved_slot_schema = int(meta.get("logical_slot_schema_version", 1))
+        # PLAN.md §7: prefer the explicit name; fall back to the historical key.
+        saved_slot_schema = int(
+            meta.get(
+                "logical_record_schema_version",
+                meta.get("logical_slot_schema_version", 1),
+            )
+        )
         objective_mismatch: Optional[str] = None
         if expected_use_prob_mask is not None:
             if saved_mask is None or saved_threshold is None:
@@ -978,6 +1007,28 @@ class GearTreeReplayBuffer:
                 buffer._validate_edge(edge)
                 buffer._edges[str(edge["edge_id"])] = edge
         return buffer
+
+    def _validate_record_mask_identity(self, record: Mapping[str, Any]) -> None:
+        """PLAN.md §4: a record's stamped threshold must match this buffer's.
+
+        Both values originate from the same resolved config and are
+        serialized directly, so exact float equality is the right comparison;
+        a tiny tolerance is applied only to absorb JSON round-trip noise.
+        """
+        raw = record.get("probability_mask_threshold")
+        if raw is None:
+            # Records predating the mask metadata carry no verifiable count;
+            # only slots (whose count cannot be recomputed) are required to
+            # stamp it — that is enforced by _validate_edge.
+            return
+        if abs(float(raw) - float(self.probability_mask_threshold)) > 1e-12:
+            raise ValueError(
+                f"replay record {record.get('edge_id')!r} stamps "
+                f"probability_mask_threshold={float(raw)} but this run uses "
+                f"{float(self.probability_mask_threshold)}; its "
+                "prob_mask_token_count was computed under a different "
+                "objective and must not be reused (PLAN.md §4)."
+            )
 
     @staticmethod
     def _validate_edge(edge: MutableMapping[str, Any]) -> None:

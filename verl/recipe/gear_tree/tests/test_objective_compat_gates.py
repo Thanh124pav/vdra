@@ -280,3 +280,142 @@ class TestReplayObjectiveCompat:
             buf.add(
                 [bad], generation_rollout_iteration=0, policy_snapshot_id="snap"
             )
+
+    def test_schema_versions_round_trip_under_both_key_names(self, tmp_path):
+        """Required test 12 / PLAN.md §7: the explicit names are written and
+        the historical keys stay readable."""
+        from recipe.gear_tree.replay_buffer import (
+            LOGICAL_RECORD_SCHEMA_VERSION,
+            REPLAY_ENVELOPE_SCHEMA_VERSION,
+        )
+
+        _saved_buffer(tmp_path, use_prob_mask=True, threshold=0.9)
+        meta = json.loads(
+            (tmp_path / "gear_tree_replay_buffer_meta.json").read_text()
+        )
+        assert meta["replay_envelope_schema_version"] == REPLAY_ENVELOPE_SCHEMA_VERSION
+        assert meta["logical_record_schema_version"] == LOGICAL_RECORD_SCHEMA_VERSION
+        # Historical keys still present for older readers.
+        assert meta["schema_version"] == REPLAY_ENVELOPE_SCHEMA_VERSION
+        assert meta["logical_slot_schema_version"] == LOGICAL_RECORD_SCHEMA_VERSION
+        restored = GearTreeReplayBuffer.load(
+            tmp_path,
+            expected_use_prob_mask=True,
+            expected_probability_mask_threshold=0.9,
+        )
+        assert len(restored) == 1
+
+    def test_only_the_historical_key_still_reads(self, tmp_path):
+        """A checkpoint written before the rename must remain loadable."""
+        _saved_buffer(tmp_path, use_prob_mask=True, threshold=0.9)
+        meta_path = tmp_path / "gear_tree_replay_buffer_meta.json"
+        meta = json.loads(meta_path.read_text())
+        meta.pop("logical_record_schema_version")
+        meta.pop("replay_envelope_schema_version")
+        meta_path.write_text(json.dumps(meta))
+        restored = GearTreeReplayBuffer.load(
+            tmp_path,
+            expected_use_prob_mask=True,
+            expected_probability_mask_threshold=0.9,
+        )
+        assert len(restored) == 1
+
+
+class TestPerRecordThresholdIdentity:
+    """PLAN.md §4 required tests 9-10: a record stamped under one threshold
+    must never be consumed under another — checked at LIVE insertion and
+    again at logical-batch construction (for callers that bypass replay)."""
+
+    def _buffer(self, threshold=0.9):
+        return GearTreeReplayBuffer(
+            target_edges_per_iteration=8,
+            max_edge_age_iterations=4,
+            max_edges_per_question_per_iteration=8,
+            use_prob_mask=True,
+            probability_mask_threshold=threshold,
+        )
+
+    def test_matching_threshold_is_accepted(self):
+        buf = self._buffer(0.9)
+        buf.add(
+            [_slot("z0", threshold=0.9)],
+            generation_rollout_iteration=0,
+            policy_snapshot_id="snap",
+        )
+        assert len(buf) == 1
+
+    def test_zero_slot_threshold_mismatch_rejected_on_insert(self):
+        """Required test 9 (slot)."""
+        buf = self._buffer(0.9)
+        with pytest.raises(ValueError, match="different objective"):
+            buf.add(
+                [_slot("z0", threshold=0.75)],
+                generation_rollout_iteration=0,
+                policy_snapshot_id="snap",
+            )
+
+    def test_trainable_edge_threshold_mismatch_rejected_on_insert(self):
+        """Required test 9 (trainable edge)."""
+        buf = self._buffer(0.9)
+        edge = {
+            "edge_id": "e0",
+            "question_id": "q0",
+            "tree_id": "t0",
+            "parent_group_id": "t0/pg",
+            "query_token_ids": [1, 2],
+            "response_token_ids": [3, 4],
+            "actor_shifted_log_probs": [-0.2, -0.2],
+            "advantage": 0.5,
+            "value": 0.4,
+            "reward": 1.0,
+            "response_token_count": 2,
+            "prob_mask_token_count": 2,
+            "probability_mask_threshold": 0.75,  # built under another run
+        }
+        with pytest.raises(ValueError, match="different objective"):
+            buf.add(
+                [edge], generation_rollout_iteration=0, policy_snapshot_id="snap"
+            )
+
+    def test_build_logical_update_batch_rejects_a_mismatch(self):
+        """Required test 10: the second line of defence for direct callers."""
+        from recipe.gear_tree.tree_data import build_logical_update_batch
+
+        try:
+            from recipe.gear_tree.tests import _tiny_actor
+        except ImportError:
+            import _tiny_actor
+
+        edge = {
+            "edge_id": "t0/e0",
+            "tree_id": "t0",
+            "parent_group_id": "t0/pg",
+            "child_segment_id": "t0/e0",
+            "question_id": "q0",
+            "allocated_k": 2,
+            "sample_multiplicity": 1,
+            "tree_total_segment_count": 2,
+            "queue_flush_id": "0",
+            "queue_released_segment_count": 2,
+            "query_token_ids": [1, 2],
+            "response_token_ids": [3, 4],
+            "actor_shifted_log_probs": [-0.2, -0.2],
+            "advantage": 0.5,
+            "value": 0.4,
+            "reward": 1.0,
+            "response_token_count": 2,
+            "prob_mask_token_count": 2,
+            "probability_mask_threshold": 0.75,  # stamped under another run
+        }
+        with pytest.raises(ValueError, match="different objective"):
+            build_logical_update_batch(
+                [edge, _slot("z0", threshold=0.75)],
+                _tiny_actor.Tok(),
+                max_prompt_length=6,
+                max_response_length=4,
+                ppo_mini_batch_size=2,
+                dp_size=1,
+                loss_mode="vdra_segment_mean_ppo",
+                use_prob_mask=True,
+                probability_mask_threshold=0.9,
+            )

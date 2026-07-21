@@ -555,11 +555,12 @@ class DataParallelPPOActor(BasePPOActor):
         # PLAN.md P0.3: count actual optimizer.step() calls so the trainer can
         # advance ``global_step`` by the correct amount for this update.
         num_optimizer_steps = 0
-        # The original selected-slot count for this optimizer batch feeds the
-        # labeled batch-slot ablation loss (N_B); the canonical VDRA loss uses
-        # the original batch's unique-tree count (N_T) instead. Both are fixed
-        # per mini_batch BEFORE micro/dynamic splitting so microbatch splits
-        # preserve the loss weights w_s = 1 / (N_T * N_seg(T)).
+        # Per-mini-batch counts fixed BEFORE micro/dynamic splitting so a
+        # microbatch split can never shrink a denominator. The CANONICAL
+        # segment_mean / token_mean paths use the trainer-stamped logical
+        # denominators M_B / T_B (see logical_denominators above); the
+        # unique-tree count N_T below feeds the tree_balanced_segment_mean
+        # ABLATION (w_s = 1 / (N_T * N_seg(T))) only.
         original_optimizer_batch_slot_count = len(mini_batches[0]) if mini_batches else 0
         original_optimizer_batch_tree_count = None
         logical_segment_count = None

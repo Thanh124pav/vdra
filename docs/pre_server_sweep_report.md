@@ -91,6 +91,26 @@ MODEL_PATH=<small hf model> TRAIN=<train.parquet> VAL=<val.parquet> \
   STEPS=5 bash verl/recipe/gear_tree/run_smoke_matrix.sh smoke_d
 ```
 
-Report the counters above per iteration; a failure that is not in the
-"server GPU smoke" list above should be treated as a regression to fix
-before the paper run.
+### Required smoke report fields (per iteration)
+
+```text
+rollout_iteration
+global_step
+scheduler / LR step count
+num_optimizer_steps_total
+training/expected_optimizer_steps
+train/logical_slots
+train/trainable_tensor_rows
+train/dummy_rows
+train/real_response_tokens
+vdra/all_zero_advantage_logical_batches
+vdra/zero_active_token_logical_batches
+vdra/skipped_zero_gradient_updates
+vdra/prob_mask_active_token_fraction
+train/mean_edge_age, train/max_edge_age
+RunManifest.is_valid_main_run() verdict
+```
+
+A failure that is not in the "server GPU smoke" list above should be
+treated as a regression to fix before the paper run. GPU/vLLM results must
+be reported from the actual run — CPU tests never establish them.

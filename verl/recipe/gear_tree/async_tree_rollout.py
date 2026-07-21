@@ -221,6 +221,10 @@ async def build_tree_edges_async(
     treerl_gamma: float = 0.9,
     only_adv_greater_than_zero: bool = False,
     emit_zero_slots: bool = False,
+    # PLAN.md §1/§2: the AUTHORITATIVE threshold, propagated per request from
+    # actor.policy_loss so extraction-time active-token counting uses exactly
+    # the value the actor loss will mask with.
+    probability_mask_threshold: float = 0.9,
     vineppo_K: int = 0,
     unfinished_penalty: float = 0.0,
     demo_logger: Any = None,
@@ -272,6 +276,7 @@ async def build_tree_edges_async(
         treerl_gamma=treerl_gamma,
         emit_pruned_edges=False,
         emit_zero_slots=emit_zero_slots,
+        probability_mask_threshold=probability_mask_threshold,
         strict_fresh_iid=strict_fresh_iid,
         collect_construction_summaries=collect_construction_summaries,
     )

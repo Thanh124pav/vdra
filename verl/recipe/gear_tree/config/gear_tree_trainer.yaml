@@ -62,6 +62,15 @@ gear_tree:
     sampling_seed: 0
     checkpoint: true
 
+    # PLAN.md §13: what to do when a restored replay was built under a
+    # DIFFERENT objective-mask configuration (use_prob_mask /
+    # probability_mask_threshold). A zero slot's prob_mask_token_count was
+    # computed at extraction and can never be recomputed, because its
+    # old-log-prob payload was intentionally discarded.
+    #   false — fail fast on the mismatch (canonical/default);
+    #   true  — DISCARD the incompatible replay rows and restart collection.
+    reset_replay_on_objective_mismatch: false
+
   # GEAR-VinePPO: K MC rollouts per cut-point for value estimation (0 = off,
   # use SPO/TreeRL/TreePO tree values instead).
   vineppo_K: 0
