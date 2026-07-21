@@ -463,6 +463,27 @@ class TestStartupConsistencyCheck:
         with pytest.raises(ValueError, match="vdra_segment_mean_ppo"):
             validate_policy_loss_consistency(cfg)
 
+
+    def test_deprecated_skip_limit_alias_is_accepted(self):
+        from recipe.gear_tree.config_validation import (
+            validate_policy_loss_consistency,
+        )
+
+        cfg = self._minimal_config("mean", "mean")
+        cfg.gear_tree.max_consecutive_skipped_updates = 7
+        assert validate_policy_loss_consistency(cfg) is None
+
+    def test_conflicting_skip_and_nonprogress_limits_are_rejected(self):
+        from recipe.gear_tree.config_validation import (
+            validate_policy_loss_consistency,
+        )
+
+        cfg = self._minimal_config("mean", "mean")
+        cfg.gear_tree.max_consecutive_nonprogress_iterations = 9
+        cfg.gear_tree.max_consecutive_skipped_updates = 7
+        with pytest.raises(ValueError, match="deprecated alias"):
+            validate_policy_loss_consistency(cfg)
+
     def test_trainer_startup_routes_through_extracted_validator(self):
         # Source guard: the trainer must call the extracted function so the
         # gate and the trainer can never diverge.

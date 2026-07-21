@@ -46,6 +46,8 @@ class TestStateRoundTrip:
             successful_actor_updates=97,
             postponed_updates=2,
             failed_updates=1,
+            skipped_zero_gradient_updates=4,
+            consecutive_nonprogress_iterations=49,
         )
         save_trainer_state(tmp_path, state)
         loaded = load_trainer_state(tmp_path)
@@ -53,6 +55,8 @@ class TestStateRoundTrip:
         assert loaded.global_step == 400
         assert loaded.rollout_iteration == 100
         assert loaded.num_optimizer_steps_total == 400
+        assert loaded.skipped_zero_gradient_updates == 4
+        assert loaded.consecutive_nonprogress_iterations == 49
 
     def test_m1_counter_units_survive_resume(self, tmp_path):
         """PLAN.md M1 completion table: five successful outer updates that
@@ -88,6 +92,30 @@ class TestStateRoundTrip:
         loaded = load_trainer_state(tmp_path)
         assert loaded is not None
         assert loaded.global_step == 12
+
+    def test_legacy_state_missing_new_counters_defaults_to_zero(self, tmp_path):
+        trainer_state_path(tmp_path).write_text(
+            json.dumps({"global_step": 8, "rollout_iteration": 9})
+        )
+        loaded = load_trainer_state(tmp_path)
+        assert loaded is not None
+        assert loaded.global_step == 8
+        assert loaded.rollout_iteration == 9
+        assert loaded.skipped_zero_gradient_updates == 0
+        assert loaded.consecutive_nonprogress_iterations == 0
+
+    def test_resume_preserves_nonprogress_counter(self, tmp_path):
+        save_trainer_state(
+            tmp_path,
+            GearTreeTrainerState(
+                global_step=12,
+                rollout_iteration=50,
+                consecutive_nonprogress_iterations=49,
+            ),
+        )
+        loaded = load_trainer_state(tmp_path)
+        assert loaded is not None
+        assert loaded.consecutive_nonprogress_iterations == 49
 
 
 class TestRestoredReplayAges:

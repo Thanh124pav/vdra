@@ -53,16 +53,19 @@ gear_tree:
   # M_B / T_B denominators; positive and negative advantages are retained.
   only_adv_greater_than_zero: true
 
-  # PLAN.md §2 anti-livelock guards. A fully skipped update consumes a
-  # reservation but performs no optimizer step, so global_step cannot
-  # advance — without these a zero-signal run would never terminate.
+  # PLAN.md §2 anti-livelock guards. A nonprogress iteration is one that
+  # does not advance global_step: zero-signal skip, postponed reservation, or
+  # empty reservation. Without this guard such runs can live-lock.
   #
-  #   max_consecutive_skipped_updates: abort after this many consecutive
-  #       fully skipped reservations. null or <= 0 disables the guard.
+  #   max_consecutive_nonprogress_iterations: abort after this many
+  #       consecutive nonprogress iterations. null or <= 0 disables the guard.
+  #   max_consecutive_skipped_updates: deprecated one-release alias for the
+  #       field above; setting both to different values is rejected.
   #   max_rollout_iterations: stop the run after this many rollout
-  #       iterations even if global_step never reached
-  #       total_training_steps. null or <= 0 disables the guard.
-  max_consecutive_skipped_updates: 50
+  #       iterations even if global_step never reached total_training_steps.
+  #       null or <= 0 disables the guard.
+  max_consecutive_nonprogress_iterations: 50
+  max_consecutive_skipped_updates: null
   max_rollout_iterations: null
 
   replay_buffer:

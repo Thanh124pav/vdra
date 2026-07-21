@@ -33,6 +33,7 @@ from recipe.gear_tree.context_contract import (
 )
 from recipe.gear_tree.replay_buffer import (
     GearTreeReplayBuffer,
+    LOGICAL_SLOT_SCHEMA_VERSION,
     expected_optimizer_steps,
     reserve_replay_edges,
     should_postpone_sampled_update,
@@ -49,6 +50,7 @@ from recipe.gear_tree.run_manifest import (
     ITERATION_STATUS_MIXED_ZERO_SIGNAL_SKIPPED,
     ITERATION_STATUS_NO_SAMPLE,
     ITERATION_STATUS_POSTPONED,
+    ITERATION_STATUS_RUNNING,
     ITERATION_STATUS_UPDATED,
     ITERATION_STATUS_ZERO_ACTIVE_SKIPPED,
     VALID_ITERATION_STATUSES,
@@ -209,6 +211,12 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 ),
                 postponed_updates=int(getattr(self, "postponed_updates", 0)),
                 failed_updates=int(getattr(self, "failed_updates", 0)),
+                skipped_zero_gradient_updates=int(
+                    getattr(self, "skipped_zero_gradient_updates", 0)
+                ),
+                consecutive_nonprogress_iterations=int(
+                    getattr(self, "consecutive_nonprogress_iterations", 0)
+                ),
             ),
         )
 
@@ -251,6 +259,16 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 )
                 self.postponed_updates = int(state.postponed_updates)
                 self.failed_updates = int(state.failed_updates)
+                self.skipped_zero_gradient_updates = int(
+                    state.skipped_zero_gradient_updates
+                )
+                self.consecutive_nonprogress_iterations = int(
+                    state.consecutive_nonprogress_iterations
+                )
+                # One-release compatibility alias for older tests/callers.
+                self.consecutive_skipped_updates = int(
+                    self.consecutive_nonprogress_iterations
+                )
         return ret
 
     def _restore_or_init_replay_buffer(self) -> Dict[str, Any]:
@@ -703,6 +721,69 @@ class RayGearTreeTrainer(RayPPOTrainer):
             )
         return manifest
 
+    def _validate_resumed_manifest_config(self, manifest: RunManifest) -> None:
+        """Fail fast if a checkpoint manifest belongs to another resolved config."""
+        current = self._build_run_manifest()
+        fields = (
+            "policy_aggregation",
+            "segment_token_reduction",
+            "advantage_mode",
+            "use_prob_mask",
+            "probability_mask_threshold",
+            "logical_slot_schema_version",
+            "replay_sampling_unit",
+            "target_edges_per_iteration",
+            "max_edge_age_iterations",
+            "ppo_mini_batch_size",
+            "ppo_epochs",
+        )
+        for field in fields:
+            old = getattr(manifest, field)
+            new = getattr(current, field)
+            if isinstance(old, float) or isinstance(new, float):
+                if abs(float(old) - float(new)) > 1e-12:
+                    raise ValueError(
+                        "resumed VDRA manifest config mismatch for "
+                        f"{field}: checkpoint has {old!r}, current config "
+                        f"resolves to {new!r}. Refusing to reset historical "
+                        "manifest counters/invariants (PLAN.md §1)."
+                    )
+            elif old != new:
+                raise ValueError(
+                    "resumed VDRA manifest config mismatch for "
+                    f"{field}: checkpoint has {old!r}, current config "
+                    f"resolves to {new!r}. Refusing to reset historical "
+                    "manifest counters/invariants (PLAN.md §1)."
+                )
+
+    def _load_or_build_run_manifest(self) -> RunManifest:
+        path = self._manifest_path()
+        if int(getattr(self, "global_steps", 0) or 0) > 0 and os.path.exists(path):
+            manifest = RunManifest.load(path)
+            self._validate_resumed_manifest_config(manifest)
+            return manifest
+        return self._build_run_manifest()
+
+    def _save_manifest_best_effort(self, metrics: Dict[str, Any]) -> None:
+        try:
+            self._save_manifest(self.run_manifest)
+        except Exception as exc:
+            metrics["vdra/manifest_save_failed"] = 1.0
+            _LOGGER.warning("Failed to persist the VDRA manifest: %s", exc)
+
+    def _append_timing_row(
+        self,
+        timing_path: str,
+        row: Mapping[str, Any],
+        metrics: Dict[str, Any],
+    ) -> None:
+        try:
+            with open(timing_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(dict(row)) + "\n")
+        except Exception as exc:
+            metrics["vdra/timing_write_failed"] = 1.0
+            _LOGGER.warning("Failed to write the VDRA timing row: %s", exc)
+
     def _record_iteration_on_manifest(
         self,
         *,
@@ -927,7 +1008,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
         # also clears the derived actor_update_skipped compatibility flag.
         self._set_iteration_status(ITERATION_STATUS_UPDATED)
         # PLAN.md §2: only a successful actor update breaks a skip streak.
-        self.consecutive_skipped_updates = 0
+        self._set_nonprogress_counter(0)
         self.successful_actor_updates += 1
         # PLAN.md M1 three-counter contract: global_step advances by 1 per
         # successful outer update_actor call (the host VERL
@@ -1072,21 +1153,44 @@ class RayGearTreeTrainer(RayPPOTrainer):
             return ITERATION_STATUS_ZERO_ACTIVE_SKIPPED
         return ITERATION_STATUS_ALL_ZERO_SKIPPED
 
-    def _enforce_livelock_guards(self, metrics: Dict[str, Any]) -> None:
-        """PLAN.md §2: a run whose reservations are all zero-signal never
-        advances ``global_step``, so without a guard it can live-lock.
-
-        Saves whatever state it can, then raises with the full context.
-        """
+    def _resolve_max_nonprogress_iterations(self) -> int:
         gt = self._gear_tree_config()
-        raw_limit = gt.get("max_consecutive_skipped_updates", 50)
-        limit = int(raw_limit) if raw_limit is not None else 0
-        if limit <= 0 or self.consecutive_skipped_updates < limit:
+        raw_new = gt.get("max_consecutive_nonprogress_iterations", None)
+        raw_old = gt.get("max_consecutive_skipped_updates", None)
+        if raw_new is not None and raw_old is not None:
+            if int(raw_new) != int(raw_old):
+                raise ValueError(
+                    "gear_tree.max_consecutive_skipped_updates is a deprecated "
+                    "alias for gear_tree.max_consecutive_nonprogress_iterations; "
+                    "setting both to different values is invalid (PLAN.md §3)."
+                )
+        raw = raw_new if raw_new is not None else raw_old
+        return int(raw) if raw is not None else 0
+
+    def _set_nonprogress_counter(self, value: int) -> None:
+        value = int(value)
+        self.consecutive_nonprogress_iterations = value
+        # Deprecated one-release compatibility alias.
+        self.consecutive_skipped_updates = value
+
+    def _increment_nonprogress_counter(self) -> None:
+        self._set_nonprogress_counter(
+            int(getattr(self, "consecutive_nonprogress_iterations", 0)) + 1
+        )
+
+    def _enforce_livelock_guards(self, metrics: Dict[str, Any]) -> None:
+        """PLAN.md §2/§3: abort a run stuck in nonprogress iterations.
+
+        A nonprogress iteration is any path that does not advance
+        ``global_step``: zero-signal skip, postponed reservation, or empty
+        reservation. Saves whatever state it can, then raises with full
+        diagnostic context.
+        """
+        limit = self._resolve_max_nonprogress_iterations()
+        current = int(getattr(self, "consecutive_nonprogress_iterations", 0))
+        if limit <= 0 or current < limit:
             return
-        try:
-            self._save_manifest(self.run_manifest)
-        except Exception as exc:  # best effort — we are already aborting
-            _LOGGER.warning("could not persist the manifest before abort: %s", exc)
+        self._save_manifest_best_effort(metrics)
         try:
             self._save_checkpoint()
         except Exception as exc:
@@ -1095,34 +1199,41 @@ class RayGearTreeTrainer(RayPPOTrainer):
             self._maybe_save_replay_buffer()
         except Exception as exc:
             _LOGGER.warning("could not persist the replay buffer before abort: %s", exc)
+        replay_buffer = getattr(self, "replay_buffer", None)
+        buffer_size = len(replay_buffer) if replay_buffer is not None else 0
         raise RuntimeError(
             "VDRA aborting: "
-            f"{self.consecutive_skipped_updates} consecutive fully skipped "
-            f"updates reached the configured limit "
-            f"gear_tree.max_consecutive_skipped_updates={limit}. A skipped "
-            "update consumes a reservation but performs no optimizer step, so "
+            f"{current} consecutive nonprogress iterations reached the "
+            "configured limit "
+            f"gear_tree.max_consecutive_nonprogress_iterations={limit}. "
+            "A nonprogress iteration performs no optimizer step, so "
             "global_step cannot advance and the run would live-lock. "
             f"global_step={self.global_steps}, "
             f"rollout_iteration={self.rollout_iteration}, "
+            f"last_iteration_status={self.run_manifest.last_iteration_status!r}, "
+            f"consecutive_nonprogress_iterations={current}, "
+            f"buffer_size={buffer_size}, "
+            f"postponed_updates={self.postponed_updates}, "
+            "skipped_zero_gradient_updates="
+            f"{self.skipped_zero_gradient_updates}, "
             "all_zero_advantage_logical_batches="
             f"{metrics.get('vdra/all_zero_advantage_logical_batches', 0.0)}, "
             "zero_active_token_logical_batches="
             f"{metrics.get('vdra/zero_active_token_logical_batches', 0.0)}. "
-            "Check the advantage/reward signal, or raise the limit "
-            "(<= 0 or null disables the guard)."
+            "Check the advantage/reward signal, replay divisibility, or raise "
+            "the limit (<= 0 or null disables the guard)."
         )
 
     def _log_livelock_counters(self, metrics: Dict[str, Any]) -> None:
-        """PLAN.md §2: make the guard state visible on every iteration."""
-        gt = self._gear_tree_config()
-        raw_skip = gt.get("max_consecutive_skipped_updates", 50)
-        raw_iters = gt.get("max_rollout_iterations", None)
-        metrics["training/consecutive_skipped_updates"] = float(
-            self.consecutive_skipped_updates
-        )
-        metrics["training/max_consecutive_skipped_updates"] = float(
-            int(raw_skip) if raw_skip is not None else 0
-        )
+        """PLAN.md §2/§3: make the guard state visible on every iteration."""
+        limit = self._resolve_max_nonprogress_iterations()
+        raw_iters = self._gear_tree_config().get("max_rollout_iterations", None)
+        current = float(getattr(self, "consecutive_nonprogress_iterations", 0))
+        metrics["training/consecutive_nonprogress_iterations"] = current
+        metrics["training/max_consecutive_nonprogress_iterations"] = float(limit)
+        # Deprecated aliases retained for one release.
+        metrics["training/consecutive_skipped_updates"] = current
+        metrics["training/max_consecutive_skipped_updates"] = float(limit)
         metrics["training/max_rollout_iterations"] = float(
             int(raw_iters) if raw_iters is not None else 0
         )
@@ -1178,10 +1289,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
         # PLAN.md §1.3: observational counter for explicit all-zero skipped
         # updates (session-local diagnostic; never drives the outer loop).
         self.skipped_zero_gradient_updates = 0
-        # PLAN.md §2: consecutive zero-signal skips, for the anti-livelock
-        # guard. Reset only by a SUCCESSFUL actor update — a postponed or
-        # empty iteration leaves it untouched.
-        self.consecutive_skipped_updates = 0
+        # PLAN.md §3: consecutive nonprogress iterations for the anti-livelock
+        # guard. Reset only by a SUCCESSFUL actor update.
+        self._set_nonprogress_counter(0)
         # PLAN.md M1: keep rollout iteration, outer global_step, and
         # internal optimizer-step diagnostics as distinct counters.
         self.optimizer_steps_this_iteration = 0
@@ -1191,9 +1301,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
         replay_resume_metrics = self._restore_or_init_replay_buffer()
         replay_buffer = self._ensure_replay_buffer()
 
-        # PLAN.md P0.N8: build the run manifest from config; the trainer
-        # updates it as invariants pass/fail and persists it at every step.
-        self.run_manifest = self._build_run_manifest()
+        # PLAN.md P0.N8: preserve a checkpoint manifest on resume so failure
+        # counters and invariant verdicts cannot be reset by rebuilding it.
+        self.run_manifest = self._load_or_build_run_manifest()
         manifest_strict = bool(
             (self.config.get("tree_policy") or {}).get(
                 "strict_group_integrity", False
@@ -1257,375 +1367,376 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 # unambiguous before/after logging.
                 global_step_before_update = int(self.global_steps)
                 metrics: Dict[str, Any] = {}
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
-                gen_batch = self._get_gen_batch(batch)
+                self._set_iteration_status(ITERATION_STATUS_RUNNING)
+                try:
+                    batch: DataProto = DataProto.from_single_dict(batch_dict)
+                    gen_batch = self._get_gen_batch(batch)
 
-                t0 = time.time()
-                new_edges = self._generate_tree_edges(gen_batch)
-                t_gen = time.time() - t0
-                # PLAN.md P0.B: full-tree CONSTRUCTION validation runs on the
-                # complete generated batch, before replay insertion. This is
-                # the only stage that may require complete parent groups and
-                # full-tree queue identities.
-                construction_summaries = list(
-                    getattr(self, "_last_construction_summaries", []) or []
-                )
-                if new_edges or construction_summaries:
-                    construction_metrics = (
-                        self._update_manifest_from_generated_edges(
-                            self.run_manifest,
-                            new_edges,
-                            strict=manifest_strict,
-                            construction_summaries=construction_summaries,
+                    t0 = time.time()
+                    new_edges = self._generate_tree_edges(gen_batch)
+                    t_gen = time.time() - t0
+                    # PLAN.md P0.B: full-tree CONSTRUCTION validation runs on the
+                    # complete generated batch, before replay insertion. This is
+                    # the only stage that may require complete parent groups and
+                    # full-tree queue identities.
+                    construction_summaries = list(
+                        getattr(self, "_last_construction_summaries", []) or []
+                    )
+                    if new_edges or construction_summaries:
+                        construction_metrics = (
+                            self._update_manifest_from_generated_edges(
+                                self.run_manifest,
+                                new_edges,
+                                strict=manifest_strict,
+                                construction_summaries=construction_summaries,
+                            )
+                        )
+                        metrics.update(construction_metrics)
+                    # PLAN.md P0.2: replay age is stamped in rollout iterations,
+                    # not optimizer steps. `self.rollout_iteration` has already been
+                    # incremented for this iteration above.
+                    replay_buffer.add(
+                        new_edges,
+                        generation_rollout_iteration=self.rollout_iteration,
+                        policy_snapshot_id=self._current_policy_snapshot_id(),
+                    )
+                    # PLAN.md P0.A: canonical strict main uses EDGE-level
+                    # reservation. Complete-tree replay is reachable only via the
+                    # explicit `replay_sampling_unit: complete_tree` ablation and
+                    # is never selected by strict_group_integrity.
+                    reservation = reserve_replay_edges(
+                        replay_buffer,
+                        replay_sampling_unit=replay_sampling_unit,
+                        current_rollout_iteration=self.rollout_iteration,
+                    )
+                    sampled_edges = [dict(edge) for edge in reservation.edges]
+                    sample_stats = reservation.stats
+                    metrics.update({k: v for k, v in sample_stats.items() if k != "removed_edge_ids"})
+                    metrics["buffer/new_edges"] = len(new_edges)
+                    metrics["buffer/postponed_update"] = 0.0
+                    metrics["training/rollout_iteration"] = float(self.rollout_iteration)
+                    # PLAN.md P0.E: never log a pre-update value under an
+                    # ambiguous name; the final training/global_step is always the
+                    # post-update value set in the timing block below.
+                    metrics["training/global_step_before_update"] = float(
+                        global_step_before_update
+                    )
+                    metrics["training/successful_actor_updates"] = float(self.successful_actor_updates)
+                    if not sampled_edges:
+                        # PLAN.md §3/§5: an empty reservation is nonprogress and
+                        # must not reset the guard counter.
+                        self._increment_nonprogress_counter()
+                        metrics["training/last_iteration_status"] = (
+                            self._set_iteration_status(ITERATION_STATUS_NO_SAMPLE)
+                        )
+                        self._log_livelock_counters(metrics)
+                        self._save_manifest_best_effort(metrics)
+                        logger.log(data=metrics, step=self.global_steps)
+                        self._enforce_livelock_guards(metrics)
+                        continue
+                    if self._should_postpone_sampled_update(sampled_edges):
+                        replay_buffer.rollback(reservation)
+                        self.postponed_updates += 1
+                        metrics["buffer/postponed_update"] = 1.0
+                        metrics["training/postponed_updates"] = float(self.postponed_updates)
+                        metrics["buffer/size_after"] = float(len(replay_buffer))
+                        # PLAN.md §3/§5: a postponed iteration is nonprogress and
+                        # must not reset the guard counter.
+                        self._increment_nonprogress_counter()
+                        metrics["training/last_iteration_status"] = (
+                            self._set_iteration_status(ITERATION_STATUS_POSTPONED)
+                        )
+                        self._log_livelock_counters(metrics)
+                        self._save_manifest_best_effort(metrics)
+                        logger.log(data=metrics, step=self.global_steps)
+                        self._enforce_livelock_guards(metrics)
+                        continue
+
+                    # PLAN.md M2: validation, tensorization, and the actor RPC run
+                    # inside one transaction helper — any failure before a
+                    # successful RPC rolls the reservation back.
+                    edge_batch, actor_output, t_update = (
+                        self._execute_reserved_actor_update(
+                            replay_buffer,
+                            reservation,
+                            sampled_edges,
+                            metrics,
+                            manifest_strict=manifest_strict,
                         )
                     )
-                    metrics.update(construction_metrics)
-                # PLAN.md P0.2: replay age is stamped in rollout iterations,
-                # not optimizer steps. `self.rollout_iteration` has already been
-                # incremented for this iteration above.
-                replay_buffer.add(
-                    new_edges,
-                    generation_rollout_iteration=self.rollout_iteration,
-                    policy_snapshot_id=self._current_policy_snapshot_id(),
-                )
-                # PLAN.md P0.A: canonical strict main uses EDGE-level
-                # reservation. Complete-tree replay is reachable only via the
-                # explicit `replay_sampling_unit: complete_tree` ablation and
-                # is never selected by strict_group_integrity.
-                reservation = reserve_replay_edges(
-                    replay_buffer,
-                    replay_sampling_unit=replay_sampling_unit,
-                    current_rollout_iteration=self.rollout_iteration,
-                )
-                sampled_edges = [dict(edge) for edge in reservation.edges]
-                sample_stats = reservation.stats
-                metrics.update({k: v for k, v in sample_stats.items() if k != "removed_edge_ids"})
-                metrics["buffer/new_edges"] = len(new_edges)
-                metrics["buffer/postponed_update"] = 0.0
-                metrics["training/rollout_iteration"] = float(self.rollout_iteration)
-                # PLAN.md P0.E: never log a pre-update value under an
-                # ambiguous name; the final training/global_step is always the
-                # post-update value set in the timing block below.
-                metrics["training/global_step_before_update"] = float(
-                    global_step_before_update
-                )
-                metrics["training/successful_actor_updates"] = float(self.successful_actor_updates)
-                if not sampled_edges:
-                    # PLAN.md §2/§5: an empty reservation is NOT a zero-signal
-                    # skip and must not reset the consecutive-skip counter.
-                    metrics["training/last_iteration_status"] = (
-                        self._set_iteration_status(ITERATION_STATUS_NO_SAMPLE)
-                    )
-                    self._log_livelock_counters(metrics)
-                    logger.log(data=metrics, step=self.global_steps)
-                    continue
-                if self._should_postpone_sampled_update(sampled_edges):
-                    replay_buffer.rollback(reservation)
-                    self.postponed_updates += 1
-                    metrics["buffer/postponed_update"] = 1.0
-                    metrics["training/postponed_updates"] = float(self.postponed_updates)
-                    metrics["buffer/size_after"] = float(len(replay_buffer))
-                    # PLAN.md §2/§5: a postponed iteration does not reset the
-                    # consecutive-skip counter either.
-                    metrics["training/last_iteration_status"] = (
-                        self._set_iteration_status(ITERATION_STATUS_POSTPONED)
-                    )
-                    self._log_livelock_counters(metrics)
-                    logger.log(data=metrics, step=self.global_steps)
-                    continue
-
-                # PLAN.md M2: validation, tensorization, and the actor RPC run
-                # inside one transaction helper — any failure before a
-                # successful RPC rolls the reservation back.
-                edge_batch, actor_output, t_update = (
-                    self._execute_reserved_actor_update(
+                    if edge_batch is None:
+                        # PLAN.md §1.3: explicit skipped update (all-zero
+                        # reservation). Consume the reservation (the zero signal
+                        # was processed), record the skip, and move on — no
+                        # global_step, no scheduler.step, no actor RPC.
+                        removed = replay_buffer.commit(reservation)
+                        metrics["buffer/removed_edges"] = float(len(removed))
+                        metrics["buffer/size_after"] = float(len(replay_buffer))
+                        self.skipped_zero_gradient_updates += 1
+                        metrics["vdra/skipped_zero_gradient_updates"] = float(
+                            self.skipped_zero_gradient_updates
+                        )
+                        # PLAN.md §6: a fully skipped iteration is a real, visible
+                        # event — write its timing row and persist the manifest so
+                        # it is auditable, with expected == actual == 0 optimizer
+                        # steps and the outer counters untouched.
+                        skip_ages = [
+                            self.rollout_iteration
+                            - int(
+                                edge.get(
+                                    "generation_rollout_iteration",
+                                    edge.get("generation_step", self.rollout_iteration),
+                                )
+                            )
+                            for edge in sampled_edges
+                        ]
+                        # PLAN.md §5: classify WHY every logical batch skipped.
+                        skip_status = self._set_iteration_status(
+                            self._zero_signal_skip_status(metrics)
+                        )
+                        # PLAN.md §3: zero-signal skip is a nonprogress iteration.
+                        self._increment_nonprogress_counter()
+                        # PLAN.md §6: a skipped iteration still consumed
+                        # generation time, so it contributes to the totals.
+                        cum_train += t_gen
+                        skip_timing = {
+                            "step": self.global_steps,
+                            "rollout_iteration": self.rollout_iteration,
+                            "actor_update_skipped": True,
+                            "last_iteration_status": skip_status,
+                            "timing/generation_seconds": t_gen,
+                            "timing/update_seconds": 0.0,
+                            "timing/train_total_seconds": t_gen,
+                            "timing/cumulative_train_seconds": cum_train,
+                            "timing/wall_seconds": time.time() - loop_start,
+                            "train/logical_slots": float(len(sampled_edges)),
+                            "train/trainable_tensor_rows": 0.0,
+                            "train/dummy_rows": 0.0,
+                            "train/real_response_tokens": 0.0,
+                            "train/mean_edge_age": float(
+                                sum(skip_ages) / len(skip_ages) if skip_ages else 0.0
+                            ),
+                            "train/max_edge_age": float(max(skip_ages) if skip_ages else 0),
+                            "training/rollout_iteration": float(self.rollout_iteration),
+                            "training/global_step": float(self.global_steps),
+                            "training/expected_optimizer_steps": 0.0,
+                            "training/optimizer_steps_this_iteration": 0.0,
+                            "training/num_optimizer_steps_total": float(
+                                self.num_optimizer_steps_total
+                            ),
+                            "training/successful_actor_updates": float(
+                                self.successful_actor_updates
+                            ),
+                            "training/postponed_updates": float(self.postponed_updates),
+                            "training/failed_updates": float(self.failed_updates),
+                            "training/consecutive_nonprogress_iterations": float(
+                                self.consecutive_nonprogress_iterations
+                            ),
+                            "training/consecutive_skipped_updates": float(
+                                self.consecutive_nonprogress_iterations
+                            ),
+                            "vdra/skipped_zero_gradient_updates": float(
+                                self.skipped_zero_gradient_updates
+                            ),
+                            "vdra/all_zero_advantage_logical_batches": float(
+                                metrics.get(
+                                    "vdra/all_zero_advantage_logical_batches", 0.0
+                                )
+                            ),
+                            "vdra/zero_active_token_logical_batches": float(
+                                metrics.get(
+                                    "vdra/zero_active_token_logical_batches", 0.0
+                                )
+                            ),
+                        }
+                        # PLAN.md §4: the reservation is ALREADY committed, so a
+                        # bookkeeping I/O failure must never crash training.
+                        self._append_timing_row(timing_path, skip_timing, metrics)
+                        metrics.update(skip_timing)
+                        # Observed facts for a skipped update: zero steps expected
+                        # and zero performed, so the accounting stays valid.
+                        self.optimizer_steps_this_iteration = 0
+                        self._expected_optimizer_steps = 0
+                        self._record_iteration_on_manifest(
+                            selected_edges=len(sampled_edges),
+                            sample_stats=sample_stats,
+                            actual_optimizer_steps=0,
+                        )
+                        self._save_manifest_best_effort(metrics)
+                        self._log_livelock_counters(metrics)
+                        logger.log(data=metrics, step=self.global_steps)
+                        # PLAN.md §2: abort a live-locked run (skips never advance
+                        # global_step) AFTER the state above has been persisted.
+                        self._enforce_livelock_guards(metrics)
+                        continue
+                    actor_updated = True
+                    # PLAN.md M2 (item 3): commit + outer counters are secured
+                    # unconditionally on actor success; the diagnostic actor
+                    # metrics are parsed afterwards and can never revert them.
+                    self._finalize_successful_actor_update(
                         replay_buffer,
                         reservation,
+                        actor_output,
                         sampled_edges,
+                        sample_stats,
                         metrics,
-                        manifest_strict=manifest_strict,
                     )
-                )
-                if edge_batch is None:
-                    # PLAN.md §1.3: explicit skipped update (all-zero
-                    # reservation). Consume the reservation (the zero signal
-                    # was processed), record the skip, and move on — no
-                    # global_step, no scheduler.step, no actor RPC.
-                    removed = replay_buffer.commit(reservation)
-                    metrics["buffer/removed_edges"] = float(len(removed))
-                    metrics["buffer/size_after"] = float(len(replay_buffer))
-                    self.skipped_zero_gradient_updates += 1
-                    metrics["vdra/skipped_zero_gradient_updates"] = float(
-                        self.skipped_zero_gradient_updates
+                    # PLAN.md §5/§9: dummy rows are collective-safety padding and
+                    # count in NO objective, replay, or diagnostic metric. Report
+                    # the REAL (non-dummy) row and token counts explicitly.
+                    _is_dummy = edge_batch.batch.get("is_dummy")
+                    if _is_dummy is None:
+                        real_row_mask = torch.ones(
+                            len(edge_batch), dtype=torch.bool
+                        )
+                        dummy_rows = 0
+                    else:
+                        real_row_mask = ~_is_dummy.bool()
+                        dummy_rows = int(_is_dummy.sum())
+                    trainable_tensor_rows = int(real_row_mask.sum())
+                    real_response_tokens = int(
+                        edge_batch.batch["response_mask"][real_row_mask].sum()
                     )
-                    # PLAN.md §6: a fully skipped iteration is a real, visible
-                    # event — write its timing row and persist the manifest so
-                    # it is auditable, with expected == actual == 0 optimizer
-                    # steps and the outer counters untouched.
-                    skip_ages = [
+                    # PLAN.md P0.2: age uses rollout_iteration (never global_step).
+                    ages = [
                         self.rollout_iteration
                         - int(
                             edge.get(
                                 "generation_rollout_iteration",
-                                edge.get("generation_step", self.rollout_iteration),
+                                edge.get(
+                                    "generation_step", self.rollout_iteration
+                                ),
                             )
                         )
                         for edge in sampled_edges
                     ]
-                    # PLAN.md §5: classify WHY every logical batch skipped.
-                    skip_status = self._set_iteration_status(
-                        self._zero_signal_skip_status(metrics)
+                    cum_train += t_gen + t_update
+                    # PLAN.md §8: the SAME authoritative expectation the manifest
+                    # uses — never the selected-slot formula on the sparse path.
+                    expected_optim_steps = self._resolve_expected_optimizer_steps(
+                        len(sampled_edges)
                     )
-                    # PLAN.md §2: only a zero-signal skip advances the
-                    # consecutive-skip counter.
-                    self.consecutive_skipped_updates += 1
-                    # PLAN.md §6: a skipped iteration still consumed
-                    # generation time, so it contributes to the totals.
-                    cum_train += t_gen
-                    skip_timing = {
+                    self._log_livelock_counters(metrics)
+                    timing = {
                         "step": self.global_steps,
                         "rollout_iteration": self.rollout_iteration,
-                        "actor_update_skipped": True,
-                        "last_iteration_status": skip_status,
+                        # PLAN.md §5: authoritative record of what this iteration
+                        # did, plus the derived compatibility flag.
+                        "last_iteration_status": self.run_manifest.last_iteration_status,
+                        "actor_update_skipped": self.run_manifest.actor_update_skipped,
+                        "training/consecutive_nonprogress_iterations": float(
+                            self.consecutive_nonprogress_iterations
+                        ),
+                        "training/consecutive_skipped_updates": float(
+                            self.consecutive_nonprogress_iterations
+                        ),
                         "timing/generation_seconds": t_gen,
-                        "timing/update_seconds": 0.0,
-                        "timing/train_total_seconds": t_gen,
+                        "timing/update_seconds": t_update,
+                        "timing/train_total_seconds": t_gen + t_update,
                         "timing/cumulative_train_seconds": cum_train,
                         "timing/wall_seconds": time.time() - loop_start,
+                        # PLAN.md §5: explicit, dummy-free accounting. The tensor
+                        # batch includes dummy padding and EXCLUDES zero logical
+                        # slots, so its raw length is not an edge count.
                         "train/logical_slots": float(len(sampled_edges)),
-                        "train/trainable_tensor_rows": 0.0,
-                        "train/dummy_rows": 0.0,
-                        "train/real_response_tokens": 0.0,
-                        "train/mean_edge_age": float(
-                            sum(skip_ages) / len(skip_ages) if skip_ages else 0.0
-                        ),
-                        "train/max_edge_age": float(max(skip_ages) if skip_ages else 0),
+                        "train/trainable_tensor_rows": float(trainable_tensor_rows),
+                        "train/dummy_rows": float(dummy_rows),
+                        "train/real_response_tokens": float(real_response_tokens),
+                        # Legacy key, explicitly labeled as the raw tensor-row
+                        # count (dummy rows included) for dashboard continuity.
+                        "train/tensor_rows_including_dummy": float(len(edge_batch)),
+                        "train/unique_questions": float(len({edge.get("question_id") for edge in sampled_edges})),
+                        "train/mean_edge_age": float(sum(ages) / len(ages) if ages else 0.0),
+                        "train/max_edge_age": float(max(ages) if ages else 0),
                         "training/rollout_iteration": float(self.rollout_iteration),
+                        # PLAN.md P0.E: one unambiguous final global_step (the
+                        # post-update value) plus explicit before/after keys.
+                        "training/global_step_before_update": float(
+                            global_step_before_update
+                        ),
+                        "training/global_step_after_update": float(self.global_steps),
                         "training/global_step": float(self.global_steps),
-                        "training/expected_optimizer_steps": 0.0,
-                        "training/optimizer_steps_this_iteration": 0.0,
+                        "training/optimizer_steps_this_iteration": float(
+                            self.optimizer_steps_this_iteration
+                        ),
                         "training/num_optimizer_steps_total": float(
                             self.num_optimizer_steps_total
                         ),
-                        "training/successful_actor_updates": float(
-                            self.successful_actor_updates
-                        ),
-                        "training/postponed_updates": float(self.postponed_updates),
-                        "training/failed_updates": float(self.failed_updates),
-                        "training/consecutive_skipped_updates": float(
-                            self.consecutive_skipped_updates
-                        ),
-                        "vdra/skipped_zero_gradient_updates": float(
-                            self.skipped_zero_gradient_updates
+                        "training/selected_edges_this_iteration": float(len(sampled_edges)),
+                        # PLAN.md §8: expected steps no longer depend only on the
+                        # selected slot count — skipped logical batches perform no
+                        # optimizer step.
+                        "training/expected_optimizer_steps": float(
+                            expected_optim_steps
+                            if expected_optim_steps is not None
+                            else -1
                         ),
                         "vdra/all_zero_advantage_logical_batches": float(
-                            metrics.get(
-                                "vdra/all_zero_advantage_logical_batches", 0.0
-                            )
+                            metrics.get("vdra/all_zero_advantage_logical_batches", 0.0)
                         ),
                         "vdra/zero_active_token_logical_batches": float(
-                            metrics.get(
-                                "vdra/zero_active_token_logical_batches", 0.0
-                            )
+                            metrics.get("vdra/zero_active_token_logical_batches", 0.0)
                         ),
+                        "training/successful_actor_updates": float(self.successful_actor_updates),
+                        "training/postponed_updates": float(self.postponed_updates),
+                        "training/failed_updates": float(self.failed_updates),
                     }
-                    # PLAN.md §1: the reservation is ALREADY committed, so a
-                    # bookkeeping I/O failure must never crash training.
-                    try:
-                        with open(timing_path, "a", encoding="utf-8") as fh:
-                            fh.write(json.dumps(skip_timing) + "\n")
-                    except Exception as exc:
-                        metrics["vdra/timing_write_failed"] = 1.0
-                        _LOGGER.warning(
-                            "Failed to write the timing row after a skipped "
-                            "update: %s",
-                            exc,
-                        )
-                    metrics.update(skip_timing)
-                    # Observed facts for a skipped update: zero steps expected
-                    # and zero performed, so the accounting stays valid.
-                    self.optimizer_steps_this_iteration = 0
-                    self._expected_optimizer_steps = 0
-                    self._record_iteration_on_manifest(
-                        selected_edges=len(sampled_edges),
-                        sample_stats=sample_stats,
-                        actual_optimizer_steps=0,
+                    self._append_timing_row(timing_path, timing, metrics)
+                    metrics.update(timing)
+
+                    # PLAN.md P0.N8: persist the manifest every optimizer step so
+                    # a killed run still leaves a snapshot on disk. Overwrites in
+                    # place — the manifest is small and monotonic per step.
+                    self._save_manifest_best_effort(metrics)
+                    # Report the manifest verdict as a boolean metric so runs can
+                    # be filtered by validity at analysis time.
+                    metrics["vdra/manifest_valid_main_run"] = float(
+                        validate_main_run(self.run_manifest) is None
                     )
-                    try:
-                        self._save_manifest(self.run_manifest)
-                    except Exception as exc:
-                        metrics["vdra/manifest_save_failed"] = 1.0
-                        _LOGGER.warning(
-                            "Failed to persist the VDRA manifest after a "
-                            "skipped update: %s",
-                            exc,
-                        )
-                    self._log_livelock_counters(metrics)
                     logger.log(data=metrics, step=self.global_steps)
-                    # PLAN.md §2: abort a live-locked run (skips never advance
-                    # global_step) AFTER the state above has been persisted.
-                    self._enforce_livelock_guards(metrics)
-                    continue
-                actor_updated = True
-                # PLAN.md M2 (item 3): commit + outer counters are secured
-                # unconditionally on actor success; the diagnostic actor
-                # metrics are parsed afterwards and can never revert them.
-                self._finalize_successful_actor_update(
-                    replay_buffer,
-                    reservation,
-                    actor_output,
-                    sampled_edges,
-                    sample_stats,
-                    metrics,
-                )
-                # PLAN.md §5/§9: dummy rows are collective-safety padding and
-                # count in NO objective, replay, or diagnostic metric. Report
-                # the REAL (non-dummy) row and token counts explicitly.
-                _is_dummy = edge_batch.batch.get("is_dummy")
-                if _is_dummy is None:
-                    real_row_mask = torch.ones(
-                        len(edge_batch), dtype=torch.bool
-                    )
-                    dummy_rows = 0
-                else:
-                    real_row_mask = ~_is_dummy.bool()
-                    dummy_rows = int(_is_dummy.sum())
-                trainable_tensor_rows = int(real_row_mask.sum())
-                real_response_tokens = int(
-                    edge_batch.batch["response_mask"][real_row_mask].sum()
-                )
-                # PLAN.md P0.2: age uses rollout_iteration (never global_step).
-                ages = [
-                    self.rollout_iteration
-                    - int(
-                        edge.get(
-                            "generation_rollout_iteration",
-                            edge.get(
-                                "generation_step", self.rollout_iteration
-                            ),
-                        )
-                    )
-                    for edge in sampled_edges
-                ]
-                cum_train += t_gen + t_update
-                # PLAN.md §8: the SAME authoritative expectation the manifest
-                # uses — never the selected-slot formula on the sparse path.
-                expected_optim_steps = self._resolve_expected_optimizer_steps(
-                    len(sampled_edges)
-                )
-                self._log_livelock_counters(metrics)
-                timing = {
-                    "step": self.global_steps,
-                    "rollout_iteration": self.rollout_iteration,
-                    # PLAN.md §5: authoritative record of what this iteration
-                    # did, plus the derived compatibility flag.
-                    "last_iteration_status": self.run_manifest.last_iteration_status,
-                    "actor_update_skipped": self.run_manifest.actor_update_skipped,
-                    "training/consecutive_skipped_updates": float(
-                        self.consecutive_skipped_updates
-                    ),
-                    "timing/generation_seconds": t_gen,
-                    "timing/update_seconds": t_update,
-                    "timing/train_total_seconds": t_gen + t_update,
-                    "timing/cumulative_train_seconds": cum_train,
-                    "timing/wall_seconds": time.time() - loop_start,
-                    # PLAN.md §5: explicit, dummy-free accounting. The tensor
-                    # batch includes dummy padding and EXCLUDES zero logical
-                    # slots, so its raw length is not an edge count.
-                    "train/logical_slots": float(len(sampled_edges)),
-                    "train/trainable_tensor_rows": float(trainable_tensor_rows),
-                    "train/dummy_rows": float(dummy_rows),
-                    "train/real_response_tokens": float(real_response_tokens),
-                    # Legacy key, explicitly labeled as the raw tensor-row
-                    # count (dummy rows included) for dashboard continuity.
-                    "train/tensor_rows_including_dummy": float(len(edge_batch)),
-                    "train/unique_questions": float(len({edge.get("question_id") for edge in sampled_edges})),
-                    "train/mean_edge_age": float(sum(ages) / len(ages) if ages else 0.0),
-                    "train/max_edge_age": float(max(ages) if ages else 0),
-                    "training/rollout_iteration": float(self.rollout_iteration),
-                    # PLAN.md P0.E: one unambiguous final global_step (the
-                    # post-update value) plus explicit before/after keys.
-                    "training/global_step_before_update": float(
-                        global_step_before_update
-                    ),
-                    "training/global_step_after_update": float(self.global_steps),
-                    "training/global_step": float(self.global_steps),
-                    "training/optimizer_steps_this_iteration": float(
-                        self.optimizer_steps_this_iteration
-                    ),
-                    "training/num_optimizer_steps_total": float(
-                        self.num_optimizer_steps_total
-                    ),
-                    "training/selected_edges_this_iteration": float(len(sampled_edges)),
-                    # PLAN.md §8: expected steps no longer depend only on the
-                    # selected slot count — skipped logical batches perform no
-                    # optimizer step.
-                    "training/expected_optimizer_steps": float(
-                        expected_optim_steps
-                        if expected_optim_steps is not None
-                        else -1
-                    ),
-                    "vdra/all_zero_advantage_logical_batches": float(
-                        metrics.get("vdra/all_zero_advantage_logical_batches", 0.0)
-                    ),
-                    "vdra/zero_active_token_logical_batches": float(
-                        metrics.get("vdra/zero_active_token_logical_batches", 0.0)
-                    ),
-                    "training/successful_actor_updates": float(self.successful_actor_updates),
-                    "training/postponed_updates": float(self.postponed_updates),
-                    "training/failed_updates": float(self.failed_updates),
-                }
-                with open(timing_path, "a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(timing) + "\n")
-                metrics.update(timing)
 
-                # PLAN.md P0.N8: persist the manifest every optimizer step so
-                # a killed run still leaves a snapshot on disk. Overwrites in
-                # place — the manifest is small and monotonic per step.
-                try:
-                    self._save_manifest(self.run_manifest)
+                    is_last_step = self.global_steps >= self.total_training_steps
+                    # PLAN.md P0.E: a jump like 8 -> 12 must still fire the
+                    # step-10 save/eval. Fire once when any threshold was crossed
+                    # and advance the counter past every crossed threshold.
+                    eval_crossed, self.next_eval_step = advance_past_thresholds(
+                        previous_step=global_step_before_update,
+                        current_step=self.global_steps,
+                        next_threshold=self.next_eval_step,
+                        freq=test_freq,
+                    )
+                    if (
+                        test_freq > 0
+                        and (eval_crossed > 0 or is_last_step)
+                        and self.val_reward_fn is not None
+                    ):
+                        val_metrics = self._validate()
+                        if val_metrics:
+                            logger.log(data=val_metrics, step=self.global_steps)
+
+                    save_crossed, self.next_save_step = advance_past_thresholds(
+                        previous_step=global_step_before_update,
+                        current_step=self.global_steps,
+                        next_threshold=self.next_save_step,
+                        freq=save_freq,
+                    )
+                    if save_freq > 0 and (save_crossed > 0 or is_last_step):
+                        self._save_checkpoint()
+                        replay_metrics = self._maybe_save_replay_buffer()
+                        logger.log(data=replay_metrics, step=self.global_steps)
+
+                    if is_last_step:
+                        return
+
                 except Exception:
-                    # Manifest IO must never break training; log via metrics.
-                    metrics["vdra/manifest_save_failed"] = 1.0
-                # Report the manifest verdict as a boolean metric so runs can
-                # be filtered by validity at analysis time.
-                metrics["vdra/manifest_valid_main_run"] = float(
-                    validate_main_run(self.run_manifest) is None
-                )
-                logger.log(data=metrics, step=self.global_steps)
-
-                is_last_step = self.global_steps >= self.total_training_steps
-                # PLAN.md P0.E: a jump like 8 -> 12 must still fire the
-                # step-10 save/eval. Fire once when any threshold was crossed
-                # and advance the counter past every crossed threshold.
-                eval_crossed, self.next_eval_step = advance_past_thresholds(
-                    previous_step=global_step_before_update,
-                    current_step=self.global_steps,
-                    next_threshold=self.next_eval_step,
-                    freq=test_freq,
-                )
-                if (
-                    test_freq > 0
-                    and (eval_crossed > 0 or is_last_step)
-                    and self.val_reward_fn is not None
-                ):
-                    val_metrics = self._validate()
-                    if val_metrics:
-                        logger.log(data=val_metrics, step=self.global_steps)
-
-                save_crossed, self.next_save_step = advance_past_thresholds(
-                    previous_step=global_step_before_update,
-                    current_step=self.global_steps,
-                    next_threshold=self.next_save_step,
-                    freq=save_freq,
-                )
-                if save_freq > 0 and (save_crossed > 0 or is_last_step):
-                    self._save_checkpoint()
-                    replay_metrics = self._maybe_save_replay_buffer()
-                    logger.log(data=replay_metrics, step=self.global_steps)
-
-                if is_last_step:
-                    return
-
+                    if (
+                        self.run_manifest.last_iteration_status
+                        == ITERATION_STATUS_RUNNING
+                    ):
+                        self._set_iteration_status(
+                            ITERATION_STATUS_FAILED_BEFORE_ACTOR
+                        )
+                    self._save_manifest_best_effort(metrics)
+                    raise
         self._save_checkpoint()
         self._maybe_save_replay_buffer()

@@ -17,6 +17,8 @@ Required tests 1-12 of the remaining-fixes spec:
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 try:  # namespace-package import under PYTHONPATH=verl
@@ -43,6 +45,7 @@ from recipe.gear_tree.run_manifest import (  # noqa: E402
     ITERATION_STATUS_NOT_STARTED,
     ITERATION_STATUS_NO_SAMPLE,
     ITERATION_STATUS_POSTPONED,
+    ITERATION_STATUS_RUNNING,
     ITERATION_STATUS_UPDATED,
     ITERATION_STATUS_ZERO_ACTIVE_SKIPPED,
     RunManifest,
@@ -65,7 +68,7 @@ class _Cfg(dict):
         return dict.get(self, key, default)
 
 
-def _trainer(tmp_path, *, max_skips=50, max_iters=None):
+def _trainer(tmp_path, *, max_skips=50, max_iters=None, use_new_limit=False):
     obj = object.__new__(RayGearTreeTrainer)
     obj.tokenizer = _tiny_actor.Tok()
     obj.config = _Cfg(
@@ -97,7 +100,12 @@ def _trainer(tmp_path, *, max_skips=50, max_iters=None):
                 "sampling_seed": 0,
             },
             "gear": {"strict_vdra": False},
-            "max_consecutive_skipped_updates": max_skips,
+            "max_consecutive_nonprogress_iterations": (
+                max_skips if use_new_limit else None
+            ),
+            "max_consecutive_skipped_updates": (
+                None if use_new_limit else max_skips
+            ),
             "max_rollout_iterations": max_iters,
         },
     )
@@ -109,6 +117,7 @@ def _trainer(tmp_path, *, max_skips=50, max_iters=None):
     obj.successful_actor_updates = 0
     obj.optimizer_steps_this_iteration = 0
     obj.skipped_zero_gradient_updates = 0
+    obj.consecutive_nonprogress_iterations = 0
     obj.consecutive_skipped_updates = 0
     obj.postponed_updates = 0
     obj.failed_updates = 0
@@ -132,6 +141,7 @@ class TestIterationStatus:
             (ITERATION_STATUS_MIXED_ZERO_SIGNAL_SKIPPED, True),
             (ITERATION_STATUS_POSTPONED, False),
             (ITERATION_STATUS_NO_SAMPLE, False),
+            (ITERATION_STATUS_RUNNING, False),
             (ITERATION_STATUS_ACTOR_FAILED, False),
         ],
     )
@@ -172,6 +182,55 @@ class TestIterationStatus:
         )
 
 
+class TestManifestResumeLifecycle:
+    """Remaining canonical-run resume manifest requirements."""
+
+    def test_resume_loads_existing_manifest_and_preserves_history(self, tmp_path):
+        trainer = _trainer(tmp_path)
+        trainer.global_steps = 3
+        manifest = trainer._build_run_manifest()
+        manifest.group_integrity_failures = 5
+        manifest.segment_count_failures = 2
+        manifest.replay_batch_failures = 1
+        manifest.parent_split_count = 7
+        manifest.tree_split_count = 8
+        manifest.num_optimizer_steps_total = 99
+        manifest.stored_old_log_probs_used = True
+        manifest.segment_count_invariants_passed = False
+        manifest.optimizer_step_accounting_valid = False
+        manifest.unique_tree_ids_verified = True
+        manifest.save(trainer._manifest_path())
+
+        loaded = trainer._load_or_build_run_manifest()
+        assert loaded.group_integrity_failures == 5
+        assert loaded.segment_count_failures == 2
+        assert loaded.replay_batch_failures == 1
+        assert loaded.parent_split_count == 7
+        assert loaded.tree_split_count == 8
+        assert loaded.num_optimizer_steps_total == 99
+        assert loaded.stored_old_log_probs_used is True
+        assert loaded.segment_count_invariants_passed is False
+        assert loaded.optimizer_step_accounting_valid is False
+        assert loaded.unique_tree_ids_verified is True
+
+    def test_resume_manifest_config_mismatch_fails_fast(self, tmp_path):
+        trainer = _trainer(tmp_path)
+        trainer.global_steps = 3
+        manifest = trainer._build_run_manifest()
+        manifest.probability_mask_threshold = 0.75
+        manifest.save(trainer._manifest_path())
+
+        with pytest.raises(ValueError, match="probability_mask_threshold"):
+            trainer._load_or_build_run_manifest()
+
+    def test_no_checkpoint_manifest_builds_fresh(self, tmp_path):
+        trainer = _trainer(tmp_path)
+        trainer.global_steps = 3
+        manifest = trainer._load_or_build_run_manifest()
+        assert isinstance(manifest, RunManifest)
+        assert manifest.group_integrity_failures == 0
+
+
 class TestLivelockGuards:
     """Required tests 3-5."""
 
@@ -181,15 +240,48 @@ class TestLivelockGuards:
             "vdra/zero_active_token_logical_batches": 0.0,
         }
 
+
+    def test_deprecated_skip_limit_alias_maps_to_nonprogress_limit(self, tmp_path):
+        trainer = _trainer(tmp_path, max_skips=11)
+        assert trainer._resolve_max_nonprogress_iterations() == 11
+
+    def test_new_nonprogress_limit_is_primary(self, tmp_path):
+        trainer = _trainer(tmp_path, max_skips=13, use_new_limit=True)
+        assert trainer._resolve_max_nonprogress_iterations() == 13
+
+    def test_conflicting_old_and_new_guard_fields_fail_fast(self, tmp_path):
+        trainer = _trainer(tmp_path, max_skips=13, use_new_limit=True)
+        trainer.config.gear_tree["max_consecutive_skipped_updates"] = 12
+        with pytest.raises(ValueError, match="deprecated alias"):
+            trainer._resolve_max_nonprogress_iterations()
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            ITERATION_STATUS_NO_SAMPLE,
+            ITERATION_STATUS_POSTPONED,
+            ITERATION_STATUS_ALL_ZERO_SKIPPED,
+            ITERATION_STATUS_ZERO_ACTIVE_SKIPPED,
+            ITERATION_STATUS_MIXED_ZERO_SIGNAL_SKIPPED,
+        ],
+    )
+    def test_nonprogress_statuses_increment_the_counter(self, tmp_path, status):
+        trainer = _trainer(tmp_path)
+        trainer._set_nonprogress_counter(4)
+        trainer._set_iteration_status(status)
+        trainer._increment_nonprogress_counter()
+        assert trainer.consecutive_nonprogress_iterations == 5
+        assert trainer.consecutive_skipped_updates == 5
+
     def test_limit_not_reached_is_a_no_op(self, tmp_path):
         trainer = _trainer(tmp_path, max_skips=3)
-        trainer.consecutive_skipped_updates = 2
+        trainer._set_nonprogress_counter(2)
         trainer._enforce_livelock_guards(self._metrics())  # must not raise
 
     def test_repeated_skips_trip_the_limit(self, tmp_path):
         """Required test 3."""
         trainer = _trainer(tmp_path, max_skips=3)
-        trainer.consecutive_skipped_updates = 3
+        trainer._set_nonprogress_counter(3)
         trainer.global_steps = 0
         trainer.rollout_iteration = 7
         with pytest.raises(RuntimeError) as excinfo:
@@ -198,14 +290,17 @@ class TestLivelockGuards:
         # The error must carry the full diagnostic context.
         assert "global_step=0" in msg
         assert "rollout_iteration=7" in msg
-        assert "3 consecutive" in msg
-        assert "max_consecutive_skipped_updates=3" in msg
+        assert "3 consecutive nonprogress" in msg
+        assert "last_iteration_status=" in msg
+        assert "buffer_size=" in msg
+        assert "postponed_updates=" in msg
+        assert "max_consecutive_nonprogress_iterations=3" in msg
         assert "all_zero_advantage_logical_batches=2.0" in msg
         assert "zero_active_token_logical_batches=0.0" in msg
 
     def test_manifest_is_persisted_before_aborting(self, tmp_path):
         trainer = _trainer(tmp_path, max_skips=1)
-        trainer.consecutive_skipped_updates = 1
+        trainer._set_nonprogress_counter(1)
         with pytest.raises(RuntimeError):
             trainer._enforce_livelock_guards(self._metrics())
         assert (tmp_path / "vdra_run_manifest.json").exists()
@@ -213,13 +308,13 @@ class TestLivelockGuards:
     @pytest.mark.parametrize("limit", [0, -1, None])
     def test_guard_can_be_disabled(self, tmp_path, limit):
         trainer = _trainer(tmp_path, max_skips=limit)
-        trainer.consecutive_skipped_updates = 10_000
+        trainer._set_nonprogress_counter(10_000)
         trainer._enforce_livelock_guards(self._metrics())  # must not raise
 
     def test_successful_update_resets_the_counter(self, tmp_path):
         """Required test 4 — driven through the REAL finalize helper."""
         trainer = _trainer(tmp_path)
-        trainer.consecutive_skipped_updates = 5
+        trainer._set_nonprogress_counter(5)
         buf = GearTreeReplayBuffer(
             target_edges_per_iteration=64,
             max_edge_age_iterations=8,
@@ -241,6 +336,7 @@ class TestLivelockGuards:
         trainer._finalize_successful_actor_update(
             buf, reservation, _Out(), [_trainable_edge("e0")], {}, {}
         )
+        assert trainer.consecutive_nonprogress_iterations == 0
         assert trainer.consecutive_skipped_updates == 0
         assert (
             trainer.run_manifest.last_iteration_status == ITERATION_STATUS_UPDATED
@@ -263,9 +359,11 @@ class TestLivelockGuards:
 
     def test_counters_are_logged(self, tmp_path):
         trainer = _trainer(tmp_path, max_skips=7, max_iters=9)
-        trainer.consecutive_skipped_updates = 2
+        trainer._set_nonprogress_counter(2)
         metrics: dict = {}
         trainer._log_livelock_counters(metrics)
+        assert metrics["training/consecutive_nonprogress_iterations"] == 2.0
+        assert metrics["training/max_consecutive_nonprogress_iterations"] == 7.0
         assert metrics["training/consecutive_skipped_updates"] == 2.0
         assert metrics["training/max_consecutive_skipped_updates"] == 7.0
         assert metrics["training/max_rollout_iterations"] == 9.0
@@ -288,18 +386,18 @@ class TestSkipPathIoRobustness:
         """Required test 1: the reservation is already committed, so a
         manifest I/O failure must not crash training."""
         branch = self._skip_branch_source()
-        assert "self._save_manifest(self.run_manifest)" in branch
-        assert "vdra/manifest_save_failed" in branch
-        # The save must sit inside a try/except, not be a bare call.
-        save_at = branch.index("self._save_manifest(self.run_manifest)")
-        assert "try:" in branch[:save_at]
+        assert "self._save_manifest_best_effort(metrics)" in branch
+        assert "vdra/manifest_save_failed" in inspect.getsource(
+            RayGearTreeTrainer._save_manifest_best_effort
+        )
 
     def test_timing_write_failure_is_caught(self):
         """Required test 2."""
         branch = self._skip_branch_source()
-        assert "vdra/timing_write_failed" in branch
-        write_at = branch.index("json.dumps(skip_timing)")
-        assert "try:" in branch[:write_at]
+        assert "self._append_timing_row(timing_path, skip_timing, metrics)" in branch
+        assert "vdra/timing_write_failed" in inspect.getsource(
+            RayGearTreeTrainer._append_timing_row
+        )
 
     def test_skip_timing_carries_cumulative_and_wall_clock(self):
         """Required test 11."""
@@ -318,6 +416,14 @@ class TestSkipPathIoRobustness:
         # Generation time is folded into the running total.
         assert "cum_train += t_gen" in branch
 
+
+    def test_fit_failure_wrapper_sets_and_persists_failed_before_actor(self):
+        src = inspect.getsource(RayGearTreeTrainer.fit)
+        assert "self._set_iteration_status(ITERATION_STATUS_RUNNING)" in src
+        assert "== ITERATION_STATUS_RUNNING" in src
+        assert "ITERATION_STATUS_FAILED_BEFORE_ACTOR" in src
+        assert "self._save_manifest_best_effort(metrics)" in src
+
     def test_skip_timing_reports_zero_steps_and_unchanged_global_step(self):
         branch = self._skip_branch_source()
         assert '"training/expected_optimizer_steps": 0.0' in branch
@@ -328,10 +434,22 @@ class TestSkipPathIoRobustness:
     def test_livelock_guard_runs_after_state_is_persisted(self):
         branch = self._skip_branch_source()
         guard_at = branch.index("_enforce_livelock_guards")
-        manifest_at = branch.index("self._save_manifest(self.run_manifest)")
+        manifest_at = branch.index("self._save_manifest_best_effort(metrics)")
         assert manifest_at < guard_at, (
             "the guard must abort only AFTER the manifest was persisted"
         )
+
+
+    def test_normal_timing_write_failure_does_not_propagate(self, tmp_path, monkeypatch):
+        trainer = _trainer(tmp_path)
+
+        def _boom(*_args, **_kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr("builtins.open", _boom)
+        metrics: dict = {}
+        trainer._append_timing_row(str(tmp_path / "training_timing.jsonl"), {"x": 1}, metrics)
+        assert metrics["vdra/timing_write_failed"] == 1.0
 
     def test_manifest_save_failure_does_not_propagate(self, tmp_path, monkeypatch):
         """Behavioural check of the same contract on the helper itself."""
@@ -344,8 +462,8 @@ class TestSkipPathIoRobustness:
         metrics: dict = {}
         # The guard's own best-effort save must swallow the failure and still
         # raise the intended RuntimeError (not the OSError).
-        trainer.consecutive_skipped_updates = 50
-        with pytest.raises(RuntimeError, match="consecutive fully skipped"):
+        trainer._set_nonprogress_counter(50)
+        with pytest.raises(RuntimeError, match="consecutive nonprogress"):
             trainer._enforce_livelock_guards(metrics)
 
 

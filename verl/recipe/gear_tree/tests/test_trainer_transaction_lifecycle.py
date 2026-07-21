@@ -21,7 +21,11 @@ if not hasattr(transformers, "AutoModelForVision2Seq"):
 
 from recipe.gear_tree.gear_ray_trainer import RayGearTreeTrainer
 from recipe.gear_tree.replay_buffer import GearTreeReplayBuffer
-from recipe.gear_tree.run_manifest import RunManifest
+from recipe.gear_tree.run_manifest import (
+    ITERATION_STATUS_ACTOR_FAILED,
+    ITERATION_STATUS_FAILED_BEFORE_ACTOR,
+    RunManifest,
+)
 
 
 class _Cfg(SimpleNamespace):
@@ -121,6 +125,10 @@ class TestPreActorFailures:
         assert trainer.failed_updates == 0
         assert trainer.run_manifest.replay_batch_failures == 1
         assert trainer.run_manifest.no_truncation is False
+        assert (
+            trainer.run_manifest.last_iteration_status
+            == ITERATION_STATUS_FAILED_BEFORE_ACTOR
+        )
 
     def test_tensorization_failure_rolls_back_without_counters(self):
         trainer, buffer, reservation, sampled = _trainer_with_reservation()
@@ -137,6 +145,10 @@ class TestPreActorFailures:
         assert trainer.failed_updates == 0
         assert trainer.run_manifest.replay_batch_failures == 0
         assert trainer.run_manifest.no_truncation is False
+        assert (
+            trainer.run_manifest.last_iteration_status
+            == ITERATION_STATUS_FAILED_BEFORE_ACTOR
+        )
 
     def test_overlength_row_is_a_real_tensorization_failure(self):
         trainer, buffer, reservation, sampled = _trainer_with_reservation()
@@ -147,6 +159,10 @@ class TestPreActorFailures:
             )
         _assert_rolled_back_and_counters_untouched(trainer, buffer, 2)
         assert trainer.failed_updates == 0
+        assert (
+            trainer.run_manifest.last_iteration_status
+            == ITERATION_STATUS_FAILED_BEFORE_ACTOR
+        )
 
     def test_actor_rpc_failure_rolls_back_and_counts_failed_update(self):
         trainer, buffer, reservation, sampled = _trainer_with_reservation()
@@ -167,6 +183,7 @@ class TestPreActorFailures:
         # Tensorization succeeded before the RPC, so the observed
         # no-truncation event did happen for this batch.
         assert trainer.run_manifest.no_truncation is True
+        assert trainer.run_manifest.last_iteration_status == ITERATION_STATUS_ACTOR_FAILED
         # Rolled-back edges must be reservable again.
         again = buffer.reserve_for_update(current_rollout_iteration=1)
         assert sorted(again.edge_ids) == ["e0", "e1"]

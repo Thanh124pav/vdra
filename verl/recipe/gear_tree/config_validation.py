@@ -56,6 +56,15 @@ def validate_policy_loss_consistency(
     does); otherwise it is derived from ``config.gear_tree``.
     """
     gt = gear_tree_cfg if gear_tree_cfg is not None else _to_plain_gear_tree_cfg(config)
+    new_nonprogress = gt.get("max_consecutive_nonprogress_iterations", None)
+    old_skipped = gt.get("max_consecutive_skipped_updates", None)
+    if new_nonprogress is not None and old_skipped is not None:
+        if int(new_nonprogress) != int(old_skipped):
+            raise ValueError(
+                "gear_tree.max_consecutive_skipped_updates is a deprecated "
+                "alias for gear_tree.max_consecutive_nonprogress_iterations; "
+                "setting both to different values is invalid (PLAN.md §3)."
+            )
     # PLAN.md P1.R7: refuse the deprecated ablation `_original` names in
     # strict main runs, and refuse to combine the *_style_ablation modes
     # with the canonical policy aggregation (they are ablations, not

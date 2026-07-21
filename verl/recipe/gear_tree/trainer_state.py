@@ -31,6 +31,8 @@ class GearTreeTrainerState:
     successful_actor_updates: int = 0
     postponed_updates: int = 0
     failed_updates: int = 0
+    skipped_zero_gradient_updates: int = 0
+    consecutive_nonprogress_iterations: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)

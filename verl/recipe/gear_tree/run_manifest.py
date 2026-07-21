@@ -36,6 +36,7 @@ POLICY_AGGREGATION_LEGACY = "legacy_token_mean"
 # so this status is the authoritative record; ``actor_update_skipped`` is
 # derived from it.
 ITERATION_STATUS_NOT_STARTED = "not_started"
+ITERATION_STATUS_RUNNING = "running"
 ITERATION_STATUS_UPDATED = "updated"
 ITERATION_STATUS_ALL_ZERO_SKIPPED = "all_zero_skipped"
 ITERATION_STATUS_ZERO_ACTIVE_SKIPPED = "zero_active_skipped"
@@ -47,6 +48,7 @@ ITERATION_STATUS_ACTOR_FAILED = "actor_failed"
 
 VALID_ITERATION_STATUSES = (
     ITERATION_STATUS_NOT_STARTED,
+    ITERATION_STATUS_RUNNING,
     ITERATION_STATUS_UPDATED,
     ITERATION_STATUS_ALL_ZERO_SKIPPED,
     ITERATION_STATUS_ZERO_ACTIVE_SKIPPED,
@@ -214,6 +216,7 @@ class RunManifest:
         cleaned = {k: v for k, v in data.items() if k in known}
         m = cls(**cleaned)
         m.extras = extras
+        m.actor_update_skipped = m.last_iteration_status in ZERO_SIGNAL_SKIP_STATUSES
         return m
 
 
