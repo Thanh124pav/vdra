@@ -168,6 +168,45 @@ class TestTrainableCountIdentity:
         )
         assert len(buf) == 1
 
+    def test_canonical_logical_build_requires_complete_denominator_metadata(self):
+        edge = _edge("missing_threshold")
+        edge.pop("probability_mask_threshold")
+        with pytest.raises(ValueError, match="missing_threshold") as excinfo:
+            build_logical_update_batch(
+                [edge, _slot()],
+                _tiny_actor.Tok(),
+                max_prompt_length=6,
+                max_response_length=4,
+                ppo_mini_batch_size=2,
+                dp_size=1,
+                loss_mode="vdra_segment_mean_ppo",
+                use_prob_mask=True,
+                probability_mask_threshold=0.9,
+                require_logical_denominator_metadata=True,
+            )
+        assert "probability_mask_threshold" in str(excinfo.value)
+
+    def test_legacy_logical_build_recomputes_missing_metadata_with_warning(self):
+        edge = _edge("legacy_missing")
+        edge.pop("response_token_count")
+        edge.pop("prob_mask_token_count")
+        edge.pop("probability_mask_threshold")
+        with pytest.warns(RuntimeWarning, match="missing"):
+            batch, stats = build_logical_update_batch(
+                [edge, _slot()],
+                _tiny_actor.Tok(),
+                max_prompt_length=6,
+                max_response_length=4,
+                ppo_mini_batch_size=2,
+                dp_size=1,
+                loss_mode="vdra_segment_mean_ppo",
+                use_prob_mask=True,
+                probability_mask_threshold=0.9,
+                require_logical_denominator_metadata=False,
+            )
+        assert batch is not None
+        assert stats["vdra/trainable_logical_batches"] == 1.0
+
 
 class TestReplayRestoreValidatesEveryRow:
     """Required test 5."""

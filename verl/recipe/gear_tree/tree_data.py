@@ -944,8 +944,9 @@ def validate_tree_construction(
     queue_failures, queue_details = _queue_segment_identity_failures(edges)
     failures.extend(queue_details)
 
-    # Extraction-time construction summaries: the only construction record
-    # for parents/trees whose every child was zero-filtered away.
+    # Extraction-time construction summaries preserve parent/tree facts
+    # when every child has exactly zero advantage. Those children still enter
+    # replay as metadata-only logical slots and produce no trainable tensor rows.
     summary_failure_count = 0
     if construction_summaries:
         summary_details = _construction_summary_failures(construction_summaries)
@@ -1354,6 +1355,7 @@ def build_logical_update_batch(
     include_old_log_probs: bool = True,
     use_prob_mask: bool = False,
     probability_mask_threshold: float = 0.9,
+    require_logical_denominator_metadata: bool = False,
 ) -> Tuple[Optional[DataProto], Dict[str, float]]:
     """PLAN.md §1.2/§1.3/§5/§6 (2026-07-21): tensorize a reservation of LOGICAL slots.
 
@@ -1412,12 +1414,50 @@ def build_logical_update_batch(
             "must gate the update BEFORE tensorization (PLAN.md P0.D/§1.2)."
         )
 
+    emitted_legacy_warnings = set()
+
+    def _warn_legacy_missing(field: str, edge_id: Any, message: str) -> None:
+        # Warn once per build and field: legacy callers still get an explicit
+        # signal without flooding large local parity tests.
+        if field in emitted_legacy_warnings:
+            return
+        emitted_legacy_warnings.add(field)
+        warnings.warn(message.format(edge_id=edge_id), RuntimeWarning, stacklevel=2)
+
     def _slot_counts(slot: Dict[str, Any]) -> Tuple[int, int]:
         """(response_token_count, prob_mask_token_count) — stamped, never
         recomputed for a zero slot whose log-prob payload was removed."""
+        if require_logical_denominator_metadata:
+            missing = [
+                name
+                for name in (
+                    "response_token_count",
+                    "prob_mask_token_count",
+                    "probability_mask_threshold",
+                )
+                if slot.get(name) is None
+            ]
+            if missing:
+                raise ValueError(
+                    "canonical logical record is missing schema-v2 "
+                    "denominator metadata fields "
+                    f"{missing}; offending edge_id={slot.get('edge_id')!r} "
+                    "(PLAN.md §4)."
+                )
         raw_resp = slot.get("response_token_count")
         if raw_resp is None:
-            raw_resp = len(slot.get("response_token_ids") or []) or None
+            response_ids = slot.get("response_token_ids") or []
+            if response_ids:
+                _warn_legacy_missing(
+                    "response_token_count",
+                    slot.get("edge_id"),
+                    "recomputing a missing response_token_count for "
+                    "edge {edge_id!r}; canonical VDRA requires the stamped "
+                    "schema-v2 denominator metadata (PLAN.md §4).",
+                )
+                raw_resp = len(response_ids)
+            else:
+                raw_resp = None
         if raw_resp is None or int(raw_resp) <= 0:
             raise ValueError(
                 "logical slot/edge is missing a positive "
@@ -1441,6 +1481,15 @@ def build_logical_update_batch(
                 "its prob_mask_token_count was computed under a different "
                 "objective and must not be reused (PLAN.md §4)."
             )
+        if raw_thr is None:
+            _warn_legacy_missing(
+                "probability_mask_threshold",
+                slot.get("edge_id"),
+                "logical record {edge_id!r} is missing "
+                "probability_mask_threshold; legacy/non-canonical batching "
+                "will use the current threshold, but canonical VDRA requires "
+                "the stamped schema-v2 metadata (PLAN.md §4).",
+            )
         raw_mask = slot.get("prob_mask_token_count")
         if not is_ledger_slot(slot):
             # PLAN.md §1: a TRAINABLE row still carries its payload, so its
@@ -1461,13 +1510,12 @@ def build_logical_update_batch(
                     # PLAN.md §4: legacy/non-canonical records may still be
                     # completed here, but never silently — a canonical run
                     # rejects them upstream in the replay validator.
-                    warnings.warn(
+                    _warn_legacy_missing(
+                        "prob_mask_token_count",
+                        slot.get("edge_id"),
                         "recomputing a missing prob_mask_token_count for "
-                        f"edge {slot.get('edge_id')!r}; canonical VDRA "
-                        "requires the stamped schema-v2 denominator metadata "
-                        "(PLAN.md §4).",
-                        RuntimeWarning,
-                        stacklevel=2,
+                        "edge {edge_id!r}; canonical VDRA requires the "
+                        "stamped schema-v2 denominator metadata (PLAN.md §4).",
                     )
                     raw_mask = recomputed
                 elif int(raw_mask) != recomputed:

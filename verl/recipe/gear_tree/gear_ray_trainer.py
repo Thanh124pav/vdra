@@ -590,6 +590,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
                 probability_mask_threshold=float(
                     policy_loss_cfg.get("probability_mask_threshold", 0.9)
                 ),
+                require_logical_denominator_metadata=True,
             )
             # PLAN.md §8: expected optimizer steps count only TRAINABLE
             # logical batches — a skipped batch must not mark the accounting
@@ -1086,6 +1087,10 @@ class RayGearTreeTrainer(RayPPOTrainer):
             self._save_manifest(self.run_manifest)
         except Exception as exc:  # best effort — we are already aborting
             _LOGGER.warning("could not persist the manifest before abort: %s", exc)
+        try:
+            self._save_checkpoint()
+        except Exception as exc:
+            _LOGGER.warning("could not persist a checkpoint before abort: %s", exc)
         try:
             self._maybe_save_replay_buffer()
         except Exception as exc:

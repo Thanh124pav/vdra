@@ -426,7 +426,7 @@ class TestCanonicalDenominatorMetadataRequired:
 
         legacy = _trainable_edge("legacy", with_metadata=False)
         legacy.update({"allocated_k": 2, "tree_total_segment_count": 2})
-        with pytest.warns(RuntimeWarning, match="recomputing a missing"):
+        with pytest.warns(RuntimeWarning, match="missing"):
             build_logical_update_batch(
                 [legacy, _trainable_edge("e1")],
                 _tiny_actor.Tok(),

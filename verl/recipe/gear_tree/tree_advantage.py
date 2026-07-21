@@ -116,10 +116,8 @@ def extract_edges_from_tree(
     ``collect_construction_summaries``: when a list is passed, the per-tree
     construction summary (pre-filter counts and per-parent
     ``realized``/``allocated_k``/``retained`` facts) is appended to it even
-    when every edge of the tree is zero-filtered away. It preserves the
-    construction facts for a parent/tree whose every child has exactly zero
-    advantage. Under sparse execution (``emit_zero_slots``) those children
-    still enter replay as metadata-only logical slots — they produce no
+    when every edge of the tree has exactly zero advantage. Exact-zero
+    children enter replay as metadata-only logical slots; they produce no
     trainable tensor rows, but they do count toward reservation, per-question
     caps and the M_B / T_B denominators.
 
