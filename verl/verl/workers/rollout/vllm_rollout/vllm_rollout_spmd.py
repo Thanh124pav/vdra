@@ -50,7 +50,14 @@ from omegaconf import ListConfig
 from tensordict import TensorDict
 from torch.distributed.device_mesh import DeviceMesh
 from vllm import LLM, SamplingParams
-from vllm.config import CompilationConfig, CompilationLevel, LoRAConfig
+try:
+    from vllm.config import CompilationConfig, CompilationLevel, LoRAConfig
+except ImportError:  # vLLM >= 0.22 exposes CompilationMode instead
+    from vllm.config import CompilationConfig, CompilationMode, LoRAConfig
+
+    class CompilationLevel:
+        PIECEWISE = CompilationMode.VLLM_COMPILE
+
 from vllm.lora.request import LoRARequest
 
 try:
