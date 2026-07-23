@@ -1,4 +1,6 @@
 
+from pathlib import Path
+
 import pytest
 
 from recipe.gear_tree.context_contract import (
@@ -80,3 +82,14 @@ def test_context_contract_rejects_edge_prompt_over_model_context():
     message = str(excinfo.value)
     assert "max_edge_prompt_length=1456 exceeds resolved model context length 1024" in message
     assert "max_response_length=2048" not in message
+
+
+def test_gear_tree_entrypoint_enables_overlong_prompt_filter_for_strict_truncation():
+    source = (
+        Path(__file__).resolve().parents[1] / "main_gear_tree.py"
+    ).read_text()
+
+    assert 'config.data.get("truncation", "error")' in source
+    assert 'data.filter_overlong_prompts", True' in source
+    assert 'data.filter_overlong_prompts_workers", 4' in source
+    assert "before DataLoader workers call postprocess_data" in source

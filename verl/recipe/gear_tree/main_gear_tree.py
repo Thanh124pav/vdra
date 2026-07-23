@@ -84,6 +84,20 @@ class GearTreeTaskRunner(TaskRunnerBase):
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
+        # Strict VDRA keeps truncation=error, so overlong prompts must be
+        # filtered before DataLoader workers call postprocess_data(). This
+        # protects both train and validation datasets, including manual runs
+        # that do not go through scripts/download_data_and_train.sh.
+        if str(config.data.get("truncation", "error")) == "error":
+            if not bool(config.data.get("filter_overlong_prompts", False)):
+                print(
+                    "[data] enabling data.filter_overlong_prompts=true because "
+                    "data.truncation=error would otherwise crash on long prompts"
+                )
+            OmegaConf.update(config, "data.filter_overlong_prompts", True, force_add=True)
+            if int(config.data.get("filter_overlong_prompts_workers", 0) or 0) <= 0:
+                OmegaConf.update(config, "data.filter_overlong_prompts_workers", 4, force_add=True)
+
         reward_kwargs = dict(config.reward_model.get("reward_kwargs", {}) or {})
         gear_tree_cfg = config.get("gear_tree", {}) or {}
         reward_kwargs.setdefault("answer_prefix", gear_tree_cfg.get("answer_prefix", "# Answer\n"))
