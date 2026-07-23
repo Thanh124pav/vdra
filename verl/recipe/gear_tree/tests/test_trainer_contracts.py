@@ -342,6 +342,59 @@ class _FakeGenBatch:
         return self._n
 
 
+def test_agent_loop_worker_derives_vdra_metadata_from_meta_info():
+    from verl.experimental.agent_loop.agent_loop import _ensure_gear_tree_agent_kwargs
+
+    class _Batch:
+        def __init__(self):
+            self.non_tensor_batch = {}
+            self.meta_info = {
+                "gear_tree_config": {
+                    "policy_snapshot_id": "global_step:9",
+                    "gear": {},
+                },
+                "rollout_iteration": 3,
+                "rollout_server_weight_version": "server:v9",
+            }
+
+        def __len__(self):
+            return 2
+
+    config = _Cfg(
+        actor_rollout_ref=_Cfg(
+            actor=_Cfg(
+                policy_loss={
+                    "use_prob_mask": False,
+                    "probability_mask_threshold": 0.75,
+                }
+            )
+        )
+    )
+    batch = _Batch()
+
+    _ensure_gear_tree_agent_kwargs(batch, config)
+
+    assert batch.non_tensor_batch["policy_snapshot_id"].tolist() == [
+        "global_step:9",
+        "global_step:9",
+    ]
+    assert batch.non_tensor_batch["current_rollout_snapshot_id"].tolist() == [
+        "global_step:9",
+        "global_step:9",
+    ]
+    assert batch.non_tensor_batch["rollout_iteration"].tolist() == [3, 3]
+    assert batch.non_tensor_batch["rollout_server_weight_version"].tolist() == [
+        "server:v9",
+        "server:v9",
+    ]
+    assert len(batch.non_tensor_batch["tree_instance_uuid"]) == 2
+    assert batch.non_tensor_batch["policy_use_prob_mask"].tolist() == [False, False]
+    assert batch.non_tensor_batch["policy_probability_mask_threshold"].tolist() == [
+        0.75,
+        0.75,
+    ]
+
+
 def test_agent_loop_worker_derives_prompt_token_ids_from_tensor_batch():
     from verl.experimental.agent_loop.agent_loop import _token_rows_from_batch
 

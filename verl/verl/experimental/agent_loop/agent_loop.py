@@ -18,6 +18,7 @@ import os
 import queue
 import random
 import threading
+import uuid
 from abc import ABC, abstractmethod
 from concurrent.futures import Future
 from typing import Any, Optional
@@ -379,6 +380,68 @@ class RewardManagerWorker:
         return self.reward_manager(data, return_dict)
 
 
+def _object_column(value: Any, count: int) -> np.ndarray:
+    out = np.empty(int(count), dtype=object)
+    out[:] = [value] * int(count)
+    return out
+
+
+def _ensure_gear_tree_agent_kwargs(batch: DataProto, config: DictConfig) -> None:
+    """Mirror VDRA rollout metadata from meta_info into per-row kwargs."""
+
+    meta = getattr(batch, "meta_info", {}) or {}
+    gt = meta.get("gear_tree_config")
+    if gt is None and not (
+        "policy_snapshot_id" in meta or "current_rollout_snapshot_id" in meta
+    ):
+        return
+
+    row_count = len(batch)
+    gear_cfg = (gt or {}).get("gear", {}) if isinstance(gt, dict) else {}
+    snapshot_id = (
+        meta.get("policy_snapshot_id")
+        or meta.get("current_rollout_snapshot_id")
+        or ((gt or {}).get("policy_snapshot_id") if isinstance(gt, dict) else None)
+        or ((gt or {}).get("current_rollout_snapshot_id") if isinstance(gt, dict) else None)
+    )
+    if not snapshot_id and meta.get("global_steps") is not None:
+        snapshot_id = f"global_step:{int(meta['global_steps'])}"
+    if snapshot_id:
+        batch.non_tensor_batch.setdefault(
+            "policy_snapshot_id", _object_column(str(snapshot_id), row_count)
+        )
+        batch.non_tensor_batch.setdefault(
+            "current_rollout_snapshot_id", _object_column(str(snapshot_id), row_count)
+        )
+
+    if "rollout_server_weight_version" not in batch.non_tensor_batch:
+        version = meta.get("rollout_server_weight_version")
+        batch.non_tensor_batch["rollout_server_weight_version"] = _object_column(
+            version, row_count
+        )
+
+    if "rollout_iteration" not in batch.non_tensor_batch:
+        rollout_iteration = meta.get("rollout_iteration", 0)
+        batch.non_tensor_batch["rollout_iteration"] = _object_column(
+            int(rollout_iteration or 0), row_count
+        )
+
+    if "tree_instance_uuid" not in batch.non_tensor_batch:
+        batch.non_tensor_batch["tree_instance_uuid"] = np.array(
+            [uuid.uuid4().hex for _ in range(row_count)], dtype=object
+        )
+
+    policy_loss = config.actor_rollout_ref.actor.policy_loss
+    if "policy_use_prob_mask" not in batch.non_tensor_batch:
+        batch.non_tensor_batch["policy_use_prob_mask"] = _object_column(
+            bool(policy_loss.get("use_prob_mask", True)), row_count
+        )
+    if "policy_probability_mask_threshold" not in batch.non_tensor_batch:
+        batch.non_tensor_batch["policy_probability_mask_threshold"] = _object_column(
+            float(policy_loss.get("probability_mask_threshold", 0.9)), row_count
+        )
+
+
 def _token_rows_from_batch(batch: DataProto, tokenizer: AutoTokenizer) -> Optional[np.ndarray]:
     """Return per-row unpadded prompt token ids for agent-loop kwargs."""
 
@@ -504,6 +567,8 @@ class AgentLoopWorker:
         if "agent_name" not in batch.non_tensor_batch:
             default_agent_loop = config.agent.default_agent_loop
             batch.non_tensor_batch["agent_name"] = np.array([default_agent_loop] * len(batch), dtype=object)
+
+        _ensure_gear_tree_agent_kwargs(batch, self.config)
 
         if (
             "raw_prompt" not in batch.non_tensor_batch
