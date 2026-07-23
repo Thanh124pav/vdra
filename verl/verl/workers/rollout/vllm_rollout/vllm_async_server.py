@@ -61,6 +61,16 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
+def _disable_log_requests(engine_args: Any) -> bool:
+    if hasattr(engine_args, "disable_log_requests"):
+        return bool(engine_args.disable_log_requests)
+    return not bool(getattr(engine_args, "enable_log_requests", False))
+
+
+def _disable_log_stats(engine_args: Any) -> bool:
+    return bool(getattr(engine_args, "disable_log_stats", False))
+
+
 class ExternalZeroMQDistributedExecutor(Executor):
     """An executor that engines are launched by external ray actors."""
 
@@ -306,8 +316,8 @@ class vLLMHttpServer:
         engine_client = AsyncLLM.from_vllm_config(
             vllm_config=vllm_config,
             usage_context=usage_context,
-            disable_log_requests=engine_args.disable_log_requests,
-            disable_log_stats=engine_args.disable_log_stats,
+            disable_log_requests=_disable_log_requests(engine_args),
+            disable_log_stats=_disable_log_stats(engine_args),
         )
 
         # Don't keep the dummy data in memory
@@ -344,7 +354,7 @@ class vLLMHttpServer:
             local_client=False,
             handshake_address=handshake_address,
             executor_class=Executor.get_class(vllm_config),
-            log_stats=not engine_args.disable_log_stats,
+            log_stats=not _disable_log_stats(engine_args),
         )
 
     async def generate(
