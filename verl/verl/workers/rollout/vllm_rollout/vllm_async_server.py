@@ -13,6 +13,7 @@
 # limitations under the License.
 import argparse
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -69,6 +70,16 @@ def _disable_log_requests(engine_args: Any) -> bool:
 
 def _disable_log_stats(engine_args: Any) -> bool:
     return bool(getattr(engine_args, "disable_log_stats", False))
+
+
+def _from_vllm_config_kwargs(engine_args: Any, usage_context: UsageContext) -> dict[str, Any]:
+    kwargs = {
+        "usage_context": usage_context,
+        "disable_log_requests": _disable_log_requests(engine_args),
+        "disable_log_stats": _disable_log_stats(engine_args),
+    }
+    signature = inspect.signature(AsyncLLM.from_vllm_config)
+    return {key: value for key, value in kwargs.items() if key in signature.parameters}
 
 
 class ExternalZeroMQDistributedExecutor(Executor):
@@ -315,9 +326,7 @@ class vLLMHttpServer:
 
         engine_client = AsyncLLM.from_vllm_config(
             vllm_config=vllm_config,
-            usage_context=usage_context,
-            disable_log_requests=_disable_log_requests(engine_args),
-            disable_log_stats=_disable_log_stats(engine_args),
+            **_from_vllm_config_kwargs(engine_args, usage_context),
         )
 
         # Don't keep the dummy data in memory
