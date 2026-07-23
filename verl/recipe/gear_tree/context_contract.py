@@ -6,6 +6,7 @@ exercise the resolver + validator without the full training stack.
 
 from __future__ import annotations
 
+import ast
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 
@@ -48,12 +49,45 @@ def resolve_max_original_prompt_length(data_cfg: Any) -> int:
     return int(_dict_get(data_cfg, "max_prompt_length", 0) or 0)
 
 
+def normalize_tree_shape(tree_shape: Any) -> list[int]:
+    """Return tree_shape as a list of branch factors, including Hydra strings."""
+
+    if tree_shape is None:
+        return []
+    if isinstance(tree_shape, str):
+        raw = tree_shape.strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+            raw = raw[1:-1].strip()
+        try:
+            parsed = ast.literal_eval(raw)
+        except (SyntaxError, ValueError) as exc:
+            raise ValueError(
+                f"gear_tree.tree_shape must be a list of ints, got {tree_shape!r}"
+            ) from exc
+        tree_shape = parsed
+    if isinstance(tree_shape, int):
+        values = [tree_shape]
+    else:
+        try:
+            values = list(tree_shape)
+        except TypeError as exc:
+            raise ValueError(
+                f"gear_tree.tree_shape must be a list of ints, got {tree_shape!r}"
+            ) from exc
+    try:
+        return [int(value) for value in values]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"gear_tree.tree_shape must be a list of ints, got {tree_shape!r}"
+        ) from exc
+
+
 def worst_case_edge_prompt_length(
     *, max_original: int, tree_shape: Sequence[int], segment_length: int
 ) -> int:
     """Length of the deepest legal edge query: L_original + (D-1) * M."""
 
-    max_depth = max(len(list(tree_shape)), 1)
+    max_depth = max(len(normalize_tree_shape(tree_shape)), 1)
     return int(max_original) + max(max_depth - 1, 0) * int(segment_length or 0)
 
 
@@ -69,6 +103,7 @@ def validate_context_contract(
     Raises ``ValueError`` with a diagnostic message on any overflow.
     """
 
+    tree_shape = normalize_tree_shape(tree_shape)
     max_original = resolve_max_original_prompt_length(data_cfg)
     max_edge = resolve_max_edge_prompt_length(data_cfg)
     max_response = int(_dict_get(data_cfg, "max_response_length", 0) or 0)
@@ -81,7 +116,7 @@ def validate_context_contract(
         raise ValueError(
             "context-length bound overflow (PLAN.md P0.2/P0.5): "
             f"max_original_prompt_length={max_original}, deepest edge "
-            f"depth={max(len(list(tree_shape)), 1)}, "
+            f"depth={max(len(tree_shape), 1)}, "
             f"segment_length={segment_length}, worst-case edge "
             f"query length={worst_case} > max_edge_prompt_length={max_edge}. "
             "Either reduce M or tree_shape depth, pre-filter prompts to "

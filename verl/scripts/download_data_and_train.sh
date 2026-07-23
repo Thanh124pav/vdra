@@ -118,10 +118,32 @@ PPO_MICRO_BATCH_PER_GPU="${PPO_MICRO_BATCH_PER_GPU:-32}"
 LOG_PROB_MICRO_BATCH_PER_GPU="${LOG_PROB_MICRO_BATCH_PER_GPU:-32}"
 
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-512}"
+MAX_ORIGINAL_PROMPT_LENGTH="${MAX_ORIGINAL_PROMPT_LENGTH:-${MAX_PROMPT_LENGTH}}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 SEGMENT_LENGTH="${SEGMENT_LENGTH:-600}"
-TREE_SHAPE="${TREE_SHAPE:-'[6,6,6]'}"
+TREE_SHAPE="${TREE_SHAPE:-[6,6,6]}"
+# Hydra list overrides must not be wrapped in literal quotes.
+if [[ "${TREE_SHAPE}" == \'*\' && "${TREE_SHAPE}" == *\' ]]; then
+  TREE_SHAPE="${TREE_SHAPE:1:${#TREE_SHAPE}-2}"
+elif [[ "${TREE_SHAPE}" == \"*\" && "${TREE_SHAPE}" == *\" ]]; then
+  TREE_SHAPE="${TREE_SHAPE:1:${#TREE_SHAPE}-2}"
+fi
+TREE_DEPTH="$(TREE_SHAPE_VALUE="${TREE_SHAPE}" python - <<'PY'
+import ast
+import os
+raw = os.environ["TREE_SHAPE_VALUE"].strip()
+if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+    raw = raw[1:-1].strip()
+value = ast.literal_eval(raw)
+if isinstance(value, int):
+    shape = [value]
+else:
+    shape = list(value)
+print(max(len(shape), 1))
+PY
+)"
+MAX_EDGE_PROMPT_LENGTH="${MAX_EDGE_PROMPT_LENGTH:-$((MAX_ORIGINAL_PROMPT_LENGTH + (TREE_DEPTH - 1) * SEGMENT_LENGTH))}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((MAX_EDGE_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 ANSWER_PREFIX="${ANSWER_PREFIX:-null}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.70}"
 DEFAULT_LOCAL_DIR="${DEFAULT_LOCAL_DIR:-checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
@@ -131,6 +153,8 @@ COMMON_OVERRIDES=(
   "data.train_files=${TRAIN_FILE}"
   "data.val_files=${VAL_FILES}"
   "data.max_prompt_length=${MAX_PROMPT_LENGTH}"
+  "+data.max_original_prompt_length=${MAX_ORIGINAL_PROMPT_LENGTH}"
+  "+data.max_edge_prompt_length=${MAX_EDGE_PROMPT_LENGTH}"
   "data.max_response_length=${MAX_RESPONSE_LENGTH}"
   "data.train_batch_size=${TRAIN_BATCH_SIZE}"
   "data.shuffle=${SHUFFLE}"

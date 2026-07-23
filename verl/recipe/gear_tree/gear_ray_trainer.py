@@ -28,6 +28,7 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 
 from recipe.gear_tree.config_validation import validate_policy_loss_consistency
 from recipe.gear_tree.context_contract import (
+    normalize_tree_shape,
     resolve_max_edge_prompt_length,
     resolve_max_original_prompt_length,
     validate_context_contract,
@@ -152,7 +153,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
     def _new_replay_buffer(self) -> GearTreeReplayBuffer:
         replay_cfg = self._replay_config()
         gt = self._gear_tree_config()
-        tree_shape = list(gt.get("tree_shape") or [])
+        tree_shape = normalize_tree_shape(gt.get("tree_shape") or [])
         return GearTreeReplayBuffer(
             target_edges_per_iteration=int(replay_cfg["target_edges_per_iteration"]),
             max_edge_age_iterations=int(replay_cfg["max_edge_age_iterations"]),
@@ -489,7 +490,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
         # P0.2: single-source validation of the entire context contract.
         validate_context_contract(
             data_cfg=self.config.data,
-            tree_shape=list(gt.get("tree_shape") or []),
+            tree_shape=normalize_tree_shape(gt.get("tree_shape") or []),
             segment_length=int(gt.get("segment_length", 0) or 0),
             model_context_length=model_context,
         )
@@ -853,7 +854,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
             _pl.get("probability_mask_threshold", 0.9)
         )
         manifest.logical_slot_schema_version = LOGICAL_SLOT_SCHEMA_VERSION
-        manifest.tree_shape = [int(x) for x in (gt.get("tree_shape") or [])]
+        manifest.tree_shape = normalize_tree_shape(gt.get("tree_shape") or [])
         manifest.trees_per_question = int(self._resolve_trees_per_question())
         manifest.segment_length = int(gt.get("segment_length", 0) or 0)
         # The resolved auto cap is populated once the replay buffer is built.
