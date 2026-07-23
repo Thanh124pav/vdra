@@ -95,7 +95,11 @@ gear_tree:
   # Penalty for length-truncated MC rollouts (VinePPO unfinished penalty).
   unfinished_penalty: 0.0
 
-  # MATH grading knobs (treetune MATHRewardFunction / MATH task).
+  # MATH grading knobs. Values:
+  #   null: auto-detect parser from the parquet prompt text
+  #   boxed: require a final \boxed{...}
+  #   answer: require the treetune "# Answer\n" delimiter
+  # The historical literal "# Answer\n" remains accepted as answer mode.
   answer_prefix: "# Answer\n"
 
   use_minerva_few_shot_prompt: false

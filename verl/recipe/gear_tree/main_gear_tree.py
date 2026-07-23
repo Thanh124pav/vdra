@@ -84,11 +84,18 @@ class GearTreeTaskRunner(TaskRunnerBase):
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
+        reward_kwargs = dict(config.reward_model.get("reward_kwargs", {}) or {})
+        gear_tree_cfg = config.get("gear_tree", {}) or {}
+        reward_kwargs.setdefault("answer_prefix", gear_tree_cfg.get("answer_prefix", "# Answer\n"))
+        reward_kwargs.setdefault(
+            "use_minerva_few_shot_prompt",
+            gear_tree_cfg.get("use_minerva_few_shot_prompt", False),
+        )
         reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
+            config, tokenizer, num_examine=0, **reward_kwargs
         )
         val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+            config, tokenizer, num_examine=1, **reward_kwargs
         )
         resource_pool_manager = self.init_resource_pool_mgr(config)
 

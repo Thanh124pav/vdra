@@ -624,6 +624,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
         )
 
         rollout_out = self.actor_rollout_wg.generate_sequences(gen_batch)
+        self._last_rollout_reward_parse_metrics = self._collect_rollout_reward_parse_metrics(rollout_out)
         edges = collect_tree_edges(rollout_out)
         # Zero-filter contract: per-tree construction summaries preserve the
         # realized/allocated facts of parents (or whole trees) whose retained
@@ -632,6 +633,29 @@ class RayGearTreeTrainer(RayPPOTrainer):
             rollout_out
         )
         return self._normalize_generated_edges(edges, snapshot_id=snapshot_id)
+
+    def _collect_rollout_reward_parse_metrics(self, rollout_out: DataProto) -> Dict[str, float]:
+        stats_items = []
+        if getattr(rollout_out, "non_tensor_batch", None) is not None:
+            stats_items = list(rollout_out.non_tensor_batch.get("gear_tree_reward_parse_stats", []) or [])
+        attempts = 0.0
+        failures = 0.0
+        boxed = 0.0
+        answer = 0.0
+        for item in stats_items:
+            if not isinstance(item, dict):
+                continue
+            attempts += float(item.get("reward/answer_parse_attempts", 0.0) or 0.0)
+            failures += float(item.get("reward/answer_parse_failures", 0.0) or 0.0)
+            boxed += float(item.get("reward/answer_parse_mode_boxed", 0.0) or 0.0)
+            answer += float(item.get("reward/answer_parse_mode_answer", 0.0) or 0.0)
+        return {
+            "reward/answer_parse_attempts": attempts,
+            "reward/answer_parse_failures": failures,
+            "reward/answer_parse_failure_rate": float(failures / attempts) if attempts else 0.0,
+            "reward/answer_parse_mode_boxed": boxed,
+            "reward/answer_parse_mode_answer": answer,
+        }
 
     def _normalize_generated_edges(
         self, edges: List[Dict[str, Any]], *, snapshot_id: str
@@ -1814,6 +1838,7 @@ class RayGearTreeTrainer(RayPPOTrainer):
                     t0 = time.time()
                     new_edges = self._generate_tree_edges(gen_batch)
                     t_gen = time.time() - t0
+                    metrics.update(getattr(self, "_last_rollout_reward_parse_metrics", {}) or {})
                     # PLAN.md P0.B: full-tree CONSTRUCTION validation runs on the
                     # complete generated batch, before replay insertion. This is
                     # the only stage that may require complete parent groups and

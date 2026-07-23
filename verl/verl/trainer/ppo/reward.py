@@ -142,6 +142,15 @@ def load_reward_manager(
         else:
             final_compute_score = default_compute_score
 
+    if reward_manager_name == "gear_math" and "answer_prefix" not in reward_kwargs:
+        gear_tree_config = config.get("gear_tree", None)
+        if gear_tree_config is not None:
+            reward_kwargs["answer_prefix"] = gear_tree_config.get("answer_prefix", "# Answer\n")
+            reward_kwargs.setdefault(
+                "use_minerva_few_shot_prompt",
+                gear_tree_config.get("use_minerva_few_shot_prompt", False),
+            )
+
     # Instantiate and return the reward manager with the specified parameters
     return reward_manager_cls(
         tokenizer=tokenizer,

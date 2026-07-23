@@ -651,6 +651,18 @@ class RayPPOTrainer:
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
 
+        if "answer_parse_failed" in reward_extra_infos_dict:
+            parse_failed = np.asarray(reward_extra_infos_dict["answer_parse_failed"], dtype=float)
+            for data_source in sorted(set(data_sources.tolist())):
+                mask = data_sources == data_source
+                total = int(mask.sum())
+                failures = float(parse_failed[mask].sum()) if total else 0.0
+                metric_dict[f"val-aux/{data_source}/answer_parse_failed/count"] = failures
+                metric_dict[f"val-aux/{data_source}/answer_parse_failed/total"] = float(total)
+                metric_dict[f"val-aux/{data_source}/answer_parse_failed/rate"] = (
+                    failures / float(total) if total else 0.0
+                )
+
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)
             metric_dict["val-aux/num_turns/min"] = sample_turns.min()
@@ -1141,6 +1153,13 @@ class RayPPOTrainer:
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            if "answer_parse_failed" in reward_extra_infos_dict:
+                                parse_failed = np.asarray(reward_extra_infos_dict["answer_parse_failed"], dtype=float)
+                                metrics["reward/answer_parse_attempts"] = float(parse_failed.size)
+                                metrics["reward/answer_parse_failures"] = float(parse_failed.sum())
+                                metrics["reward/answer_parse_failure_rate"] = (
+                                    float(parse_failed.mean()) if parse_failed.size else 0.0
+                                )
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:

@@ -346,6 +346,7 @@ def test_generate_tree_edges_injects_policy_snapshot_into_config():
     trainer = _trainer()
     trainer.global_steps = 7
     trainer.rollout_iteration = 1
+    trainer._fetch_rollout_server_weight_version = lambda gear_cfg: None
     seen = {}
     seen_rows = {}
 
@@ -368,6 +369,36 @@ def test_generate_tree_edges_injects_policy_snapshot_into_config():
     # P0.1: every prompt row carries the snapshot id via non_tensor_batch
     assert seen_rows["policy_snapshot_id"] == ["global_step:7"] * 3
     assert seen_rows["current_rollout_snapshot_id"] == ["global_step:7"] * 3
+
+
+def test_collect_rollout_reward_parse_metrics_sums_per_prompt():
+    trainer = _trainer()
+    rollout_out = SimpleNamespace(
+        non_tensor_batch={
+            "gear_tree_reward_parse_stats": [
+                {
+                    "reward/answer_parse_attempts": 3.0,
+                    "reward/answer_parse_failures": 1.0,
+                    "reward/answer_parse_mode_boxed": 3.0,
+                    "reward/answer_parse_mode_answer": 0.0,
+                },
+                {
+                    "reward/answer_parse_attempts": 2.0,
+                    "reward/answer_parse_failures": 0.0,
+                    "reward/answer_parse_mode_boxed": 0.0,
+                    "reward/answer_parse_mode_answer": 2.0,
+                },
+            ]
+        }
+    )
+
+    metrics = trainer._collect_rollout_reward_parse_metrics(rollout_out)
+
+    assert metrics["reward/answer_parse_attempts"] == 5.0
+    assert metrics["reward/answer_parse_failures"] == 1.0
+    assert metrics["reward/answer_parse_failure_rate"] == pytest.approx(0.2)
+    assert metrics["reward/answer_parse_mode_boxed"] == 3.0
+    assert metrics["reward/answer_parse_mode_answer"] == 2.0
 
 
 def test_scorer_cache_reuses_client_across_calls(monkeypatch):

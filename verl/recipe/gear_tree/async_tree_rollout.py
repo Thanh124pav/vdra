@@ -621,6 +621,10 @@ try:  # keep CPU-importable when agent_loop isn't installed
             # scorer keeps its init-time weight_version even after the actor
             # has stepped, and strict-mode invariants would compare stale
             # state.
+            run_reward_fn = MathRewardFunction(
+                answer_prefix=self._gt.get("answer_prefix", "# Answer\n"),
+                use_minerva_few_shot_prompt=self._gt.get("use_minerva_few_shot_prompt", False),
+            )
             if self._gate is not None:
                 # P0.1: pass the rollout server's own fingerprint separately so
                 # bind_snapshot can compare it against the scorer's fingerprint
@@ -635,11 +639,9 @@ try:  # keep CPU-importable when agent_loop isn't installed
                 )
                 # P0.4: wire the terminal grader so terminal pilots contribute
                 # observed reward differences to the dispersion estimate.
-                reward_fn = self._reward_fn
-
                 def _terminal_grader(node):
                     text = node.get("full_text") or node.get("text") or ""
-                    return float(reward_fn(prompt_text, text, data_instance)[0])
+                    return float(run_reward_fn(prompt_text, text, data_instance)[0])
 
                 self._gate.set_terminal_reward_fn(_terminal_grader)
 
@@ -656,7 +658,7 @@ try:  # keep CPU-importable when agent_loop isn't installed
             )
             edges = await build_tree_edges_async(
                 prompt_text, prompt_ids, data_instance,
-                segment_generator=per_call_gen, reward_fn=self._reward_fn,
+                segment_generator=per_call_gen, reward_fn=run_reward_fn,
                 tree_shape=self._gt.get("tree_shape", [6, 6, 6]),
                 M=self._gt.get("segment_length", 100), gear_gate=self._gate,
                 tree_update_mode=self._gt.get("tree_update_mode", "spo"),
@@ -711,6 +713,7 @@ try:  # keep CPU-importable when agent_loop isn't installed
                     # downstream logging can prove which distribution the
                     # rollout actually used.
                     "gear_tree_resolved_sampling_params": dict(resolved_sp),
+                    "gear_tree_reward_parse_stats": run_reward_fn.parse_metrics(),
                 },
             )
 

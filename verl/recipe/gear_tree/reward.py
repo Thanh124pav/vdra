@@ -12,6 +12,11 @@ from verl.workers.reward_manager import register
 from verl.workers.reward_manager.abstract import AbstractRewardManager
 
 from recipe.gear_tree.gear_core.grading.math_grader import grade_answer
+from recipe.gear_tree.gear_core.reward_function import (
+    ANSWER_PREFIX,
+    extract_predicted_answer,
+    normalize_answer_parse_mode,
+)
 
 
 def compute_gear_math_score(
@@ -38,12 +43,23 @@ def compute_gear_math_score(
 class GearMathRewardManager(AbstractRewardManager):
     """verl reward manager that mirrors treetune math grading semantics."""
 
-    def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source", **kwargs) -> None:
+    def __init__(
+        self,
+        tokenizer,
+        num_examine,
+        compute_score=None,
+        reward_fn_key="data_source",
+        answer_prefix=ANSWER_PREFIX,
+        use_minerva_few_shot_prompt=False,
+        **kwargs,
+    ) -> None:
         _ = kwargs
         self.tokenizer = tokenizer
         self.num_examine = num_examine
         self.compute_score = compute_score or compute_gear_math_score
         self.reward_fn_key = reward_fn_key
+        self.answer_prefix = answer_prefix
+        self.use_minerva_few_shot_prompt = bool(use_minerva_few_shot_prompt)
 
     def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
         # P1.7: the tree rollout already grades every leaf via MathRewardFunction
@@ -88,17 +104,42 @@ class GearMathRewardManager(AbstractRewardManager):
             ground_truth = reward_model.get("ground_truth", item.non_tensor_batch.get("ground_truth"))
             data_source = item.non_tensor_batch.get(self.reward_fn_key, "gear_math")
             extra_info = dict(item.non_tensor_batch.get("extra_info", {}))
+            problem = extra_info.get("problem") or extra_info.get("question") or prompt_str
+            metadata_answer = extra_info.get("predicted_answer", extra_info.get("answer"))
+            if metadata_answer is not None:
+                predicted_answer = str(metadata_answer)
+                parse_mode = "metadata"
+            else:
+                predicted_answer, parse_mode = extract_predicted_answer(
+                    text=response_str,
+                    problem=problem,
+                    prompt=prompt_str,
+                    answer_prefix=self.answer_prefix,
+                    use_minerva_few_shot_prompt=self.use_minerva_few_shot_prompt,
+                )
+            parse_failed = predicted_answer is None
+            scoring_extra_info = dict(extra_info)
+            if predicted_answer is not None:
+                scoring_extra_info["predicted_answer"] = predicted_answer
 
-            score = self.compute_score(
-                data_source=data_source,
-                solution_str=response_str,
-                ground_truth=ground_truth,
-                extra_info=extra_info,
-            )
+            if parse_failed:
+                score = {"score": 0.0, "correct": False, "given_answer": ""}
+            else:
+                score = self.compute_score(
+                    data_source=data_source,
+                    solution_str=response_str,
+                    ground_truth=ground_truth,
+                    extra_info=scoring_extra_info,
+                )
             reward = score["score"] if isinstance(score, dict) else score
             if isinstance(score, dict):
                 for key, value in score.items():
                     reward_extra_info[key].append(value)
+            configured_mode, _ = normalize_answer_parse_mode(self.answer_prefix)
+            reward_extra_info["answer_parse_failed"].append(float(parse_failed))
+            reward_extra_info["answer_parse_mode_boxed"].append(float(parse_mode == "boxed"))
+            reward_extra_info["answer_parse_mode_answer"].append(float(parse_mode == "answer"))
+            reward_extra_info["answer_parse_mode_auto"].append(float(configured_mode == "auto"))
 
             if valid_response_length > 0:
                 reward_tensor[i, valid_response_length - 1] = float(reward)
