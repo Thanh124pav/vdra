@@ -473,6 +473,53 @@ def _build_gate_cpu(gt: dict, tokenizer: Any = None):
     )
 
 
+def _format_openai_api_base(host: Any, port: Any) -> str:
+    host_text = str(host).strip()
+    if host_text.startswith("[") and host_text.endswith("]"):
+        host_text = host_text[1:-1]
+    if ":" in host_text and not host_text.startswith("["):
+        host_text = f"[{host_text}]"
+    return f"http://{host_text}:{int(port)}/v1"
+
+
+def _resolve_rollout_server_api_base(server_manager: Any, *, timeout: float = 10.0) -> Optional[str]:
+    """Resolve the OpenAI-compatible rollout endpoint from Ray server handles."""
+    handles = list(getattr(server_manager, "server_handles", []) or [])
+    if not handles:
+        return None
+
+    import ray
+
+    for handle in handles:
+        try:
+            address, port = ray.get(handle.get_server_address.remote(), timeout=timeout)
+        except Exception:
+            continue
+        if address and port:
+            return _format_openai_api_base(address, port)
+    return None
+
+
+def _attach_rollout_scorer_endpoint(gear_cfg: dict, server_manager: Any) -> dict:
+    """Point VDRA's log-prob scorer at the rollout server when configured to share it."""
+    if not bool(gear_cfg.get("enabled", False)):
+        return gear_cfg
+    if not bool(gear_cfg.get("scorer_uses_rollout_server", False)):
+        return gear_cfg
+    api_base = _resolve_rollout_server_api_base(
+        server_manager,
+        timeout=float(gear_cfg.get("scorer_model_resolve_timeout", 10.0)),
+    )
+    if not api_base:
+        raise RuntimeError(
+            "gear_tree.gear.scorer_uses_rollout_server=true but no rollout "
+            "vLLM server endpoint could be resolved from Ray server handles."
+        )
+    gear_cfg["rollout_api_base"] = api_base
+    gear_cfg["scorer_api_base"] = api_base
+    return gear_cfg
+
+
 # --------------------------------------------------------------------------- #
 # TreeAgentLoop — registered agent for verl's agent-loop framework (GPU path).
 # --------------------------------------------------------------------------- #
@@ -497,6 +544,7 @@ try:  # keep CPU-importable when agent_loop isn't installed
             actual_top_p = float(rollout_config.top_p)
             gear_cfg["rollout_temperature"] = actual_temp
             gear_cfg["rollout_top_p"] = actual_top_p
+            gear_cfg = _attach_rollout_scorer_endpoint(gear_cfg, self.server_manager)
             # Enforce the tanh-TV estimator's distributional prerequisites.
             # The scorer implements the untransformed p(a|s); if the rollout
             # server samples under (temperature, top_p) != (1, 1) then scorer

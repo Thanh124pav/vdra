@@ -558,6 +558,42 @@ def test_tree_agent_loop_uses_trainer_rollout_config_attribute():
     assert "self.rollout_config" not in src
 
 
+def test_tree_agent_loop_auto_resolves_rollout_scorer_endpoint(monkeypatch):
+    import inspect
+    import sys
+
+    from recipe.gear_tree import async_tree_rollout as atr
+
+    src = Path(inspect.getfile(atr)).read_text()
+    assert "gear_cfg = _attach_rollout_scorer_endpoint(gear_cfg, self.server_manager)" in src
+
+    class _RemoteGetAddress:
+        def remote(self):
+            return "fake-ref"
+
+    class _ServerHandle:
+        get_server_address = _RemoteGetAddress()
+
+    fake_ray = SimpleNamespace(
+        get=lambda ref, timeout=None: ("10.0.0.5", 12345)
+    )
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+    gear_cfg = {
+        "enabled": True,
+        "scorer_uses_rollout_server": True,
+        "scorer_api_base": "http://127.0.0.1:8000/v1",
+    }
+    out = atr._attach_rollout_scorer_endpoint(
+        gear_cfg,
+        SimpleNamespace(server_handles=[_ServerHandle()]),
+    )
+
+    assert out is gear_cfg
+    assert out["rollout_api_base"] == "http://10.0.0.5:12345/v1"
+    assert out["scorer_api_base"] == "http://10.0.0.5:12345/v1"
+
+
 def test_gear_tree_ray_runtime_env_exports_repo_pythonpath():
     main_source = (Path(__file__).resolve().parents[1] / "main_gear_tree.py").read_text()
     script_source = (
