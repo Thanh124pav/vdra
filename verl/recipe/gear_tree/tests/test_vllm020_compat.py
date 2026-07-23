@@ -51,8 +51,12 @@ def test_vllm020_rollout_uses_020_imports_without_newer_fallbacks():
     source = _read("verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py")
     server_source = _read("verl/workers/rollout/vllm_rollout/vllm_async_server.py")
 
-    assert "from vllm.config import CompilationConfig, CompilationLevel, LoRAConfig" in source
-    assert "CompilationMode" not in source
+    assert "from vllm.config import CompilationConfig, LoRAConfig" in source
+    assert "from vllm.config.compilation import CUDAGraphMode, CompilationMode" in source
+    assert "CompilationLevel" not in source
+    assert "mode=CompilationMode.VLLM_COMPILE" in source
+    assert "cudagraph_mode=CUDAGraphMode.PIECEWISE" in source
+    assert "cudagraph_capture_sizes=list(cudagraph_capture_sizes)" in source
     assert "vLLM >= 0.22" not in source
     assert "self.inference_engine.add_lora(lora_reqest)" in source
     assert "self.inference_engine.worker.add_lora" not in source
