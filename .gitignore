@@ -12,6 +12,10 @@ wandb/
 data/
 local/
 third_party/
+# Keep VERL vendored compatibility shims tracked; rollout/checkpoint code imports them.
+!verl/verl/third_party/
+!verl/verl/third_party/**/
+!verl/verl/third_party/**/*.py
 *.swp
 .DS_Store
 slides
