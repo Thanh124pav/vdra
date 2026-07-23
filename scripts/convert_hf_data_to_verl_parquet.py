@@ -35,7 +35,21 @@ HF_SOURCES: dict[str, dict[str, Any]] = {
         "revision": "e53f048856ff4f594e959d75785d2c2d37b678ee",
     },
     "math": {
-        "repo_id": "DigitalLearningGmbH/MATH-lighteval",
+        "repo_id": "EleutherAI/hendrycks_math",
+        "config_names": [
+            "algebra",
+            "counting_and_probability",
+            "geometry",
+            "intermediate_algebra",
+            "number_theory",
+            "prealgebra",
+            "precalculus",
+        ],
+        "test_repo_id": "HuggingFaceH4/MATH-500",
+        "test_source_config": "MATH-500",
+    },
+    "math500": {
+        "repo_id": "HuggingFaceH4/MATH-500",
     },
     "aime24": {
         "repo_id": "math-ai/aime24",
@@ -75,6 +89,7 @@ EXTRA_STRING_FIELDS = (
     "license",
     "data_topic",
     "answer_type",
+    "type",
     "is_multiple_answer",
     "unit",
     "error",
@@ -240,6 +255,7 @@ def _olympiadbench_hf_answer(example: dict[str, Any]) -> str:
 ADAPTERS: dict[str, Adapter] = {
     "gsm8k": Adapter("gsm8k", "question", _extract_gsm8k_answer),
     "math": Adapter("math", "problem", _answer_from_field("answer", boxed_fallback_fields=("solution",))),
+    "math500": Adapter("math500", "problem", _answer_from_field("answer", boxed_fallback_fields=("solution",))),
     "aime24": Adapter("aime24", "problem", _boxed_from_field("solution")),
     "aime25": Adapter("aime25", "problem", _answer_from_field("answer")),
     "amc23": Adapter("amc23", "question", _answer_from_field("answer")),
@@ -280,16 +296,46 @@ def _datasetdict_from_loaded(loaded: datasets.Dataset | datasets.DatasetDict) ->
     raise ConversionError(f"expected Dataset or DatasetDict, got {type(loaded)!r}")
 
 
+def _with_source_config(dataset: datasets.DatasetDict, config_name: str) -> datasets.DatasetDict:
+    return datasets.DatasetDict(
+        {
+            split: split_dataset.map(lambda _: {"__source_config": config_name})
+            for split, split_dataset in dataset.items()
+        }
+    )
+
+
 def _load_hf_dataset(dataset_name: str) -> datasets.DatasetDict:
     if dataset_name not in HF_SOURCES:
         raise ConversionError(f"dataset {dataset_name!r} has no HuggingFace source mapping")
     source = HF_SOURCES[dataset_name]
     kwargs = {"revision": source["revision"]} if source.get("revision") else {}
+    repo_id = source["repo_id"]
+    config_names = source.get("config_names")
+    if config_names:
+        per_config = [
+            _with_source_config(_datasetdict_from_loaded(datasets.load_dataset(repo_id, config, **kwargs)), config)
+            for config in config_names
+        ]
+        splits = sorted({split for dataset in per_config for split in dataset.keys()})
+        merged = datasets.DatasetDict()
+        for split in splits:
+            parts = [dataset[split] for dataset in per_config if split in dataset]
+            merged[split] = datasets.concatenate_datasets(parts)
+        test_repo_id = source.get("test_repo_id")
+        if test_repo_id:
+            test_loaded = _datasetdict_from_loaded(datasets.load_dataset(test_repo_id))
+            if "test" not in test_loaded:
+                raise ConversionError(f"{test_repo_id} does not provide a test split")
+            merged["test"] = test_loaded["test"].map(
+                lambda _: {"__source_config": str(source.get("test_source_config", test_repo_id))}
+            )
+        return merged
     config_name = source.get("config_name")
     if config_name:
-        loaded = datasets.load_dataset(source["repo_id"], config_name, **kwargs)
-    else:
-        loaded = datasets.load_dataset(source["repo_id"], **kwargs)
+        loaded = datasets.load_dataset(repo_id, config_name, **kwargs)
+        return _with_source_config(_datasetdict_from_loaded(loaded), str(config_name))
+    loaded = datasets.load_dataset(repo_id, **kwargs)
     return _datasetdict_from_loaded(loaded)
 
 
@@ -332,7 +378,15 @@ def _source_repo(dataset_name: str) -> str:
 
 
 def _source_config(dataset_name: str) -> str:
-    return str(HF_SOURCES.get(dataset_name, {}).get("config_name", ""))
+    source = HF_SOURCES.get(dataset_name, {})
+    if "config_name" in source:
+        return str(source.get("config_name", ""))
+    if "config_names" in source:
+        configs = ",".join(str(item) for item in source.get("config_names", ()))
+        if source.get("test_source_config"):
+            return f"train:{configs};test:{source['test_source_config']}"
+        return configs
+    return ""
 
 
 def _build_extra_info(dataset_name: str, split: str, idx: int, example: dict[str, Any]) -> dict[str, Any]:
@@ -340,12 +394,16 @@ def _build_extra_info(dataset_name: str, split: str, idx: int, example: dict[str
     extra["dataset"] = str(dataset_name)
     extra["split"] = str(split)
     extra["source_repo"] = _source_repo(dataset_name)
-    extra["source_config"] = _source_config(dataset_name)
+    extra["source_config"] = _clean_text(example.get("__source_config")) or _source_config(dataset_name)
     for field in EXTRA_STRING_FIELDS:
         if field in {"dataset", "split", "source_repo", "source_config"}:
             continue
         if field in example and example[field] is not None:
             extra[field] = _clean_text(example[field])
+    if not extra.get("subject") and example.get("type") is not None:
+        extra["subject"] = _clean_text(example.get("type"))
+    if not extra.get("question_type") and example.get("type") is not None:
+        extra["question_type"] = _clean_text(example.get("type"))
     extra["index"] = int(idx)
     return extra
 
