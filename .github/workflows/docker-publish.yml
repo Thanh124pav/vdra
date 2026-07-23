@@ -1,0 +1,97 @@
+name: Build and Push Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_name:
+        description: "Docker Hub image name, e.g. thanh124pav/vdra. Empty => $DOCKERHUB_USERNAME/vdra"
+        required: false
+        default: ""
+      image_tag:
+        description: "Docker image tag to push"
+        required: true
+        default: "latest"
+      base_image:
+        description: "Base image used by docker/Dockerfile.github"
+        required: true
+        default: "verlai/verl:uv.cu130"
+      install_requirements:
+        description: "Install requirements.txt during image build"
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Resolve image tags
+        id: image
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          INPUT_IMAGE_NAME: ${{ inputs.image_name }}
+          INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          image_name="${INPUT_IMAGE_NAME}"
+          if [[ -z "${image_name}" ]]; then
+            if [[ -z "${DOCKERHUB_USERNAME}" ]]; then
+              echo "Either workflow input image_name or secret DOCKERHUB_USERNAME must be set." >&2
+              exit 1
+            fi
+            image_name="${DOCKERHUB_USERNAME}/vdra"
+          fi
+
+          tag="${INPUT_IMAGE_TAG}"
+          if [[ -z "${tag}" ]]; then
+            echo "image_tag cannot be empty." >&2
+            exit 1
+          fi
+
+          echo "image_name=${image_name}" >> "${GITHUB_OUTPUT}"
+          echo "primary_tag=${image_name}:${tag}" >> "${GITHUB_OUTPUT}"
+          echo "sha_tag=${image_name}:sha-${GITHUB_SHA::12}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.github
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            BASE_IMAGE=${{ inputs.base_image }}
+            INSTALL_REQUIREMENTS=${{ inputs.install_requirements }}
+          tags: |
+            ${{ steps.image.outputs.primary_tag }}
+            ${{ steps.image.outputs.sha_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Print image
+        run: |
+          echo "Pushed ${{ steps.image.outputs.primary_tag }}"
+          echo "Also pushed ${{ steps.image.outputs.sha_tag }}"

@@ -1,0 +1,29 @@
+.git
+.github
+.agents
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.cache
+
+# Local datasets/checkpoints/logs are huge and should not enter the Docker build context.
+data/
+verl/data/
+checkpoints/
+outputs/
+wandb/
+runs/
+logs/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.parquet
+*.jsonl
+
+# Local helper files from Windows/desktop sessions.
+requirements_small.txt
+requirements_small.txt:Zone.Identifier

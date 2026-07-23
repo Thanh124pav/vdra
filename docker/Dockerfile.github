@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1.7
+
+ARG BASE_IMAGE=verlai/verl:uv.cu130
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    VDRA_WORKSPACE=/workspace/vdra
+
+WORKDIR /workspace/vdra
+
+# Keep dependency installation opt-in because the verlai/verl base image already
+# carries the CUDA/vLLM stack. Reinstalling torch/vLLM-era packages from
+# requirements.txt can accidentally replace CUDA-matched wheels.
+ARG INSTALL_REQUIREMENTS=false
+COPY requirements.txt /tmp/vdra-requirements.txt
+RUN if [ "${INSTALL_REQUIREMENTS}" = "true" ]; then \
+      (python3 -m pip install --upgrade pip || python -m pip install --upgrade pip) && \
+      (python3 -m pip install -r /tmp/vdra-requirements.txt || python -m pip install -r /tmp/vdra-requirements.txt); \
+    fi
+
+COPY . /workspace/vdra
+
+# Install the local VERL checkout without dependency resolution so the selected
+# base image remains the source of truth for CUDA, torch, vLLM, flash-attn, etc.
+RUN (python3 -m pip install --no-deps -e /workspace/vdra/verl || \
+     python -m pip install --no-deps -e /workspace/vdra/verl)
+
+ENV PYTHONPATH=/workspace/vdra/verl:${PYTHONPATH}
+WORKDIR /workspace/vdra/verl
+
+CMD ["bash"]
