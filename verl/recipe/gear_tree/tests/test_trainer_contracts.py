@@ -342,6 +342,34 @@ class _FakeGenBatch:
         return self._n
 
 
+def test_agent_loop_worker_derives_vdra_metadata_from_trajectory():
+    from verl.experimental.agent_loop.agent_loop import (
+        _ensure_gear_tree_trajectory_kwargs,
+    )
+
+    kwargs = {}
+    config = _Cfg(
+        actor_rollout_ref=_Cfg(
+            actor=_Cfg(
+                policy_loss={
+                    "use_prob_mask": True,
+                    "probability_mask_threshold": 0.8,
+                }
+            )
+        )
+    )
+
+    _ensure_gear_tree_trajectory_kwargs(kwargs, {"step": 11}, config)
+
+    assert kwargs["policy_snapshot_id"] == "global_step:11"
+    assert kwargs["current_rollout_snapshot_id"] == "global_step:11"
+    assert kwargs["rollout_server_weight_version"] is None
+    assert kwargs["rollout_iteration"] == 0
+    assert kwargs["tree_instance_uuid"]
+    assert kwargs["policy_use_prob_mask"] is True
+    assert kwargs["policy_probability_mask_threshold"] == 0.8
+
+
 def test_agent_loop_worker_derives_vdra_metadata_from_meta_info():
     from verl.experimental.agent_loop.agent_loop import _ensure_gear_tree_agent_kwargs
 

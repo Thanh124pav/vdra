@@ -386,6 +386,38 @@ def _object_column(value: Any, count: int) -> np.ndarray:
     return out
 
 
+def _ensure_gear_tree_trajectory_kwargs(
+    kwargs: dict[str, Any], trajectory: dict[str, Any], config: DictConfig
+) -> None:
+    """Last-mile VDRA kwargs fallback when DataProto metadata was stripped."""
+
+    if not (
+        "policy_snapshot_id" in kwargs or "current_rollout_snapshot_id" in kwargs
+    ):
+        step = trajectory.get("step", -1)
+        try:
+            step_int = int(step)
+        except Exception:
+            step_int = -1
+        if step_int >= 0:
+            snapshot_id = f"global_step:{step_int}"
+            kwargs["policy_snapshot_id"] = snapshot_id
+            kwargs["current_rollout_snapshot_id"] = snapshot_id
+
+    kwargs.setdefault("rollout_server_weight_version", None)
+    kwargs.setdefault("rollout_iteration", 0)
+    kwargs.setdefault("tree_instance_uuid", uuid.uuid4().hex)
+
+    policy_loss = config.actor_rollout_ref.actor.policy_loss
+    kwargs.setdefault(
+        "policy_use_prob_mask", bool(policy_loss.get("use_prob_mask", True))
+    )
+    kwargs.setdefault(
+        "policy_probability_mask_threshold",
+        float(policy_loss.get("probability_mask_threshold", 0.9)),
+    )
+
+
 def _ensure_gear_tree_agent_kwargs(batch: DataProto, config: DictConfig) -> None:
     """Mirror VDRA rollout metadata from meta_info into per-row kwargs."""
 
@@ -624,6 +656,8 @@ class AgentLoopWorker:
                 tokenizer=self.tokenizer,
                 processor=self.processor,
             )
+            if agent_name == "gear_tree_agent":
+                _ensure_gear_tree_trajectory_kwargs(kwargs, trajectory, self.config)
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
 
             # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
