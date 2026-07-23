@@ -37,3 +37,11 @@ def test_vllm020_worker_wrapper_uses_v1_lazy_init_api():
     assert "from vllm.worker.worker_base import WorkerWrapperBase" not in source
     assert "WorkerWrapperBase(vllm_config=" not in source
     assert "self.inference_engine = WorkerWrapperBase()" in source
+
+
+def test_vllm020_worker_dispatch_does_not_use_removed_execute_method():
+    source = _read("verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py")
+
+    assert "self.inference_engine.execute_method" not in source
+    assert "getattr(self.inference_engine, method)(*args, **kwargs)" in source
+    assert "pickle.loads(method)(self.inference_engine, *args, **kwargs)" in source

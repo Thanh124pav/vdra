@@ -570,8 +570,10 @@ class vLLMAsyncRollout(BaseRollout):
             return self._load_model(*args, **kwargs)
         elif method == "sleep" or method == "wake_up":
             raise ValueError("wake_up and sleep should not be called through ZeroMQ")
+        elif isinstance(method, bytes):
+            return pickle.loads(method)(self.inference_engine, *args, **kwargs)
         else:
-            return self.inference_engine.execute_method(method, *args, **kwargs)
+            return getattr(self.inference_engine, method)(*args, **kwargs)
 
     async def resume(self, tags: list[str]):
         """Resume rollout weights or kv cache in GPU memory.
