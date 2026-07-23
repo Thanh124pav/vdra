@@ -487,12 +487,14 @@ try:  # keep CPU-importable when agent_loop isn't installed
             super().__init__(*args, **kwargs)
             gt = dict(self.config.get("gear_tree", {}))
             gear_cfg = dict(gt.get("gear", {}))
+            rollout_config = self.config.actor_rollout_ref.rollout
+            self._rollout_config = rollout_config
             # P0.3: overwrite, don't setdefault. Nested VDRA config often carries
             # stale rollout_temperature/rollout_top_p from an earlier ablation;
             # the strict gate must validate the *actual* sampling distribution
             # used by the async rollout server, which is rollout_config.*.
-            actual_temp = float(self.rollout_config.temperature)
-            actual_top_p = float(self.rollout_config.top_p)
+            actual_temp = float(rollout_config.temperature)
+            actual_top_p = float(rollout_config.top_p)
             gear_cfg["rollout_temperature"] = actual_temp
             gear_cfg["rollout_top_p"] = actual_top_p
             # Enforce the tanh-TV estimator's distributional prerequisites.
@@ -515,10 +517,10 @@ try:  # keep CPU-importable when agent_loop isn't installed
             self._gen = AsyncServerSegmentGenerator(
                 self.server_manager, self.tokenizer,
                 base_sampling_params={
-                    "temperature": self.rollout_config.temperature,
-                    "top_p": self.rollout_config.top_p,
+                    "temperature": rollout_config.temperature,
+                    "top_p": rollout_config.top_p,
                 },
-                free_max_tokens=self.rollout_config.response_length,
+                free_max_tokens=rollout_config.response_length,
             )
             self._reward_fn = MathRewardFunction(
                 answer_prefix=gt.get("answer_prefix", "# Answer\n"),
@@ -688,7 +690,7 @@ try:  # keep CPU-importable when agent_loop isn't installed
             resp = (edges[0].get("response_token_ids") if edges else [self.tokenizer.eos_token_id]) or [
                 self.tokenizer.eos_token_id
             ]
-            resp = resp[: self.rollout_config.response_length]
+            resp = resp[: self._rollout_config.response_length]
             # P1.2: skip placeholder reward computation. The custom trainer
             # scores tree edges, not this placeholder — grading it wastes
             # reward-model calls (and, for MathReward, can flag legitimate

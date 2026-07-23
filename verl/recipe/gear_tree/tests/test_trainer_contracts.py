@@ -543,3 +543,16 @@ def test_missing_edge_weight_defaults_to_one_when_batch_has_weights():
     batch = trainer._edges_to_update_batch([weighted, plain], {})
     assert batch.batch["edge_weights"][0, :2].tolist() == [2.0, 2.0]
     assert batch.batch["edge_weights"][1, :2].tolist() == [1.0, 1.0]
+
+
+def test_tree_agent_loop_uses_trainer_rollout_config_attribute():
+    import inspect
+
+    from recipe.gear_tree import async_tree_rollout as atr
+
+    src = Path(inspect.getfile(atr)).read_text()
+    assert "rollout_config = self.config.actor_rollout_ref.rollout" in src
+    assert "self._rollout_config = rollout_config" in src
+    assert "actual_temp = float(rollout_config.temperature)" in src
+    assert "free_max_tokens=rollout_config.response_length" in src
+    assert "self.rollout_config" not in src
