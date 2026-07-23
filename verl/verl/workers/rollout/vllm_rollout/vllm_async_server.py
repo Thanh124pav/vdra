@@ -34,7 +34,17 @@ from vllm.entrypoints.openai.api_server import (
 from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils import FlexibleArgumentParser, get_tcp_uri
+try:
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+except ModuleNotFoundError:  # vLLM<0.12 exposed it directly from vllm.utils.
+    from vllm.utils import FlexibleArgumentParser
+
+try:
+    from vllm.utils import get_tcp_uri
+except ImportError:
+    def get_tcp_uri(host: str, port: int) -> str:
+        return f"tcp://{host}:{port}"
+
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
