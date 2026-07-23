@@ -10,6 +10,9 @@ GPU/Ray required to actually train.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import hydra
 import ray
 from omegaconf import OmegaConf
@@ -22,6 +25,37 @@ from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 import recipe.gear_tree.policy_loss  # noqa: F401
 import recipe.gear_tree.reward  # noqa: F401
 import recipe.gear_tree.async_tree_rollout  # noqa: F401
+
+
+def _repo_pythonpath() -> str:
+    current = Path(__file__).resolve()
+    repo_root = None
+    for parent in current.parents:
+        if (parent / "vdra_core").is_dir():
+            repo_root = parent
+            break
+    if repo_root is None:
+        repo_root = current.parents[3]
+    verl_root = repo_root / "verl"
+    parts = [str(repo_root), str(verl_root)]
+    existing = os.environ.get("PYTHONPATH")
+    if existing:
+        parts.extend(part for part in existing.split(os.pathsep) if part)
+    deduped = []
+    seen = set()
+    for part in parts:
+        if part not in seen:
+            seen.add(part)
+            deduped.append(part)
+    return os.pathsep.join(deduped)
+
+
+def _with_repo_pythonpath(runtime_env):
+    runtime_env = OmegaConf.create(runtime_env or {})
+    env_vars = OmegaConf.to_container(runtime_env.get("env_vars", {}), resolve=True) or {}
+    env_vars["PYTHONPATH"] = _repo_pythonpath()
+    runtime_env["env_vars"] = env_vars
+    return runtime_env
 
 
 @ray.remote(num_cpus=1)
@@ -140,6 +174,7 @@ def run_gear_tree(config) -> None:
         runtime_env = OmegaConf.merge(
             get_ppo_ray_runtime_env(), config.ray_kwargs.get("ray_init", {}).get("runtime_env", {})
         )
+        runtime_env = _with_repo_pythonpath(runtime_env)
         ray.init(runtime_env=OmegaConf.to_container(runtime_env, resolve=True))
     runner = GearTreeTaskRunner.remote()
     ray.get(runner.run.remote(config))

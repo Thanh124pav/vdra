@@ -556,3 +556,16 @@ def test_tree_agent_loop_uses_trainer_rollout_config_attribute():
     assert "actual_temp = float(rollout_config.temperature)" in src
     assert "free_max_tokens=rollout_config.response_length" in src
     assert "self.rollout_config" not in src
+
+
+def test_gear_tree_ray_runtime_env_exports_repo_pythonpath():
+    main_source = (Path(__file__).resolve().parents[1] / "main_gear_tree.py").read_text()
+    script_source = (
+        Path(__file__).resolve().parents[3] / "scripts" / "download_data_and_train.sh"
+    ).read_text()
+
+    assert 'if (parent / "vdra_core").is_dir()' in main_source
+    assert 'env_vars["PYTHONPATH"] = _repo_pythonpath()' in main_source
+    assert 'runtime_env = _with_repo_pythonpath(runtime_env)' in main_source
+    assert 'REPO_ROOT="${REPO_ROOT:-$(cd "${VERL_ROOT}/.." && pwd)}"' in script_source
+    assert 'export PYTHONPATH="${REPO_ROOT}:${VERL_ROOT}:${PYTHONPATH:-}"' in script_source

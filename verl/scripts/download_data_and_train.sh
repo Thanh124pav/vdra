@@ -246,7 +246,8 @@ if [[ -n "${EXTRA_OVERRIDES_STR}" ]]; then
 fi
 
 cd "${VERL_ROOT}"
-export PYTHONPATH="${VERL_ROOT}:${PYTHONPATH:-}"
+REPO_ROOT="${REPO_ROOT:-$(cd "${VERL_ROOT}/.." && pwd)}"
+export PYTHONPATH="${REPO_ROOT}:${VERL_ROOT}:${PYTHONPATH:-}"
 
 TRAIN_CMD=("${ENTRYPOINT[@]}" "${COMMON_OVERRIDES[@]}" "${MODE_OVERRIDES[@]}" "${EXTRA_OVERRIDES_ARRAY[@]}")
 
