@@ -14,7 +14,7 @@ on:
       base_image:
         description: "Base image used by docker/Dockerfile.github"
         required: true
-        default: "verlai/verl:uv.cu130"
+        default: "verlai/verl:vllm020.dev2"
       install_requirements:
         description: "Install requirements.txt during image build"
         type: boolean

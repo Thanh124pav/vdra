@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG BASE_IMAGE=verlai/verl:uv.cu130
+ARG BASE_IMAGE=verlai/verl:vllm020.dev2
 FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
