@@ -603,6 +603,8 @@ try:  # keep CPU-importable when agent_loop isn't installed
         async def run(self, sampling_params: dict, **kwargs) -> "AgentLoopOutput":
             raw_prompt = kwargs.get("raw_prompt")
             prompt_token_ids = kwargs.get("prompt_token_ids")
+            if prompt_token_ids is None:
+                prompt_token_ids = kwargs.get("raw_prompt_ids")
             if raw_prompt is not None:
                 messages = list(raw_prompt)
                 prompt_ids = await self.loop.run_in_executor(
@@ -619,8 +621,9 @@ try:  # keep CPU-importable when agent_loop isn't installed
             else:
                 raise RuntimeError(
                     "TreeAgentLoop.run received neither raw_prompt nor "
-                    "prompt_token_ids. The trainer must populate one of these "
-                    "fields in gen_batch.non_tensor_batch before async rollout."
+                    "prompt_token_ids/raw_prompt_ids. The trainer or "
+                    "AgentLoopWorker must populate one of these fields before "
+                    "async rollout."
                 )
             prompt_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
 

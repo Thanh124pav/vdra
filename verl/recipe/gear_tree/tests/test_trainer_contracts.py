@@ -342,6 +342,24 @@ class _FakeGenBatch:
         return self._n
 
 
+def test_agent_loop_worker_derives_prompt_token_ids_from_tensor_batch():
+    from verl.experimental.agent_loop.agent_loop import _token_rows_from_batch
+
+    class _Batch:
+        batch = {
+            "input_ids": torch.tensor([[0, 5, 6], [0, 0, 7], [8, 9, 0]]),
+            "attention_mask": torch.tensor([[0, 1, 1], [0, 0, 1], [1, 1, 0]]),
+        }
+
+        def __len__(self):
+            return 3
+
+    rows = _token_rows_from_batch(_Batch(), _Tokenizer())
+
+    assert rows.shape == (3,)
+    assert rows.tolist() == [[5, 6], [7], [8, 9]]
+
+
 def test_generate_tree_edges_injects_policy_snapshot_into_config():
     trainer = _trainer()
     trainer.global_steps = 7

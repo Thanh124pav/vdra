@@ -639,9 +639,9 @@ class RayGearTreeTrainer(RayPPOTrainer):
                         continue
                     vals = ids.detach().cpu().tolist() if hasattr(ids, "detach") else list(ids)
                     prompt_rows.append([int(x) for x in vals])
-                gen_batch.non_tensor_batch["prompt_token_ids"] = np.array(
-                    prompt_rows, dtype=object
-                )
+                prompt_token_ids = np.empty(len(prompt_rows), dtype=object)
+                prompt_token_ids[:] = prompt_rows
+                gen_batch.non_tensor_batch["prompt_token_ids"] = prompt_token_ids
         snapshot_col = np.array([snapshot_id] * row_count, dtype=object)
         gen_batch.non_tensor_batch["policy_snapshot_id"] = snapshot_col
         gen_batch.non_tensor_batch["current_rollout_snapshot_id"] = snapshot_col

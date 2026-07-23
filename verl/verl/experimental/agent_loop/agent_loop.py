@@ -379,6 +379,45 @@ class RewardManagerWorker:
         return self.reward_manager(data, return_dict)
 
 
+def _token_rows_from_batch(batch: DataProto, tokenizer: AutoTokenizer) -> Optional[np.ndarray]:
+    """Return per-row unpadded prompt token ids for agent-loop kwargs."""
+
+    tensor_batch = getattr(batch, "batch", None)
+    if tensor_batch is None:
+        return None
+    input_ids = tensor_batch.get("input_ids", None)
+    if input_ids is None:
+        input_ids = tensor_batch.get("prompts", None)
+    if input_ids is None:
+        return None
+    attention_mask = tensor_batch.get("attention_mask", None)
+    if (
+        attention_mask is not None
+        and getattr(attention_mask, "shape", None) != getattr(input_ids, "shape", None)
+    ):
+        attention_mask = None
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = getattr(tokenizer, "eos_token_id", None)
+
+    rows = []
+    for row in range(len(batch)):
+        ids = input_ids[row]
+        mask = attention_mask[row] if attention_mask is not None else None
+        if mask is not None:
+            ids = ids[mask.bool()]
+            vals = ids.detach().cpu().tolist() if hasattr(ids, "detach") else list(ids)
+        else:
+            vals = ids.detach().cpu().tolist() if hasattr(ids, "detach") else list(ids)
+            while vals and pad_id is not None and int(vals[0]) == int(pad_id):
+                vals.pop(0)
+        rows.append([int(x) for x in vals])
+
+    out = np.empty(len(rows), dtype=object)
+    out[:] = rows
+    return out
+
+
 @ray.remote
 class AgentLoopWorker:
     """Agent loop worker takes a batch of messages and run each message in an agent loop."""
@@ -465,6 +504,15 @@ class AgentLoopWorker:
         if "agent_name" not in batch.non_tensor_batch:
             default_agent_loop = config.agent.default_agent_loop
             batch.non_tensor_batch["agent_name"] = np.array([default_agent_loop] * len(batch), dtype=object)
+
+        if (
+            "raw_prompt" not in batch.non_tensor_batch
+            and "prompt_token_ids" not in batch.non_tensor_batch
+            and "raw_prompt_ids" not in batch.non_tensor_batch
+        ):
+            prompt_token_ids = _token_rows_from_batch(batch, self.tokenizer)
+            if prompt_token_ids is not None:
+                batch.non_tensor_batch["prompt_token_ids"] = prompt_token_ids
 
         if "index" in batch.non_tensor_batch:
             index = batch.non_tensor_batch["index"]
