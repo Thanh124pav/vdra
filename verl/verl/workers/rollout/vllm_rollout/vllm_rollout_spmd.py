@@ -50,14 +50,7 @@ from omegaconf import ListConfig
 from tensordict import TensorDict
 from torch.distributed.device_mesh import DeviceMesh
 from vllm import LLM, SamplingParams
-try:
-    from vllm.config import CompilationConfig, CompilationLevel, LoRAConfig
-except ImportError:  # vLLM >= 0.22 exposes CompilationMode instead
-    from vllm.config import CompilationConfig, CompilationMode, LoRAConfig
-
-    class CompilationLevel:
-        PIECEWISE = CompilationMode.VLLM_COMPILE
-
+from vllm.config import CompilationConfig, CompilationLevel, LoRAConfig
 from vllm.lora.request import LoRARequest
 
 from vllm.v1.worker.worker_base import WorkerWrapperBase
@@ -605,7 +598,7 @@ class vLLMAsyncRollout(BaseRollout):
                 peft_config=asdict(peft_config),
                 lora_tensors=dict(weights),
             )
-            self.inference_engine.worker.add_lora(lora_reqest)
+            self.inference_engine.add_lora(lora_reqest)
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader

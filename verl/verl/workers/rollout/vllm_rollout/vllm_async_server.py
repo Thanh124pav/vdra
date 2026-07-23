@@ -350,7 +350,7 @@ class vLLMHttpServer:
 
     async def run_headless(self, args: argparse.Namespace):
         # Create the EngineConfig.
-        engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
+        engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context, headless=True)
 

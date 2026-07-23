@@ -45,3 +45,16 @@ def test_vllm020_worker_dispatch_does_not_use_removed_execute_method():
     assert "self.inference_engine.execute_method" not in source
     assert "getattr(self.inference_engine, method)(*args, **kwargs)" in source
     assert "pickle.loads(method)(self.inference_engine, *args, **kwargs)" in source
+
+
+def test_vllm020_rollout_uses_020_imports_without_newer_fallbacks():
+    source = _read("verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py")
+    server_source = _read("verl/workers/rollout/vllm_rollout/vllm_async_server.py")
+
+    assert "from vllm.config import CompilationConfig, CompilationLevel, LoRAConfig" in source
+    assert "CompilationMode" not in source
+    assert "vLLM >= 0.22" not in source
+    assert "self.inference_engine.add_lora(lora_reqest)" in source
+    assert "self.inference_engine.worker.add_lora" not in source
+    assert "vllm.AsyncEngineArgs" not in server_source
+    assert "AsyncEngineArgs.from_cli_args" in server_source
