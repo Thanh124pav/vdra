@@ -310,7 +310,21 @@ def test_p02_validator_rejects_one_token_overflow():
         )
 
 
-def test_p02_validator_rejects_model_context_overflow():
+def test_p02_validator_allows_dynamic_response_within_model_context():
+    cfg = _data_cfg(
+        max_edge_prompt_length=1500,
+        max_original_prompt_length=500,
+        max_response_length=1024,
+    )
+    validate_context_contract(
+        data_cfg=cfg,
+        tree_shape=[6, 6, 6],
+        segment_length=100,
+        model_context_length=2048,
+    )
+
+
+def test_p02_validator_rejects_edge_prompt_model_context_overflow():
     cfg = _data_cfg(
         max_edge_prompt_length=1500,
         max_original_prompt_length=500,
@@ -321,7 +335,7 @@ def test_p02_validator_rejects_model_context_overflow():
             data_cfg=cfg,
             tree_shape=[6, 6, 6],
             segment_length=100,
-            model_context_length=2048,
+            model_context_length=1024,
         )
 
 
