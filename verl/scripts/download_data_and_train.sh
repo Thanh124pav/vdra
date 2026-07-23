@@ -92,7 +92,14 @@ fi
 
 PROJECT_NAME="${PROJECT_NAME:-vdra}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-${ALGO}-${TRAIN_DATASET}}"
-LOGGER="${LOGGER:-'["console","wandb"]'}"
+LOGGER="${LOGGER:-[console,wandb]}"
+# Hydra list overrides must not be wrapped in literal quotes. Accept common
+# env forms like LOGGER='["console","wandb"]' or LOGGER="'[console,wandb]'".
+if [[ "${LOGGER}" == \'*\' && "${LOGGER}" == *\' ]]; then
+  LOGGER="${LOGGER:1:${#LOGGER}-2}"
+elif [[ "${LOGGER}" == \"*\" && "${LOGGER}" == *\" ]]; then
+  LOGGER="${LOGGER:1:${#LOGGER}-2}"
+fi
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-false}"
 TEST_FREQ="${TEST_FREQ:-5}"
 SAVE_FREQ="${SAVE_FREQ:-5}"
