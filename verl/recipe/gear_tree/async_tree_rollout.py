@@ -594,12 +594,34 @@ try:  # keep CPU-importable when agent_loop isn't installed
                 answer_prefix=gt.get("answer_prefix", "# Answer\n"),
                 use_minerva_few_shot_prompt=gt.get("use_minerva_few_shot_prompt", False),
             )
+            self.apply_chat_template_kwargs = self.config.data.get(
+                "apply_chat_template_kwargs", {}
+            )
             self._gate = _build_gate(gt, tokenizer=self.tokenizer)
             self._node_expander = SegmentNodeExpander(self._gen, self.tokenizer)
 
         async def run(self, sampling_params: dict, **kwargs) -> "AgentLoopOutput":
-            messages = list(kwargs["raw_prompt"])
-            prompt_ids = await self.apply_chat_template(messages)
+            raw_prompt = kwargs.get("raw_prompt")
+            prompt_token_ids = kwargs.get("prompt_token_ids")
+            if raw_prompt is not None:
+                messages = list(raw_prompt)
+                prompt_ids = await self.loop.run_in_executor(
+                    None,
+                    lambda: self.tokenizer.apply_chat_template(
+                        messages,
+                        add_generation_prompt=True,
+                        tokenize=True,
+                        **self.apply_chat_template_kwargs,
+                    ),
+                )
+            elif prompt_token_ids is not None:
+                prompt_ids = [int(tok) for tok in list(prompt_token_ids)]
+            else:
+                raise RuntimeError(
+                    "TreeAgentLoop.run received neither raw_prompt nor "
+                    "prompt_token_ids. The trainer must populate one of these "
+                    "fields in gen_batch.non_tensor_batch before async rollout."
+                )
             prompt_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
 
             # PLAN.md P1.R4: honor and log the per-request sampling parameters.

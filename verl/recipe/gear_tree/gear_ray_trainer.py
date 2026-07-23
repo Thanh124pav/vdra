@@ -608,6 +608,40 @@ class RayGearTreeTrainer(RayPPOTrainer):
         if not hasattr(gen_batch, "non_tensor_batch") or gen_batch.non_tensor_batch is None:
             gen_batch.non_tensor_batch = {}
         row_count = len(gen_batch)
+        if "prompt_token_ids" not in gen_batch.non_tensor_batch:
+            input_ids = None
+            attention_mask = None
+            batch = getattr(gen_batch, "batch", None)
+            if batch is not None:
+                try:
+                    input_ids = batch.get("input_ids")
+                    attention_mask = batch.get("attention_mask")
+                except AttributeError:
+                    input_ids = batch["input_ids"] if "input_ids" in batch else None
+                    attention_mask = (
+                        batch["attention_mask"] if "attention_mask" in batch else None
+                    )
+            if input_ids is not None:
+                prompt_rows = []
+                for row in range(row_count):
+                    ids = input_ids[row]
+                    mask = attention_mask[row] if attention_mask is not None else None
+                    if mask is not None:
+                        ids = ids[mask.bool()]
+                    else:
+                        pad_id = getattr(self.tokenizer, "pad_token_id", None)
+                        if pad_id is None:
+                            pad_id = getattr(self.tokenizer, "eos_token_id", None)
+                        vals = ids.detach().cpu().tolist() if hasattr(ids, "detach") else list(ids)
+                        while vals and pad_id is not None and int(vals[0]) == int(pad_id):
+                            vals.pop(0)
+                        prompt_rows.append([int(x) for x in vals])
+                        continue
+                    vals = ids.detach().cpu().tolist() if hasattr(ids, "detach") else list(ids)
+                    prompt_rows.append([int(x) for x in vals])
+                gen_batch.non_tensor_batch["prompt_token_ids"] = np.array(
+                    prompt_rows, dtype=object
+                )
         snapshot_col = np.array([snapshot_id] * row_count, dtype=object)
         gen_batch.non_tensor_batch["policy_snapshot_id"] = snapshot_col
         gen_batch.non_tensor_batch["current_rollout_snapshot_id"] = snapshot_col

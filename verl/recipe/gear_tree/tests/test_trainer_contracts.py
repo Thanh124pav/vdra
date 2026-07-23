@@ -359,16 +359,25 @@ def test_generate_tree_edges_injects_policy_snapshot_into_config():
             seen_rows["current_rollout_snapshot_id"] = list(
                 gen_batch.non_tensor_batch["current_rollout_snapshot_id"]
             )
+            seen_rows["prompt_token_ids"] = list(
+                gen_batch.non_tensor_batch["prompt_token_ids"]
+            )
             return type("DP", (), {"non_tensor_batch": {"gear_tree_edges": [[_edge("e")]]}})()
 
+    gen_batch = _FakeGenBatch(n=3)
+    gen_batch.batch = {
+        "input_ids": torch.tensor([[0, 5, 6], [0, 0, 7], [8, 9, 0]]),
+        "attention_mask": torch.tensor([[0, 1, 1], [0, 0, 1], [1, 1, 0]]),
+    }
     trainer.actor_rollout_wg = _WG()
-    out = trainer._generate_tree_edges(_FakeGenBatch(n=3))
+    out = trainer._generate_tree_edges(gen_batch)
     assert seen["policy_snapshot_id"] == "global_step:7"
     assert seen["gear"]["policy_snapshot_id"] == "global_step:7"
     assert out[0]["policy_snapshot_id"] == "global_step:7"
     # P0.1: every prompt row carries the snapshot id via non_tensor_batch
     assert seen_rows["policy_snapshot_id"] == ["global_step:7"] * 3
     assert seen_rows["current_rollout_snapshot_id"] == ["global_step:7"] * 3
+    assert seen_rows["prompt_token_ids"] == [[5, 6], [7], [8, 9]]
 
 
 def test_generate_tree_edges_resolves_async_rollout_endpoint_before_probe(monkeypatch):
