@@ -93,3 +93,14 @@ def test_gear_tree_entrypoint_enables_overlong_prompt_filter_for_strict_truncati
     assert 'data.filter_overlong_prompts", True' in source
     assert 'data.filter_overlong_prompts_workers", 4' in source
     assert "before DataLoader workers call postprocess_data" in source
+
+
+def test_rlhf_dataset_filter_uses_getitem_tokenization_path():
+    source = (
+        Path(__file__).resolve().parents[3] / "verl" / "utils" / "dataset" / "rl_dataset.py"
+    ).read_text()
+
+    assert "raw_prompt = tokenizer.apply_chat_template(" in source
+    assert "tokenize=False" in source
+    assert 'tokenizer(raw_prompt, return_tensors=None, add_special_tokens=False)["input_ids"]' in source
+    assert "doc[prompt_key], add_generation_prompt=True" not in source
