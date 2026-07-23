@@ -482,11 +482,13 @@ def _format_openai_api_base(host: Any, port: Any) -> str:
     return f"http://{host_text}:{int(port)}/v1"
 
 
-def _resolve_rollout_server_api_base(server_manager: Any, *, timeout: float = 10.0) -> Optional[str]:
-    """Resolve the OpenAI-compatible rollout endpoint from Ray server handles."""
+def _resolve_rollout_server_info(
+    server_manager: Any, *, timeout: float = 10.0
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve the OpenAI-compatible rollout endpoint and served model id."""
     handles = list(getattr(server_manager, "server_handles", []) or [])
     if not handles:
-        return None
+        return None, None
 
     import ray
 
@@ -495,9 +497,25 @@ def _resolve_rollout_server_api_base(server_manager: Any, *, timeout: float = 10
             address, port = ray.get(handle.get_server_address.remote(), timeout=timeout)
         except Exception:
             continue
-        if address and port:
-            return _format_openai_api_base(address, port)
-    return None
+        if not (address and port):
+            continue
+        model_id = None
+        try:
+            get_model_id = getattr(handle, "get_model_id", None)
+            if get_model_id is not None:
+                model_id = ray.get(get_model_id.remote(), timeout=timeout)
+        except Exception:
+            model_id = None
+        return _format_openai_api_base(address, port), (
+            str(model_id).strip() if model_id else None
+        )
+    return None, None
+
+
+def _resolve_rollout_server_api_base(server_manager: Any, *, timeout: float = 10.0) -> Optional[str]:
+    """Resolve the OpenAI-compatible rollout endpoint from Ray server handles."""
+    api_base, _ = _resolve_rollout_server_info(server_manager, timeout=timeout)
+    return api_base
 
 
 def _attach_rollout_scorer_endpoint(gear_cfg: dict, server_manager: Any) -> dict:
@@ -506,7 +524,7 @@ def _attach_rollout_scorer_endpoint(gear_cfg: dict, server_manager: Any) -> dict
         return gear_cfg
     if not bool(gear_cfg.get("scorer_uses_rollout_server", False)):
         return gear_cfg
-    api_base = _resolve_rollout_server_api_base(
+    api_base, model_id = _resolve_rollout_server_info(
         server_manager,
         timeout=float(gear_cfg.get("scorer_model_resolve_timeout", 10.0)),
     )
@@ -517,6 +535,8 @@ def _attach_rollout_scorer_endpoint(gear_cfg: dict, server_manager: Any) -> dict
         )
     gear_cfg["rollout_api_base"] = api_base
     gear_cfg["scorer_api_base"] = api_base
+    if model_id and not str(gear_cfg.get("scorer_model") or "").strip():
+        gear_cfg["scorer_model"] = model_id
     return gear_cfg
 
 
@@ -676,11 +696,24 @@ try:  # keep CPU-importable when agent_loop isn't installed
                 use_minerva_few_shot_prompt=self._gt.get("use_minerva_few_shot_prompt", False),
             )
             if self._gate is not None:
-                # P0.1: pass the rollout server's own fingerprint separately so
-                # bind_snapshot can compare it against the scorer's fingerprint
-                # (fetched independently in _build_scorer). Setting them from
-                # the same value would silently paper over a mismatch.
+                # P0.1/P0.5: pass the rollout server's own fingerprint. In
+                # two-server mode, bind_snapshot compares it against the
+                # scorer's independently fetched fingerprint. In same-server
+                # mode, the scorer is the rollout endpoint; when the worker
+                # could not independently refetch a fingerprint, reuse the
+                # trainer-verified rollout value so strict mode does not require
+                # a redundant /models probe during Hydra construction.
                 rollout_server_version = kwargs.get("rollout_server_weight_version")
+                scorer = getattr(self._gate, "scorer", None)
+                if (
+                    rollout_server_version is not None
+                    and bool((self._gt.get("gear") or {}).get("scorer_uses_rollout_server", False))
+                    and scorer is not None
+                    and getattr(scorer, "server_weight_version", None) is None
+                ):
+                    scorer.server_weight_version = rollout_server_version
+                    scorer.weight_version_verified = True
+                    scorer.rollout_server_weight_version = rollout_server_version
                 self._gate.bind_snapshot(
                     snapshot_id,
                     weight_version=rollout_server_version,

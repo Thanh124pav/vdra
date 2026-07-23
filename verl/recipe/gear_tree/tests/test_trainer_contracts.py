@@ -396,10 +396,15 @@ def test_generate_tree_edges_resolves_async_rollout_endpoint_before_probe(monkey
 
     class _RemoteGetAddress:
         def remote(self):
-            return "fake-ref"
+            return "fake-address-ref"
+
+    class _RemoteGetModelId:
+        def remote(self):
+            return "fake-model-ref"
 
     class _ServerHandle:
         get_server_address = _RemoteGetAddress()
+        get_model_id = _RemoteGetModelId()
 
     class _AsyncManager:
         server_handles = [_ServerHandle()]
@@ -415,7 +420,14 @@ def test_generate_tree_edges_resolves_async_rollout_endpoint_before_probe(monkey
                 {"non_tensor_batch": {"gear_tree_edges": [[_edge("e")]]}},
             )()
 
-    fake_ray = SimpleNamespace(get=lambda ref, timeout=None: ("10.0.0.5", 12345))
+    def _fake_ray_get(ref, timeout=None):
+        if ref == "fake-address-ref":
+            return "10.0.0.5", 12345
+        if ref == "fake-model-ref":
+            return "served-model"
+        raise AssertionError(ref)
+
+    fake_ray = SimpleNamespace(get=_fake_ray_get)
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
     trainer.async_rollout_manager = _AsyncManager()
 
@@ -425,6 +437,8 @@ def test_generate_tree_edges_resolves_async_rollout_endpoint_before_probe(monkey
     assert probed["rollout_api_base"] == "http://10.0.0.5:12345/v1"
     assert probed["scorer_api_base"] == "http://10.0.0.5:12345/v1"
     assert seen["scorer_api_base"] == "http://10.0.0.5:12345/v1"
+    assert probed["scorer_model"] == "served-model"
+    assert seen["scorer_model"] == "served-model"
     assert seen["row_weight_versions"] == ["server:abc", "server:abc"]
 
 
@@ -626,14 +640,24 @@ def test_tree_agent_loop_auto_resolves_rollout_scorer_endpoint(monkeypatch):
 
     class _RemoteGetAddress:
         def remote(self):
-            return "fake-ref"
+            return "fake-address-ref"
+
+    class _RemoteGetModelId:
+        def remote(self):
+            return "fake-model-ref"
 
     class _ServerHandle:
         get_server_address = _RemoteGetAddress()
+        get_model_id = _RemoteGetModelId()
 
-    fake_ray = SimpleNamespace(
-        get=lambda ref, timeout=None: ("10.0.0.5", 12345)
-    )
+    def _fake_ray_get(ref, timeout=None):
+        if ref == "fake-address-ref":
+            return "10.0.0.5", 12345
+        if ref == "fake-model-ref":
+            return "served-model"
+        raise AssertionError(ref)
+
+    fake_ray = SimpleNamespace(get=_fake_ray_get)
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
 
     gear_cfg = {
@@ -649,6 +673,7 @@ def test_tree_agent_loop_auto_resolves_rollout_scorer_endpoint(monkeypatch):
     assert out is gear_cfg
     assert out["rollout_api_base"] == "http://10.0.0.5:12345/v1"
     assert out["scorer_api_base"] == "http://10.0.0.5:12345/v1"
+    assert out["scorer_model"] == "served-model"
 
 
 def test_gear_tree_ray_runtime_env_exports_repo_pythonpath():

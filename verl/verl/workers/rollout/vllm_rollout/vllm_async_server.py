@@ -217,6 +217,12 @@ class vLLMHttpServer:
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
 
+    def get_model_id(self):
+        """Return the served model id used by OpenAI-compatible requests."""
+        return getattr(self.model_config, "local_path", None) or getattr(
+            self.model_config, "path", None
+        )
+
     async def launch_server(self, master_address: str = None, master_port: int = None):
         _warn_if_not_vllm_020()
         if self.node_rank != 0:
