@@ -32,7 +32,7 @@ jobs:
           # Minimal test toolchain — vdra_core and treetune.gear are dep-free
           # Python. The gate/trainer tests importorskip when verl or transformers
           # are missing, so we do NOT install the full verl stack here.
-          pip install pytest numpy sortedcontainers httpx pyyaml
+          pip install pytest numpy sortedcontainers httpx pyyaml cachetools
           # OmegaConf + Hydra: needed by RayGearTreeTrainer._gear_tree_config
           # and by the PLAN.md P0.1 config-wiring tests.
           pip install omegaconf hydra-core
