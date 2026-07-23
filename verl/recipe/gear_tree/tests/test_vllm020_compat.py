@@ -28,3 +28,12 @@ def test_vllm020_async_server_uses_020_cli_and_log_api():
     assert '"enable_log_requests"' in source
     assert "disable_log_requests" not in source
     assert "VDRA/VERL is tested against vLLM 0.20.x" in source
+
+
+def test_vllm020_worker_wrapper_uses_v1_lazy_init_api():
+    source = _read("verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py")
+
+    assert "from vllm.v1.worker.worker_base import WorkerWrapperBase" in source
+    assert "from vllm.worker.worker_base import WorkerWrapperBase" not in source
+    assert "WorkerWrapperBase(vllm_config=" not in source
+    assert "self.inference_engine = WorkerWrapperBase()" in source

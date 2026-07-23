@@ -60,11 +60,7 @@ except ImportError:  # vLLM >= 0.22 exposes CompilationMode instead
 
 from vllm.lora.request import LoRARequest
 
-try:
-    from vllm.worker.worker_base import WorkerWrapperBase
-except ModuleNotFoundError:
-    # https://github.com/vllm-project/vllm/commit/6a113d9aed8221a9c234535958e70e34ab6cac5b
-    from vllm.v1.worker.worker_base import WorkerWrapperBase
+from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 from verl import DataProto
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL
@@ -560,7 +556,7 @@ class vLLMAsyncRollout(BaseRollout):
         if self.lora_config:
             lora_dtype = getattr(torch, self.config.dtype)
             self.vllm_config.lora_config = LoRAConfig(lora_dtype=lora_dtype, **self.lora_config)
-        self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
+        self.inference_engine = WorkerWrapperBase()
         self.inference_engine.init_worker(all_kwargs)
 
     def _load_model(self, *args, **kwargs):
