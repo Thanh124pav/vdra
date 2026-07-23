@@ -5,7 +5,11 @@ set -euo pipefail
 # launch one training run. Override any setting with environment variables:
 #
 #   MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
-#   ALGO=spo N_GPUS_PER_NODE=4 TP_SIZE=2 TOTAL_STEPS=20 \
+#   ALGO=vdra N_GPUS_PER_NODE=4 TP_SIZE=2 TOTAL_STEPS=20 \
+#   bash scripts/download_data_and_train.sh
+#
+# If your Docker image starts in the nested verl/ directory, run the wrapper:
+#
 #   bash scripts/download_data_and_train.sh
 #
 # Algorithms:
@@ -67,8 +71,8 @@ else
 fi
 
 # ------------------------- training config --------------------------
-ALGO="${ALGO:-spo}"
-MODEL="${MODEL:-HuggingFaceTB/SmolLM2-135M-Instruct}"
+ALGO="${ALGO:-vdra}"
+MODEL="${MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}"
 TRAIN_DATASET="${TRAIN_DATASET:-math}"
 TRAIN_SPLIT="${TRAIN_SPLIT:-train}"
 VAL_DATASETS="${VAL_DATASETS:-math aime24 aime25 amc23}"
