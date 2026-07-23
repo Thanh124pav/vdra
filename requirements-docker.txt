@@ -1,0 +1,36 @@
+# Runtime/app dependencies layered onto verlai/verl base images.
+# Do not put CUDA stack packages here: torch, torchaudio, torchvision, triton,
+# xformers, flash-attn, vllm, deepspeed, and transformers should come from the
+# selected base image so their CUDA/vLLM ABI remains consistent.
+accelerate==1.13.0
+aiohttp==3.13.5
+base58==2.1.1
+chardet==5.2.0
+charset-normalizer==3.4.7
+datasets==4.8.5
+dill==0.4.1
+diskcache==5.6.3
+evaluate==0.4.1
+fire==0.7.1
+gptcache
+graphviz
+httpx==0.28.1
+jsonlines==4.0.0
+jsonnet==0.22.0
+nest_asyncio==1.6.0
+openai==2.33.0
+overrides==7.7.0
+peft==0.19.1
+platformdirs==4.9.6
+psutil==7.2.2
+py-cpuinfo==9.0.0
+pygtrie==2.5.0
+pylatexenc==2.10
+redis==7.4.0
+redis_om
+regex==2026.4.4
+requests==2.33.1
+sentencepiece==0.2.1
+sortedcontainers==2.4.0
+tqdm==4.67.3
+wandb==0.26.1

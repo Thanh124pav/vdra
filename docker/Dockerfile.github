@@ -14,10 +14,13 @@ WORKDIR /workspace/vdra
 # carries the CUDA/vLLM stack. Reinstalling torch/vLLM-era packages from
 # requirements.txt can accidentally replace CUDA-matched wheels.
 ARG INSTALL_REQUIREMENTS=false
-COPY requirements.txt /tmp/vdra-requirements.txt
+ARG REQUIREMENTS_FILE=requirements-docker.txt
+COPY requirements*.txt /tmp/vdra-requirements/
 RUN if [ "${INSTALL_REQUIREMENTS}" = "true" ]; then \
+      req="/tmp/vdra-requirements/${REQUIREMENTS_FILE}"; \
+      test -f "${req}" || (echo "Missing requirements file: ${REQUIREMENTS_FILE}" >&2; exit 1); \
       (python3 -m pip install --upgrade pip || python -m pip install --upgrade pip) && \
-      (python3 -m pip install -r /tmp/vdra-requirements.txt || python -m pip install -r /tmp/vdra-requirements.txt); \
+      (python3 -m pip install -r "${req}" || python -m pip install -r "${req}"); \
     fi
 
 COPY . /workspace/vdra

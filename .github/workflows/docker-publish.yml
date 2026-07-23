@@ -16,10 +16,14 @@ on:
         required: true
         default: "verlai/verl:vllm020.dev2"
       install_requirements:
-        description: "Install requirements.txt during image build"
+        description: "Install an additional requirements file during image build"
         type: boolean
         required: true
         default: false
+      requirements_file:
+        description: "Requirements file to install when install_requirements=true"
+        required: true
+        default: "requirements-docker.txt"
 
 permissions:
   contents: read
@@ -84,6 +88,7 @@ jobs:
           build-args: |
             BASE_IMAGE=${{ inputs.base_image }}
             INSTALL_REQUIREMENTS=${{ inputs.install_requirements }}
+            REQUIREMENTS_FILE=${{ inputs.requirements_file }}
           tags: |
             ${{ steps.image.outputs.primary_tag }}
             ${{ steps.image.outputs.sha_tag }}
