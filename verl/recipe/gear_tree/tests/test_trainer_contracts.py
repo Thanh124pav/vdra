@@ -371,6 +371,63 @@ def test_generate_tree_edges_injects_policy_snapshot_into_config():
     assert seen_rows["current_rollout_snapshot_id"] == ["global_step:7"] * 3
 
 
+def test_generate_tree_edges_resolves_async_rollout_endpoint_before_probe(monkeypatch):
+    import sys
+
+    trainer = _trainer()
+    trainer.global_steps = 7
+    trainer.rollout_iteration = 1
+    trainer.async_rollout_mode = True
+    trainer.config.gear_tree["gear"] = {
+        "enabled": True,
+        "strict_vdra": True,
+        "scorer_uses_rollout_server": True,
+        "rollout_api_base": None,
+        "scorer_api_base": "http://127.0.0.1:8000/v1",
+    }
+    probed = {}
+    seen = {}
+
+    def _fetch(gear_cfg):
+        probed.update(gear_cfg)
+        return "server:abc"
+
+    trainer._fetch_rollout_server_weight_version = _fetch
+
+    class _RemoteGetAddress:
+        def remote(self):
+            return "fake-ref"
+
+    class _ServerHandle:
+        get_server_address = _RemoteGetAddress()
+
+    class _AsyncManager:
+        server_handles = [_ServerHandle()]
+
+        def generate_sequences(self, gen_batch):
+            seen.update(gen_batch.meta_info["gear_tree_config"]["gear"])
+            seen["row_weight_versions"] = list(
+                gen_batch.non_tensor_batch["rollout_server_weight_version"]
+            )
+            return type(
+                "DP",
+                (),
+                {"non_tensor_batch": {"gear_tree_edges": [[_edge("e")]]}},
+            )()
+
+    fake_ray = SimpleNamespace(get=lambda ref, timeout=None: ("10.0.0.5", 12345))
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    trainer.async_rollout_manager = _AsyncManager()
+
+    out = trainer._generate_tree_edges(_FakeGenBatch(n=2))
+
+    assert out[0]["policy_snapshot_id"] == "global_step:7"
+    assert probed["rollout_api_base"] == "http://10.0.0.5:12345/v1"
+    assert probed["scorer_api_base"] == "http://10.0.0.5:12345/v1"
+    assert seen["scorer_api_base"] == "http://10.0.0.5:12345/v1"
+    assert seen["row_weight_versions"] == ["server:abc", "server:abc"]
+
+
 def test_collect_rollout_reward_parse_metrics_sums_per_prompt():
     trainer = _trainer()
     rollout_out = SimpleNamespace(

@@ -543,6 +543,31 @@ class RayGearTreeTrainer(RayPPOTrainer):
             gear_cfg, fetch_fn=fetch_server_weight_version
         )
 
+    def _attach_async_rollout_scorer_endpoint(
+        self, gear_cfg: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Resolve the live async rollout endpoint before trainer-side checks.
+
+        TreeAgentLoop also performs this resolution inside workers, but the
+        trainer must fetch the rollout server's weight version before dispatch.
+        Without this mirror step strict same-server runs probe the static
+        config default (often 127.0.0.1:8000) instead of the Ray-managed server.
+        """
+
+        if not bool(gear_cfg.get("enabled", False)):
+            return gear_cfg
+        if not bool(gear_cfg.get("scorer_uses_rollout_server", False)):
+            return gear_cfg
+        manager = getattr(self, "async_rollout_manager", None)
+        if manager is None:
+            return gear_cfg
+
+        from recipe.gear_tree.async_tree_rollout import (
+            _attach_rollout_scorer_endpoint,
+        )
+
+        return _attach_rollout_scorer_endpoint(gear_cfg, manager)
+
     def _generate_tree_edges(self, gen_batch: DataProto) -> List[Dict[str, Any]]:
         """Run tree rollout and return raw replayable edge records."""
         gt = self._gear_tree_config()
@@ -552,6 +577,8 @@ class RayGearTreeTrainer(RayPPOTrainer):
         gear_cfg = gt.setdefault("gear", {})
         if isinstance(gear_cfg, dict):
             gear_cfg["policy_snapshot_id"] = snapshot_id
+            gear_cfg = self._attach_async_rollout_scorer_endpoint(gear_cfg)
+            gt["gear"] = gear_cfg
         # PLAN.md P0.5: fetch the rollout server's own weight version once
         # per generation. TreeAgentLoop.run reads
         # non_tensor_batch['rollout_server_weight_version'] and passes it to
@@ -625,7 +652,10 @@ class RayGearTreeTrainer(RayPPOTrainer):
             collect_tree_edges,
         )
 
-        rollout_out = self.actor_rollout_wg.generate_sequences(gen_batch)
+        if getattr(self, "async_rollout_mode", False):
+            rollout_out = self.async_rollout_manager.generate_sequences(gen_batch)
+        else:
+            rollout_out = self.actor_rollout_wg.generate_sequences(gen_batch)
         self._last_rollout_reward_parse_metrics = self._collect_rollout_reward_parse_metrics(rollout_out)
         edges = collect_tree_edges(rollout_out)
         # Zero-filter contract: per-tree construction summaries preserve the
