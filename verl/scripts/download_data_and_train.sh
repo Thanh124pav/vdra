@@ -155,7 +155,7 @@ fi
 
 case "${ALGO}" in
   vdra)
-    ENTRYPOINT=(python -m recipe.gear_tree.main_gear_tree --config-path recipe/gear_tree/config --config-name gear_tree_trainer)
+    ENTRYPOINT=(python -m recipe.gear_tree.main_gear_tree)
     MODE_OVERRIDES=(
       "gear_tree.tree_update_mode=spo"
       "gear_tree.gear.enabled=true"
@@ -167,7 +167,7 @@ case "${ALGO}" in
     )
     ;;
   spo)
-    ENTRYPOINT=(python -m recipe.gear_tree.main_gear_tree --config-path recipe/gear_tree/config --config-name gear_tree_trainer)
+    ENTRYPOINT=(python -m recipe.gear_tree.main_gear_tree)
     MODE_OVERRIDES=(
       "gear_tree.tree_update_mode=spo"
       "gear_tree.gear.enabled=false"
@@ -178,7 +178,7 @@ case "${ALGO}" in
     )
     ;;
   treepo|treepo_style_ablation)
-    ENTRYPOINT=(python -m recipe.gear_tree.main_gear_tree --config-path recipe/gear_tree/config --config-name gear_tree_trainer)
+    ENTRYPOINT=(python -m recipe.gear_tree.main_gear_tree)
     MODE_OVERRIDES=(
       "gear_tree.tree_update_mode=treepo_style_ablation"
       "gear_tree.gear.enabled=false"
@@ -188,7 +188,7 @@ case "${ALGO}" in
     )
     ;;
   grpo)
-    ENTRYPOINT=(python -m recipe.gear_tree.main_flat --config-path recipe/gear_tree/config --config-name flat_trainer)
+    ENTRYPOINT=(python -m recipe.gear_tree.main_flat)
     MODE_OVERRIDES=(
       "algorithm.adv_estimator=grpo"
       "reward_model.reward_manager=gear_math"
