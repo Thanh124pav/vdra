@@ -72,3 +72,14 @@ def test_vllm020_openai_app_state_uses_020_signature():
     assert "build_app(args, supported_tasks, model_config)" in source
     assert "init_app_state(engine_client, app.state, args, supported_tasks)" in source
     assert "init_app_state(engine_client, vllm_config, app.state, args)" not in source
+
+
+def test_vllm020_async_server_preserves_model_context_and_clamps_max_tokens():
+    source = _read("verl/workers/rollout/vllm_rollout/vllm_async_server.py")
+
+    assert "if not self.config.max_model_len:" in source
+    assert "self.config.max_model_len = self.config.prompt_length + self.config.response_length" in source
+    assert "remaining_tokens = int(self.config.max_model_len) - len(prompt_ids)" in source
+    assert 'requested_max_tokens = sampling_params.pop("max_tokens", None)' in source
+    assert "max_tokens = min(int(requested_max_tokens), remaining_tokens)" in source
+    assert "SamplingParams(max_tokens=max_tokens, **sampling_params)" in source

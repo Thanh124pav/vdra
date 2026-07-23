@@ -100,7 +100,10 @@ def validate_context_contract(
 ) -> None:
     """Enforce PLAN.md P0.2: L_original + (D-1) * M <= L_edge,max <= L_model_ctx.
 
-    Raises ``ValueError`` with a diagnostic message on any overflow.
+    ``max_response_length`` is a tensor/storage cap for realized responses, not
+    a startup requirement that every deepest edge must have that many free
+    tokens. Generation clamps each node's max_tokens to the remaining model
+    context.
     """
 
     tree_shape = normalize_tree_shape(tree_shape)
@@ -123,19 +126,12 @@ def validate_context_contract(
             "reserve segment headroom, or raise data.max_edge_prompt_length "
             "(within the model context length)."
         )
-    if (
-        max_edge > 0
-        and max_response > 0
-        and model_context_length is not None
-        and int(model_context_length) > 0
-    ):
+    if max_edge > 0 and model_context_length is not None and int(model_context_length) > 0:
         model_ctx = int(model_context_length)
-        if max_edge + max_response > model_ctx:
+        if max_edge > model_ctx:
             raise ValueError(
                 "context-length bound overflow (PLAN.md P0.2): "
-                f"max_edge_prompt_length={max_edge} + "
-                f"max_response_length={max_response} = "
-                f"{max_edge + max_response} exceeds resolved model context "
-                f"length {model_ctx}. Lower one of the two limits or raise "
-                "the model context."
+                f"max_edge_prompt_length={max_edge} exceeds resolved model "
+                f"context length {model_ctx}. Lower data.max_edge_prompt_length "
+                "or raise actor_rollout_ref.rollout.max_model_len."
             )

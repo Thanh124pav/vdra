@@ -47,3 +47,36 @@ def test_context_contract_accepts_edge_prompt_headroom_for_hydra_string_shape():
         segment_length=600,
         model_context_length=3760,
     )
+
+
+def test_context_contract_allows_dynamic_response_remaining_context():
+    validate_context_contract(
+        data_cfg={
+            "max_prompt_length": 512,
+            "max_original_prompt_length": 512,
+            "max_edge_prompt_length": 1456,
+            "max_response_length": 2048,
+        },
+        tree_shape="[6,6,6]",
+        segment_length=472,
+        model_context_length=2560,
+    )
+
+
+def test_context_contract_rejects_edge_prompt_over_model_context():
+    with pytest.raises(ValueError) as excinfo:
+        validate_context_contract(
+            data_cfg={
+                "max_prompt_length": 512,
+                "max_original_prompt_length": 512,
+                "max_edge_prompt_length": 1456,
+                "max_response_length": 2048,
+            },
+            tree_shape="[6,6,6]",
+            segment_length=472,
+            model_context_length=1024,
+        )
+
+    message = str(excinfo.value)
+    assert "max_edge_prompt_length=1456 exceeds resolved model context length 1024" in message
+    assert "max_response_length=2048" not in message

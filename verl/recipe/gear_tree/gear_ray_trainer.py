@@ -479,12 +479,13 @@ class RayGearTreeTrainer(RayPPOTrainer):
         # accepted configs that then failed at training time when the deepest
         # edge query overflowed the actor limit.
         gt = self._gear_tree_config()
+        rollout_cfg = self.config.actor_rollout_ref.rollout
         try:
-            model_context = int(
-                self.config.actor_rollout_ref.rollout.get("prompt_length", 0)
-                or self.config.actor_rollout_ref.rollout.get("max_model_len", 0)
-                or 0
-            )
+            model_context = int(rollout_cfg.get("max_model_len", 0) or 0)
+            if model_context <= 0:
+                model_context = int(rollout_cfg.get("prompt_length", 0) or 0) + int(
+                    rollout_cfg.get("response_length", 0) or 0
+                )
         except Exception:
             model_context = 0
         # P0.2: single-source validation of the entire context contract.
