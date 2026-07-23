@@ -79,7 +79,11 @@ def test_vllm020_async_server_preserves_model_context_and_clamps_max_tokens():
 
     assert "if not self.config.max_model_len:" in source
     assert "self.config.max_model_len = self.config.prompt_length + self.config.response_length" in source
+    assert "prompt_ids = [int(x) for x in prompt_ids]" in source
+    assert "sampling_kwargs = dict(sampling_params)" in source
     assert "remaining_tokens = int(self.config.max_model_len) - len(prompt_ids)" in source
-    assert 'requested_max_tokens = sampling_params.pop("max_tokens", None)' in source
-    assert "max_tokens = min(int(requested_max_tokens), remaining_tokens)" in source
-    assert "SamplingParams(max_tokens=max_tokens, **sampling_params)" in source
+    assert 'requested_max_tokens = sampling_kwargs.pop("max_tokens", None)' in source
+    assert "max_tokens = min(max(1, int(requested_max_tokens)), remaining_tokens)" in source
+    assert "SamplingParams(max_tokens=max_tokens, **sampling_kwargs)" in source
+    assert "vLLM generate failed " in source
+    assert "effective_max_tokens={max_tokens}" in source

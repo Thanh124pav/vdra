@@ -393,18 +393,20 @@ class vLLMHttpServer:
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
+        prompt_ids = [int(x) for x in prompt_ids]
+        sampling_kwargs = dict(sampling_params)
         remaining_tokens = int(self.config.max_model_len) - len(prompt_ids)
         if remaining_tokens <= 0:
             raise ValueError(
                 f"prompt length {len(prompt_ids)} exceeds max_model_len {self.config.max_model_len}"
             )
-        requested_max_tokens = sampling_params.pop("max_tokens", None)
+        requested_max_tokens = sampling_kwargs.pop("max_tokens", None)
         if requested_max_tokens is None:
             requested_max_tokens = self.config.response_length
-        max_tokens = min(int(requested_max_tokens), remaining_tokens)
-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
-        sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
-        sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        max_tokens = min(max(1, int(requested_max_tokens)), remaining_tokens)
+        sampling_kwargs["logprobs"] = 0 if sampling_kwargs.pop("logprobs", False) else None
+        sampling_kwargs.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_kwargs)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         prompt = TokensPrompt(
             prompt_token_ids=prompt_ids, multi_modal_data={"image": image_data} if image_data else None
@@ -413,8 +415,18 @@ class vLLMHttpServer:
 
         # Get final response
         final_res: Optional[RequestOutput] = None
-        async for output in generator:
-            final_res = output
+        try:
+            async for output in generator:
+                final_res = output
+        except Exception as exc:
+            raise RuntimeError(
+                "vLLM generate failed "
+                f"request_id={request_id!r} prompt_len={len(prompt_ids)} "
+                f"max_model_len={self.config.max_model_len} "
+                f"requested_max_tokens={requested_max_tokens!r} "
+                f"effective_max_tokens={max_tokens} "
+                f"sampling_keys={sorted(sampling_kwargs.keys())}: {exc!r}"
+            ) from exc
         assert final_res is not None
 
         token_ids = final_res.outputs[0].token_ids
