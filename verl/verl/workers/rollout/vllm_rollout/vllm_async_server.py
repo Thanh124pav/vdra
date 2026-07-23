@@ -340,8 +340,11 @@ class vLLMHttpServer:
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
 
-        app = build_app(args)
-        await init_app_state(engine_client, vllm_config, app.state, args)
+        supported_tasks = await engine_client.get_supported_tasks()
+        model_config = engine_client.model_config
+
+        app = build_app(args, supported_tasks, model_config)
+        await init_app_state(engine_client, app.state, args, supported_tasks)
         if self.replica_rank == 0 and self.node_rank == 0:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 

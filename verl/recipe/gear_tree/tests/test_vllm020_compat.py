@@ -58,3 +58,13 @@ def test_vllm020_rollout_uses_020_imports_without_newer_fallbacks():
     assert "self.inference_engine.worker.add_lora" not in source
     assert "vllm.AsyncEngineArgs" not in server_source
     assert "AsyncEngineArgs.from_cli_args" in server_source
+
+
+def test_vllm020_openai_app_state_uses_020_signature():
+    source = _read("verl/workers/rollout/vllm_rollout/vllm_async_server.py")
+
+    assert "supported_tasks = await engine_client.get_supported_tasks()" in source
+    assert "model_config = engine_client.model_config" in source
+    assert "build_app(args, supported_tasks, model_config)" in source
+    assert "init_app_state(engine_client, app.state, args, supported_tasks)" in source
+    assert "init_app_state(engine_client, vllm_config, app.state, args)" not in source
