@@ -1,0 +1,30 @@
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _read(relpath: str) -> str:
+    return (REPO_ROOT / relpath).read_text()
+
+
+def test_vllm020_lora_uses_lora_model_api():
+    source = _read("verl/utils/vllm/utils.py")
+
+    assert "from vllm.lora.lora_model import LoRAModel" in source
+    assert "vllm.lora.models" not in source
+    assert "model_vocab_size=self.vocab_size" in source
+    assert "target_embedding_padding" not in source
+    assert "embedding_modules=self.embedding_modules" not in source
+    assert "embedding_padding_modules" not in source
+
+
+def test_vllm020_async_server_uses_020_cli_and_log_api():
+    source = _read("verl/workers/rollout/vllm_rollout/vllm_async_server.py")
+
+    assert "from vllm.utils.argparse_utils import FlexibleArgumentParser" in source
+    assert "from vllm.utils import FlexibleArgumentParser" not in source
+    assert "from vllm.utils import get_tcp_uri" not in source
+    assert '"enable_log_requests"' in source
+    assert "disable_log_requests" not in source
+    assert "VDRA/VERL is tested against vLLM 0.20.x" in source

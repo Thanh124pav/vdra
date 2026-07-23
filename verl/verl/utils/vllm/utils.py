@@ -15,12 +15,7 @@
 
 from msgspec import field
 from packaging import version as vs
-
-try:
-    from vllm.lora.lora_model import LoRAModel
-except ModuleNotFoundError:  # vLLM<0.18 used vllm.lora.models.
-    from vllm.lora.models import LoRAModel
-
+from vllm.lora.lora_model import LoRAModel
 from vllm.lora.request import LoRARequest
 from vllm.lora.utils import get_adapter_absolute_path
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
@@ -87,31 +82,27 @@ class VLLMHijack:
                         peft_helper=peft_helper,
                         device="cpu",
                         dtype=self.lora_config.lora_dtype,
-                        embeddings=None,
-                        target_embedding_padding=self.vocab_size + self.lora_config.lora_extra_vocab_size,
-                        embedding_modules=self.embedding_modules,
-                        embedding_padding_modules=self.embedding_padding_modules,
+                        model_vocab_size=self.vocab_size,
                         weights_mapper=hf_to_vllm_mapper,
                     )
                 else:
                     lora = self._lora_model_cls.from_local_checkpoint(
                         lora_path,
-                        expected_lora_modules,
+                        set(expected_lora_modules),
                         peft_helper=peft_helper,
                         lora_model_id=lora_request.lora_int_id,
                         device="cpu",
                         dtype=self.lora_config.lora_dtype,
-                        target_embedding_padding=self.vocab_size + self.lora_config.lora_extra_vocab_size,
-                        embedding_modules=self.embedding_modules,
-                        embedding_padding_modules=self.embedding_padding_modules,
+                        model_vocab_size=self.vocab_size,
                         weights_mapper=hf_to_vllm_mapper,
                     )
             except Exception as e:
                 raise e
 
-            if lora.extra_vocab_size > self.lora_config.lora_extra_vocab_size:
+            extra_vocab_size = getattr(lora, "extra_vocab_size", 0)
+            if extra_vocab_size > self.lora_config.lora_extra_vocab_size:
                 raise ValueError(
-                    f"LoRA added vocab size {lora.extra_vocab_size} is greater than lora_extra_vocab_size "
+                    f"LoRA added vocab size {extra_vocab_size} is greater than lora_extra_vocab_size "
                     f"{self.lora_config.lora_extra_vocab_size}."
                 )
             return lora

@@ -35,17 +35,7 @@ from vllm.entrypoints.openai.api_server import (
 from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
-try:
-    from vllm.utils.argparse_utils import FlexibleArgumentParser
-except ModuleNotFoundError:  # vLLM<0.12 exposed it directly from vllm.utils.
-    from vllm.utils import FlexibleArgumentParser
-
-try:
-    from vllm.utils import get_tcp_uri
-except ImportError:
-    def get_tcp_uri(host: str, port: int) -> str:
-        return f"tcp://{host}:{port}"
-
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
@@ -62,10 +52,27 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
-def _disable_log_requests(engine_args: Any) -> bool:
-    if hasattr(engine_args, "disable_log_requests"):
-        return bool(engine_args.disable_log_requests)
-    return not bool(getattr(engine_args, "enable_log_requests", False))
+_VLLM_VERSION_WARNED = False
+
+
+def _get_tcp_uri(host: str, port: int) -> str:
+    return f"tcp://{host}:{port}"
+
+
+def _warn_if_not_vllm_020() -> None:
+    global _VLLM_VERSION_WARNED
+    if _VLLM_VERSION_WARNED:
+        return
+    _VLLM_VERSION_WARNED = True
+    version = getattr(vllm, "__version__", "unknown")
+    if not str(version).startswith("0.20."):
+        logger.warning("Unsupported vLLM version %s detected; VDRA/VERL is tested against vLLM 0.20.x", version)
+    else:
+        logger.info("Using supported vLLM version %s", version)
+
+
+def _enable_log_requests(engine_args: Any) -> bool:
+    return bool(getattr(engine_args, "enable_log_requests", False))
 
 
 def _disable_log_stats(engine_args: Any) -> bool:
@@ -75,7 +82,7 @@ def _disable_log_stats(engine_args: Any) -> bool:
 def _from_vllm_config_kwargs(engine_args: Any, usage_context: UsageContext) -> dict[str, Any]:
     kwargs = {
         "usage_context": usage_context,
-        "disable_log_requests": _disable_log_requests(engine_args),
+        "enable_log_requests": _enable_log_requests(engine_args),
         "disable_log_stats": _disable_log_stats(engine_args),
     }
     signature = inspect.signature(AsyncLLM.from_vllm_config)
@@ -210,6 +217,7 @@ class vLLMHttpServer:
         return self._server_address, self._server_port
 
     async def launch_server(self, master_address: str = None, master_port: int = None):
+        _warn_if_not_vllm_020()
         if self.node_rank != 0:
             assert master_address and master_port, "non-master node should provide master address and port"
             self._master_address = master_address
@@ -351,7 +359,7 @@ class vLLMHttpServer:
 
         host = parallel_config.data_parallel_master_ip
         port = engine_args.data_parallel_rpc_port  # add to config too
-        handshake_address = get_tcp_uri(host, port)
+        handshake_address = _get_tcp_uri(host, port)
 
         # Create the engines.
         self.engine_manager = CoreEngineProcManager(
