@@ -383,8 +383,11 @@ def resolve_vllm_model_id(
             response.raise_for_status()
             data = response.json()
     except Exception as exc:
+        # Name the underlying failure: a connect error, a timeout and an HTTP 4xx all
+        # land here, and they call for different fixes.
         raise RuntimeError(
-            "Could not resolve scorer_model from the vLLM /models endpoint. "
+            "Could not resolve scorer_model from the vLLM /models endpoint "
+            f"({type(exc).__name__}: {exc}). "
             f"Set gear_tree.gear.scorer_model explicitly or make {url!r} reachable."
         ) from exc
     models = data.get("data") or []

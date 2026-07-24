@@ -24,12 +24,16 @@ and shared with the SPMD path.
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from typing import Any, Dict, List, Optional, Sequence
 from uuid import uuid4
 
 from recipe.gear_tree.tree_rollout import SegmentSample, async_build_tree
 from recipe.gear_tree.tree_advantage import extract_edges_from_tree
 from recipe.gear_tree.gear_core.reward_function import MathRewardFunction
+
+logger = logging.getLogger(__name__)
 
 
 def _prompt_sticky_key(prompt_ids: Sequence[int]) -> str:
@@ -482,6 +486,43 @@ def _format_openai_api_base(host: Any, port: Any) -> str:
     return f"http://{host_text}:{int(port)}/v1"
 
 
+# Served model ids never change for the lifetime of a rollout server, so one
+# successful probe per endpoint is enough. The vLLM http server is a Ray async
+# actor whose event loop is blocked while it sleeps/wakes and syncs weights, so
+# re-probing it every generation step is what makes the resolution flaky.
+_ROLLOUT_MODEL_ID_CACHE: Dict[str, str] = {}
+
+
+def _ray_get_with_retries(
+    remote_fn: Any, *, timeout: float, attempts: int = 3, what: str = "rpc"
+) -> Any:
+    """Call a Ray actor method, retrying transient timeouts with backoff.
+
+    The rollout server actor blocks its event loop during sleep/wake weight sync, so a
+    single short-timeout probe can time out even though the actor is perfectly healthy.
+    """
+    import ray
+
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            return ray.get(remote_fn.remote(), timeout=timeout * attempt)
+        except Exception as exc:  # noqa: BLE001 - retried, then reported by the caller
+            last_exc = exc
+            logger.warning(
+                "Rollout server %s probe failed (attempt %d/%d): %s: %s",
+                what,
+                attempt,
+                attempts,
+                type(exc).__name__,
+                exc,
+            )
+            if attempt < attempts:
+                time.sleep(min(2.0 * attempt, 5.0))
+    assert last_exc is not None
+    raise last_exc
+
+
 def _resolve_rollout_server_info(
     server_manager: Any, *, timeout: float = 10.0
 ) -> tuple[Optional[str], Optional[str]]:
@@ -490,25 +531,34 @@ def _resolve_rollout_server_info(
     if not handles:
         return None, None
 
-    import ray
-
     for handle in handles:
         try:
-            address, port = ray.get(handle.get_server_address.remote(), timeout=timeout)
+            address, port = _ray_get_with_retries(
+                handle.get_server_address, timeout=timeout, what="get_server_address"
+            )
         except Exception:
             continue
         if not (address and port):
             continue
+        api_base = _format_openai_api_base(address, port)
+        cached_model_id = _ROLLOUT_MODEL_ID_CACHE.get(api_base)
+        if cached_model_id:
+            return api_base, cached_model_id
         model_id = None
-        try:
-            get_model_id = getattr(handle, "get_model_id", None)
-            if get_model_id is not None:
-                model_id = ray.get(get_model_id.remote(), timeout=timeout)
-        except Exception:
-            model_id = None
-        return _format_openai_api_base(address, port), (
-            str(model_id).strip() if model_id else None
-        )
+        get_model_id = getattr(handle, "get_model_id", None)
+        if get_model_id is not None:
+            try:
+                model_id = _ray_get_with_retries(
+                    get_model_id, timeout=timeout, what="get_model_id"
+                )
+            except Exception:
+                # Leave model_id unset: the scorer then falls back to the /models
+                # endpoint, which reports its own failure with the underlying cause.
+                model_id = None
+        model_id = str(model_id).strip() if model_id else None
+        if model_id:
+            _ROLLOUT_MODEL_ID_CACHE[api_base] = model_id
+        return api_base, model_id
     return None, None
 
 
