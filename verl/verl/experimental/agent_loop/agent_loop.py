@@ -418,10 +418,58 @@ def _ensure_gear_tree_trajectory_kwargs(
     )
 
 
+GEAR_TREE_ENDPOINT_META_KEY = "gear_tree_rollout_endpoint"
+
+
+def _ensure_gear_tree_rollout_endpoint(batch: DataProto, manager: Any) -> None:
+    """Stamp the rollout server endpoint on the batch before workers are dispatched.
+
+    TreeAgentLoop needs the OpenAI-compatible endpoint and the served model id to build
+    its VDRA scorer. Resolving them inside the worker means probing the rollout server
+    actor while it is saturated with generation requests, where the probe times out and
+    the run dies with "no rollout vLLM server endpoint could be resolved". The manager
+    runs on the driver and already knows the addresses from launch, so resolve here —
+    once per process, before dispatch — and let the workers read the answer.
+    """
+
+    meta = getattr(batch, "meta_info", None)
+    if meta is None or meta.get(GEAR_TREE_ENDPOINT_META_KEY):
+        return
+
+    cached = getattr(manager, "_gear_tree_endpoint", None)
+    if cached is None:
+        addresses = list(getattr(manager, "server_addresses", []) or [])
+        if not addresses:
+            return
+        model_id = None
+        handles = list(getattr(manager, "server_handles", []) or [])
+        if handles:
+            try:
+                model_id = ray.get(handles[0].get_model_id.remote(), timeout=30.0)
+            except Exception as e:  # noqa: BLE001 - scorer falls back to the /models probe
+                logger.warning("Could not resolve served model id from rollout server: %s", e)
+        cached = {
+            "api_base": f"http://{addresses[0]}/v1",
+            "model_id": str(model_id).strip() if model_id else None,
+        }
+        manager._gear_tree_endpoint = cached
+    meta[GEAR_TREE_ENDPOINT_META_KEY] = dict(cached)
+
+
 def _ensure_gear_tree_agent_kwargs(batch: DataProto, config: DictConfig) -> None:
     """Mirror VDRA rollout metadata from meta_info into per-row kwargs."""
 
     meta = getattr(batch, "meta_info", {}) or {}
+    endpoint = meta.get(GEAR_TREE_ENDPOINT_META_KEY) or {}
+    if endpoint.get("api_base") and "rollout_endpoint_api_base" not in batch.non_tensor_batch:
+        row_count = len(batch)
+        batch.non_tensor_batch["rollout_endpoint_api_base"] = _object_column(
+            str(endpoint["api_base"]), row_count
+        )
+        batch.non_tensor_batch["rollout_endpoint_model_id"] = _object_column(
+            str(endpoint["model_id"]) if endpoint.get("model_id") else None, row_count
+        )
+
     gt = meta.get("gear_tree_config")
     if gt is None and not (
         "policy_snapshot_id" in meta or "current_rollout_snapshot_id" in meta
@@ -1006,6 +1054,7 @@ class AgentLoopManager:
             )
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.wake_up()
+        _ensure_gear_tree_rollout_endpoint(prompts, self)
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = ray.get(
             [

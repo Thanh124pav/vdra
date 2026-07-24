@@ -614,7 +614,18 @@ try:  # keep CPU-importable when agent_loop isn't installed
             actual_top_p = float(rollout_config.top_p)
             gear_cfg["rollout_temperature"] = actual_temp
             gear_cfg["rollout_top_p"] = actual_top_p
-            gear_cfg = _attach_rollout_scorer_endpoint(gear_cfg, self.server_manager)
+            # Best-effort at construction time: the rollout server actor may be
+            # saturated with generation requests, in which case the probe times out on
+            # a perfectly healthy server. run() resolves it again from the per-request
+            # endpoint the manager stamped on the batch, and only then gives up.
+            try:
+                gear_cfg = _attach_rollout_scorer_endpoint(gear_cfg, self.server_manager)
+                self._scorer_endpoint_resolved = True
+            except RuntimeError as exc:
+                logger.warning(
+                    "Deferring VDRA scorer endpoint resolution to the first request: %s", exc
+                )
+                self._scorer_endpoint_resolved = False
             # Enforce the tanh-TV estimator's distributional prerequisites.
             # The scorer implements the untransformed p(a|s); if the rollout
             # server samples under (temperature, top_p) != (1, 1) then scorer
@@ -647,10 +658,49 @@ try:  # keep CPU-importable when agent_loop isn't installed
             self.apply_chat_template_kwargs = self.config.data.get(
                 "apply_chat_template_kwargs", {}
             )
-            self._gate = _build_gate(gt, tokenizer=self.tokenizer)
+            # The gate owns the scorer, so it can only be built once the endpoint is
+            # known; with an unresolved endpoint it would bind the static config
+            # default (127.0.0.1:8000) and fail on the first scoring call.
+            self._gate = (
+                _build_gate(gt, tokenizer=self.tokenizer)
+                if self._scorer_endpoint_resolved
+                else None
+            )
             self._node_expander = SegmentNodeExpander(self._gen, self.tokenizer)
+            self._endpoint_lock = asyncio.Lock()
+
+        def _ensure_scorer_endpoint(self, kwargs: dict) -> None:
+            """Resolve the scorer endpoint from the request, then from the server.
+
+            Runs in a worker thread; ``_endpoint_lock`` serializes the callers.
+            """
+            if self._scorer_endpoint_resolved:
+                return
+            gear_cfg = dict(self._gt.get("gear", {}))
+            api_base = kwargs.get("rollout_endpoint_api_base")
+            if api_base and bool(gear_cfg.get("scorer_uses_rollout_server", False)):
+                gear_cfg["rollout_api_base"] = str(api_base)
+                gear_cfg["scorer_api_base"] = str(api_base)
+                model_id = kwargs.get("rollout_endpoint_model_id")
+                if model_id and not str(gear_cfg.get("scorer_model") or "").strip():
+                    gear_cfg["scorer_model"] = str(model_id)
+            else:
+                # No endpoint on the request: retry the server probe, and let its
+                # RuntimeError surface if the endpoint is genuinely unavailable.
+                gear_cfg = _attach_rollout_scorer_endpoint(gear_cfg, self.server_manager)
+            self._gt["gear"] = gear_cfg
+            self._gate = _build_gate(self._gt, tokenizer=self.tokenizer)
+            self._scorer_endpoint_resolved = True
 
         async def run(self, sampling_params: dict, **kwargs) -> "AgentLoopOutput":
+            if not self._scorer_endpoint_resolved:
+                # Off the event loop: the fallback path blocks on Ray RPCs, and this
+                # worker still has to serve the requests that keep the server busy.
+                async with self._endpoint_lock:
+                    if not self._scorer_endpoint_resolved:
+                        await self.loop.run_in_executor(
+                            None, self._ensure_scorer_endpoint, kwargs
+                        )
             raw_prompt = kwargs.get("raw_prompt")
             prompt_token_ids = kwargs.get("prompt_token_ids")
             if prompt_token_ids is None:
