@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import pickle
+from concurrent.futures import Future
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -118,10 +119,9 @@ class ExternalZeroMQDistributedExecutor(Executor):
         self.collective_rpc("init_device")
         self.collective_rpc("load_model")
 
-    def collective_rpc(
+    def _blocking_rpc(
         self,
         method: str | Callable,
-        timeout: Optional[float] = None,
         args: tuple = (),
         kwargs: Optional[dict[str, Any]] = None,
     ) -> list[Any]:
@@ -139,6 +139,55 @@ class ExternalZeroMQDistributedExecutor(Executor):
         for socket in self.sockets:
             outputs.append(pickle.loads(socket.recv()))
         return outputs
+
+    def collective_rpc(
+        self,
+        method: str | Callable,
+        timeout: Optional[float] = None,
+        args: tuple = (),
+        kwargs: Optional[dict[str, Any]] = None,
+        non_block: bool = False,
+        unique_reply_rank: Optional[int] = None,
+        single_value: bool = False,
+        **extra_kwargs: Any,
+    ) -> Any:
+        """Execute an RPC call on all workers over ZMQ.
+
+        The ZMQ REQ/REP round trip is inherently blocking, so `non_block=True` is honored by
+        returning an already-resolved Future. vLLM's engine core calls
+        `execute_model(..., non_block=True)` and then `future.result()`, so returning the raw
+        list would break it.
+        """
+        if extra_kwargs:
+            logger.debug("Ignoring unsupported collective_rpc kwargs: %s", sorted(extra_kwargs))
+
+        def _run() -> Any:
+            outputs = self._blocking_rpc(method, args, kwargs)
+            if unique_reply_rank is not None:
+                return outputs[unique_reply_rank]
+            return outputs[0] if single_value else outputs
+
+        if not non_block:
+            return _run()
+
+        future: Future[Any] = Future()
+        try:
+            future.set_result(_run())
+        except Exception as e:  # noqa: BLE001 - surfaced through the future, as vLLM expects
+            future.set_exception(e)
+        return future
+
+    def execute_model(self, scheduler_output, non_block: bool = False) -> Any:
+        # Override the base implementation: it indexes the collective_rpc result (`output[0]`),
+        # which is invalid when `non_block=True` returns a Future.
+        return self.collective_rpc(
+            "execute_model", args=(scheduler_output,), non_block=non_block, single_value=True
+        )
+
+    def sample_tokens(self, grammar_output, non_block: bool = False) -> Any:
+        return self.collective_rpc(
+            "sample_tokens", args=(grammar_output,), non_block=non_block, single_value=True
+        )
 
     def check_health(self):
         return
